@@ -1,11 +1,25 @@
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
-python-binance==1.0.16
-python-telegram-bot==13.15
-pandas==2.2.2
+# Core dependencies
 numpy==1.26.4
-requests==2.31.0
+pandas==2.1.4      # Compatible with Python 3.13
+scipy==1.12.0
 
-# Optional helpers (uncomment if needed)
-# python-dotenv==1.0.0
-# sqlalchemy==2.1.0
+# FastAPI for health checks
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+
+# Binance API
+python-binance==1.0.19
+
+# Telegram bot integration
+python-telegram-bot==13.15
+
+# Networking & requests
+requests==2.31.0
+websocket-client==1.7.0
+
+# Performance & compilation helpers
+setuptools>=69.5.1
+wheel>=0.43.0
+cython>=3.0.10
+meson>=1.4.0
+ninja>=1.11.1
