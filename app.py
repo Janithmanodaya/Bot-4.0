@@ -1072,33 +1072,40 @@ def build_control_keyboard():
     ]
     return InlineKeyboardMarkup(buttons)
 
-def handle_update_sync(update, loop):
+from fastapi import Request, Response
+
+@app.post("/webhook/{token}")
+async def telegram_webhook(token: str, request: Request):
+    if token != TELEGRAM_BOT_TOKEN:
+        return Response(content="unauthorized", status_code=401)
+    
+    update_data = await request.json()
+    # Run the handler in the background to immediately acknowledge the webhook
+    asyncio.create_task(handle_update(update_data))
+    return Response(content="ok", status_code=200)
+
+async def handle_update(update: dict):
+    # The 'update' is a dict from the webhook. We need to convert it to a telegram.Update object.
+    upd = telegram.Update.de_json(update, telegram_bot)
+
     try:
-        if update is None:
+        if upd is None:
             return
-        if getattr(update, 'message', None):
-            msg = update.message
+        if getattr(upd, 'message', None):
+            msg = upd.message
             text = (msg.text or "").strip()
             if text.startswith("/startbot"):
-                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot state -> RUNNING")
+                await _set_running(True)
+                await send_telegram("Bot state -> RUNNING")
             elif text.startswith("/stopbot"):
-                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot state -> STOPPED")
+                await _set_running(False)
+                await send_telegram("Bot state -> STOPPED")
             elif text.startswith("/freeze"):
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot -> FROZEN (no new entries)")
+                await _set_frozen(True)
+                await send_telegram("Bot -> FROZEN (no new entries)")
             elif text.startswith("/unfreeze"):
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot -> UNFROZEN")
+                await _set_frozen(False)
+                await send_telegram("Bot -> UNFROZEN")
             elif text.startswith("/help"):
                 help_text = (
                     "**KAMA Bot Commands**\\n\\n"
@@ -1116,50 +1123,41 @@ def handle_update_sync(update, loop):
                     "/tunnelstatus: Shows the SSH tunnel configuration and status.\\n"
                     "/settunnel <p> <v>: Sets a tunnel param `p` to value `v` (requires restart)."
                 )
-                send_telegram_sync(help_text)
+                await send_telegram(help_text)
             elif text.startswith("/ip") or text.startswith("/forceip"):
-                ip = get_public_ip()
-                send_telegram_sync(f"Server IP: {ip}")
+                ip = await asyncio.to_thread(get_public_ip)
+                await send_telegram(f"Server IP: {ip}")
             elif text.startswith("/status"):
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
-                trades = {}
-                try: trades = fut.result(timeout=5)
-                except Exception: pass
+                trades = await get_managed_trades_snapshot()
                 txt = f"Status:\nrunning={running}\nfrozen={frozen}\nmanaged_trades={len(trades)}"
-                send_telegram_sync(txt)
+                await send_telegram(txt)
                 try:
-                    telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
+                    await asyncio.to_thread(telegram_bot.send_message, chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
                     pass
-            elif text.startswith("/ip") or text.startswith("/forceip"):
-                ip = get_public_ip()
-                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/listorders"):
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
-                trades = {}
-                try: trades = fut.result(timeout=5)
-                except Exception: pass
+                trades = await get_managed_trades_snapshot()
                 if not trades:
-                    send_telegram_sync("No managed trades.")
+                    await send_telegram("No managed trades.")
                 else:
                     out = "Open trades:\n"
                     for k, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    send_telegram_sync(out)
+                    await send_telegram(out)
             elif text.startswith("/showparams"):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
-                send_telegram_sync(out)
+                await send_telegram(out)
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
                     key = parts[1]
                     val = " ".join(parts[2:])
                     if key not in CONFIG:
-                        send_telegram_sync(f"Parameter {key} not found.")
+                        await send_telegram(f"Parameter {key} not found.")
                     else:
                         old = CONFIG[key]
                         try:
@@ -1173,30 +1171,30 @@ def handle_update_sync(update, loop):
                                 CONFIG[key] = [x.strip().upper() for x in val.split(",")]
                             else:
                                 CONFIG[key] = val
-                            send_telegram_sync(f"Set {key} = {CONFIG[key]}")
+                            await send_telegram(f"Set {key} = {CONFIG[key]}")
                         except Exception as e:
-                            send_telegram_sync(f"Failed to set {key}: {e}")
+                            await send_telegram(f"Failed to set {key}: {e}")
                 else:
-                    send_telegram_sync("Usage: /setparam KEY VALUE")
+                    await send_telegram("Usage: /setparam KEY VALUE")
             elif text.startswith("/validate"):
-                result = validate_and_sanity_check_sync(send_report=False)
-                send_telegram_sync("Validation result: " + ("OK" if result["ok"] else "ERROR"))
+                result = await asyncio.to_thread(validate_and_sanity_check_sync, send_report=False)
+                await send_telegram("Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
-                    send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+                    await send_telegram(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             elif text.startswith("/tunnelstatus"):
                 status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
                 out = f"Tunnel Status: {status}\\n-- Config --\\n"
                 cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
                 for k,v in cfg_safe.items():
                     out += f"{k} = {v}\\n"
-                send_telegram_sync(out)
+                await send_telegram(out)
             elif text.startswith("/settunnel"):
                 parts = text.split()
                 if len(parts) >= 3:
                     key = parts[1].lower()
                     val = " ".join(parts[2:])
                     if key not in TUNNEL_CONFIG:
-                        send_telegram_sync(f"Tunnel parameter {key} not found.")
+                        await send_telegram(f"Tunnel parameter {key} not found.")
                     else:
                         try:
                             if key == 'enabled':
@@ -1205,91 +1203,58 @@ def handle_update_sync(update, loop):
                                 TUNNEL_CONFIG[key] = int(val)
                             else:
                                 TUNNEL_CONFIG[key] = val
-                            send_telegram_sync(f"Set tunnel param {key} = {TUNNEL_CONFIG[key]}")
-                            send_telegram_sync("NOTE: A restart is required for tunnel changes to take effect.")
+                            await send_telegram(f"Set tunnel param {key} = {TUNNEL_CONFIG[key]}")
+                            await send_telegram("NOTE: A restart is required for tunnel changes to take effect.")
                         except Exception as e:
-                            send_telegram_sync(f"Failed to set {key}: {e}")
+                            await send_telegram(f"Failed to set {key}: {e}")
                 else:
-                    send_telegram_sync("Usage: /settunnel <param> <value>")
+                    await send_telegram("Usage: /settunnel <param> <value>")
             else:
-                send_telegram_sync("Unknown command. Use /status or buttons.")
-        elif getattr(update, 'callback_query', None):
-            cq = update.callback_query
+                await send_telegram("Unknown command. Use /status or buttons.")
+        elif getattr(upd, 'callback_query', None):
+            cq = upd.callback_query
             data = cq.data
             try:
-                telegram_bot.answer_callback_query(callback_query_id=cq.id, text=f"Action: {data}")
+                await asyncio.to_thread(telegram_bot.answer_callback_query, callback_query_id=cq.id, text=f"Action: {data}")
             except Exception:
                 pass
             if data == "start":
-                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot state -> RUNNING")
+                await _set_running(True)
+                await send_telegram("Bot state -> RUNNING")
             elif data == "stop":
-                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot state -> STOPPED")
+                await _set_running(False)
+                await send_telegram("Bot state -> STOPPED")
             elif data == "freeze":
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot -> FROZEN")
+                await _set_frozen(True)
+                await send_telegram("Bot -> FROZEN")
             elif data == "unfreeze":
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
-                try: fut.result(timeout=5)
-                except Exception: pass
-                send_telegram_sync("Bot -> UNFROZEN")
+                await _set_frozen(False)
+                await send_telegram("Bot -> UNFROZEN")
             elif data == "listorders":
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
-                trades = {}
-                try: trades = fut.result(timeout=5)
-                except Exception: pass
+                trades = await get_managed_trades_snapshot()
                 if not trades:
-                    send_telegram_sync("No managed trades.")
+                    await send_telegram("No managed trades.")
                 else:
                     out = "Open trades:\n"
                     for k, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    send_telegram_sync(out)
+                    await send_telegram(out)
             elif data == "showparams":
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
-                send_telegram_sync(out)
+                await send_telegram(out)
             elif data == "tunnelstatus":
                 status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
                 out = f"Tunnel Status: {status}\\n-- Config --\\n"
                 cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
                 for k,v in cfg_safe.items():
                     out += f"{k} = {v}\\n"
-                send_telegram_sync(out)
+                await send_telegram(out)
     except Exception:
-        log.exception("Error in handle_update_sync")
-
-def telegram_polling_thread(loop):
-    global telegram_bot
-    if not telegram_bot:
-        log.info("telegram thread not started: bot not configured")
-        return
-    offset = None
-    while True:
-        try:
-            updates = telegram_bot.get_updates(offset=offset, timeout=20)
-            for u in updates:
-                offset = u.update_id + 1
-                handle_update_sync(u, loop)
-            time.sleep(0.2)
-        except Exception:
-            log.exception("Telegram polling thread error")
-            try:
-                ip = get_public_ip()
-                send_telegram_sync(f"Telegram polling error. Server IP: {ip}")
-            except Exception:
-                pass
-            time.sleep(5)
+        log.exception("Error in handle_update")
 
 # -------------------------
 # small control coroutines
@@ -1329,15 +1294,17 @@ async def startup_event():
 async def initialize_bot():
     global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
     
-    # Start Telegram listener first to ensure bot is responsive for configuration
-    loop = asyncio.get_running_loop()
-    run_poller = os.getenv("RUN_TELEGRAM_POLLER", "true").lower() in ("true", "1", "yes")
-    if telegram_bot and run_poller:
-        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
-        telegram_thread.start()
-        log.info("Started telegram polling thread (RUN_TELEGRAM_POLLER=true).")
-    else:
-        log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    if telegram_bot and WEBHOOK_URL:
+        webhook_url_with_token = f"{WEBHOOK_URL}/webhook/{TELEGRAM_BOT_TOKEN}"
+        # Use a thread for the blocking network call
+        success = await asyncio.to_thread(telegram_bot.set_webhook, url=webhook_url_with_token)
+        if success:
+            log.info(f"Webhook set to {webhook_url_with_token}")
+        else:
+            log.error("Failed to set webhook.")
+    elif telegram_bot:
+        log.warning("WEBHOOK_URL not set. Bot will not receive updates from Telegram.")
 
     # --- Pre-startup Network Diagnostic Test ---
     try:
@@ -1387,6 +1354,9 @@ async def initialize_bot():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    if telegram_bot:
+        log.info("Deleting webhook...")
+        await asyncio.to_thread(telegram_bot.delete_webhook)
     stop_tunnel_sync()
     try:
         monitor_stop_event.set()
