@@ -1073,13 +1073,6 @@ def handle_update_sync(update, loop):
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
                 send_telegram_sync(out)
-            elif data == "tunnelstatus":
-                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
-                out = f"Tunnel Status: {status}\\n-- Config --\\n"
-                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
-                for k,v in cfg_safe.items():
-                    out += f"{k} = {v}\\n"
-                send_telegram_sync(out)
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
@@ -1185,6 +1178,13 @@ def handle_update_sync(update, loop):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
+                send_telegram_sync(out)
+            elif data == "tunnelstatus":
+                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                out = f"Tunnel Status: {status}\\n-- Config --\\n"
+                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                for k,v in cfg_safe.items():
+                    out += f"{k} = {v}\\n"
                 send_telegram_sync(out)
     except Exception:
         log.exception("Error in handle_update_sync")
