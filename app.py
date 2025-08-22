@@ -1,3 +1,4 @@
+
 # app.py
 """
 KAMA trend-following bot — fixed for:
@@ -79,7 +80,6 @@ CONFIG = {
 # -------------------------
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-BINANCE_TLD = os.getenv("BINANCE_TLD", "com")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("1", "true", "yes")
@@ -361,6 +361,16 @@ def start_tunnel_sync():
     global tunnel_server
     if not TUNNEL_CONFIG.get("enabled"):
         return True, "Tunnel not enabled."
+
+    # Validate required fields if tunnel is enabled
+    required_fields = ["host", "user", "password"]
+    missing_fields = [f for f in required_fields if not TUNNEL_CONFIG.get(f)]
+    if missing_fields:
+        error_msg = (
+            f"Tunnel is enabled but required configuration is missing: {', '.join(missing_fields)}. "
+            "Please set them using /settunnel or environment variables and restart."
+        )
+        return False, error_msg
     
     if tunnel_server and tunnel_server.is_active:
         log.info("Tunnel is already active.")
@@ -428,8 +438,8 @@ def init_binance_client_sync():
             client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True, requests_params=req_params)
             log.warning("Binance client in TESTNET mode.")
         else:
-            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, tld=BINANCE_TLD, requests_params=req_params)
-            log.info(f"Binance client in MAINNET mode (tld={BINANCE_TLD}).")
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=req_params)
+            log.info("Binance client in MAINNET mode.")
         
         client.ping()
         log.info("Connected to Binance API (ping ok).")
@@ -821,8 +831,7 @@ def monitor_thread_func():
                 time.sleep(5)
                 continue
             try:
-                account_info = client.futures_account()
-                positions = account_info.get('positions', [])
+                positions = client.futures_position_information()
             except Exception as e:
                 # sanitize the Binance response (may be HTML)
                 raw = str(e)
@@ -995,6 +1004,27 @@ def handle_update_sync(update, loop):
                 try: fut.result(timeout=5)
                 except Exception: pass
                 send_telegram_sync("Bot -> UNFROZEN")
+            elif text.startswith("/help"):
+                help_text = (
+                    "**KAMA Bot Commands**\\n\\n"
+                    "/startbot: Starts the trading bot.\\n"
+                    "/stopbot: Stops the trading bot.\\n"
+                    "/status: Shows current bot status.\\n"
+                    "/freeze: Freezes new trades, but continues monitoring existing ones.\\n"
+                    "/unfreeze: Unfreezes the bot to allow new trades.\\n"
+                    "/ip: Shows the server's public IP address.\\n"
+                    "/listorders: Lists all currently managed open trades.\\n"
+                    "/showparams: Shows the current trading parameters.\\n"
+                    "/setparam <p> <v>: Sets a trading parameter `p` to value `v`.\\n"
+                    "/validate: Runs a sanity check of the configuration.\\n"
+                    "--- Tunnel Commands ---\\n"
+                    "/tunnelstatus: Shows the SSH tunnel configuration and status.\\n"
+                    "/settunnel <p> <v>: Sets a tunnel param `p` to value `v` (requires restart)."
+                )
+                send_telegram_sync(help_text)
+            elif text.startswith("/ip") or text.startswith("/forceip"):
+                ip = get_public_ip()
+                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/status"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -1203,7 +1233,11 @@ async def startup_event():
     ok, err = await asyncio.to_thread(init_binance_client_sync)
     if not ok:
         log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
-        await send_telegram(f"CRITICAL: Bot failed to start. Binance client initialization failed: {err}")
+        # Send a more helpful message for the common case of missing tunnel config
+        if "Tunnel is enabled but required configuration is missing" in err:
+            await send_telegram(f"CRITICAL: Bot failed to start. {err}")
+        else:
+            await send_telegram(f"CRITICAL: Bot failed to start. Binance client initialization failed: {err}")
         return
 
     await asyncio.to_thread(validate_and_sanity_check_sync, True)
