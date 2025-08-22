@@ -143,6 +143,8 @@ class DualLock:
 managed_trades: Dict[str, Dict[str, Any]] = {}
 managed_trades_lock = DualLock()
 
+user_set_param_state: Dict[int, str] = {} # Tracks which param a user is currently setting
+
 last_trade_close_time: Dict[str, datetime] = {}
 
 telegram_thread: Optional[threading.Thread] = None
@@ -1072,6 +1074,15 @@ def build_control_keyboard():
     ]
     return InlineKeyboardMarkup(buttons)
 
+def build_tunnel_setup_keyboard():
+    buttons = [
+        [InlineKeyboardButton("Set Host", callback_data="tset_host"), InlineKeyboardButton("Set User", callback_data="tset_user")],
+        [InlineKeyboardButton("Set Password", callback_data="tset_password"), InlineKeyboardButton("Set Port", callback_data="tset_port")],
+        [InlineKeyboardButton("Enable", callback_data="tset_enable"), InlineKeyboardButton("Disable", callback_data="tset_disable")],
+        [InlineKeyboardButton("Show Config", callback_data="tset_show")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
 from fastapi import Request, Response
 
 @app.post("/webhook/{token}")
@@ -1094,6 +1105,23 @@ async def handle_update(update: dict):
         if getattr(upd, 'message', None):
             msg = upd.message
             text = (msg.text or "").strip()
+            chat_id = msg.chat_id
+
+            # Check if we are waiting for a parameter value from this user
+            if chat_id in user_set_param_state:
+                state = user_set_param_state[chat_id]
+                del user_set_param_state[chat_id] # Clear state immediately
+                
+                try:
+                    if state == 'port':
+                        TUNNEL_CONFIG[state] = int(text)
+                    else:
+                        TUNNEL_CONFIG[state] = text
+                    await send_telegram(f"Tunnel parameter '{state}' set to: {text}\nRestart required for changes to take effect.")
+                except Exception as e:
+                    await send_telegram(f"Invalid value. Error: {e}")
+                return # Stop further processing
+
             if text.startswith("/startbot"):
                 await _set_running(True)
                 await send_telegram("Bot state -> RUNNING")
@@ -1121,7 +1149,7 @@ async def handle_update(update: dict):
                     "/validate: Runs a sanity check of the configuration.\\n"
                     "--- Tunnel Commands ---\\n"
                     "/tunnelstatus: Shows the SSH tunnel configuration and status.\\n"
-                    "/settunnel <p> <v>: Sets a tunnel param `p` to value `v` (requires restart)."
+                    "/tunnelsetup: Starts an interactive setup for tunnel parameters."
                 )
                 await send_telegram(help_text)
             elif text.startswith("/ip") or text.startswith("/forceip"):
@@ -1188,27 +1216,41 @@ async def handle_update(update: dict):
                 for k,v in cfg_safe.items():
                     out += f"{k} = {v}\\n"
                 await send_telegram(out)
-            elif text.startswith("/settunnel"):
-                parts = text.split()
-                if len(parts) >= 3:
-                    key = parts[1].lower()
-                    val = " ".join(parts[2:])
-                    if key not in TUNNEL_CONFIG:
-                        await send_telegram(f"Tunnel parameter {key} not found.")
-                    else:
-                        try:
-                            if key == 'enabled':
-                                TUNNEL_CONFIG[key] = val.lower() in ("1","true","yes","on")
-                            elif key in ['port', 'local_bind_port', 'remote_bind_port']:
-                                TUNNEL_CONFIG[key] = int(val)
-                            else:
-                                TUNNEL_CONFIG[key] = val
-                            await send_telegram(f"Set tunnel param {key} = {TUNNEL_CONFIG[key]}")
-                            await send_telegram("NOTE: A restart is required for tunnel changes to take effect.")
-                        except Exception as e:
-                            await send_telegram(f"Failed to set {key}: {e}")
-                else:
-                    await send_telegram("Usage: /settunnel <param> <value>")
+            # --- Tunnel Setup Callbacks ---
+            elif data.startswith("tset_"):
+                param = data.split("_")[1]
+                chat_id = cq.message.chat_id
+                if param == "host":
+                    user_set_param_state[chat_id] = "host"
+                    await send_telegram("Please send the tunnel host:")
+                elif param == "user":
+                    user_set_param_state[chat_id] = "user"
+                    await send_telegram("Please send the tunnel username:")
+                elif param == "password":
+                    user_set_param_state[chat_id] = "password"
+                    await send_telegram("Please send the tunnel password:")
+                elif param == "port":
+                    user_set_param_state[chat_id] = "port"
+                    await send_telegram("Please send the tunnel port (e.g., 22):")
+                elif param == "enable":
+                    TUNNEL_CONFIG["enabled"] = True
+                    await send_telegram("Tunnel enabled. Restart required.")
+                elif param == "disable":
+                    TUNNEL_CONFIG["enabled"] = False
+                    await send_telegram("Tunnel disabled. Restart required.")
+                elif param == "show":
+                    cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                    out = "Current Tunnel Config:\n"
+                    for k,v in cfg_safe.items():
+                        out += f"{k} = {v}\n"
+                    await send_telegram(out)
+            elif text.startswith("/tunnelsetup"):
+                await send_telegram(
+                    "SSH Tunnel Configuration\n\n"
+                    "Use the buttons below to set each parameter one-by-one. "
+                    "A restart is required for changes to take effect.",
+                    reply_markup=build_tunnel_setup_keyboard()
+                )
             else:
                 await send_telegram("Unknown command. Use /status or buttons.")
         elif getattr(upd, 'callback_query', None):
