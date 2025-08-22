@@ -163,6 +163,21 @@ def sanitize_error_for_telegram(raw: str, max_len: int = 1000) -> str:
         return text[:max_len] + "\n\n[...] (truncated)"
     return text
 
+def get_public_ip() -> str:
+    """Fetches the public IP address from an external service."""
+    try:
+        # Use a reliable and simple service that returns JSON
+        response = requests.get("https://api.ipify.org?format=json", timeout=5)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        return response.json().get("ip", "N/A (key missing)")
+    except requests.exceptions.RequestException as e:
+        log.warning(f"Could not get public IP via requests: {e}")
+        return "N/A (request failed)"
+    except Exception as e:
+        # Catch any other exceptions, e.g., JSON parsing
+        log.warning(f"An unexpected error occurred while getting public IP: {e}")
+        return "N/A (unexpected error)"
+
 # -------------------------
 # Robust Telegram send (sync)
 # -------------------------
