@@ -1,0 +1,1124 @@
+# app.py
+"""
+KAMA trend-following bot — version with a dedicated monitor thread.
+- Scanning (entries) runs as an async task in the event loop.
+- Monitoring (positions, trailing, closes) runs in a dedicated synchronous thread.
+- A DualLock wrapper (threading.Lock) is used so both async code and threads can
+  coordinate access to shared structures (managed_trades, last_trade_close_time).
+"""
+
+import os
+import sys
+import time
+import math
+import asyncio
+import logging
+import sqlite3
+import signal
+import traceback
+import threading
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+from decimal import Decimal, ROUND_DOWN, getcontext
+
+import requests
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI
+
+# Binance client
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+# Telegram (synchronous lib used in a dedicated thread)
+import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+# -------------------------
+# CONFIG (edit values here)
+# -------------------------
+CONFIG = {
+    # Symbols and timeframes
+    "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+    "TIMEFRAME": os.getenv("TIMEFRAME", "1h"),
+    "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
+
+    # Scanning & concurrency
+    "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
+    "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
+    "START_MODE": os.getenv("START_MODE", "running").lower(),
+
+    # KAMA
+    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
+    "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
+    "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
+
+    # ATR / SL-TP
+    "ATR_LENGTH": int(os.getenv("ATR_LENGTH", "14")),
+    "SL_TP_ATR_MULT": float(os.getenv("SL_TP_ATR_MULT", "2.5")),
+
+    # Risk sizing
+    "RISK_SMALL_BALANCE_THRESHOLD": float(os.getenv("RISK_SMALL_BALANCE_THRESHOLD", "50.0")),
+    "RISK_SMALL_FIXED_USDT": float(os.getenv("RISK_SMALL_FIXED_USDT", "0.5")),
+    "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
+    "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
+
+    # ADX filter
+    "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
+    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "50.0")),
+
+    # Choppiness filter
+    "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
+    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "50.0")),
+
+    # Bollinger Band width (we check (BBW*100) < threshold)
+    "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
+    "BB_STD": float(os.getenv("BB_STD", "2.0")),
+    "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "7.0")),
+
+    # cooldown after trade CLOSE (count candles on entry timeframe)
+    "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
+
+    # trailing
+    "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
+
+    # DB file
+    "DB_FILE": os.getenv("DB_FILE", "trades.db"),
+}
+# -------------------------
+# Secrets (must be set as environment variables)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("1", "true", "yes")
+# -------------------------
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("kama-bot")
+
+# FastAPI app for health checks
+app = FastAPI()
+
+# Globals
+client: Optional[Client] = None
+telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+
+running = (CONFIG["START_MODE"] == "running")
+frozen = False
+
+# Thread-safe lock wrapper usable from async and sync code
+class DualLock:
+    """
+    Wrap a threading.Lock so it can be used:
+      - synchronously: lock.acquire(), lock.release()
+      - asynchronously: 'async with lock' (acquire is offloaded to a thread)
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    # Sync API
+    def acquire(self, timeout: Optional[float] = None) -> bool:
+        if timeout is None:
+            return self._lock.acquire()
+        return self._lock.acquire(timeout=timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    # Async context manager API
+    async def __aenter__(self):
+        # offload blocking acquire to thread so it doesn't block event loop
+        await asyncio.to_thread(self._lock.acquire)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._lock.release()
+
+managed_trades: Dict[str, Dict[str, Any]] = {}
+managed_trades_lock = DualLock()  # used across async tasks and sync monitor thread
+
+# last close times per symbol (for cooldown). Protected by the same lock.
+last_trade_close_time: Dict[str, datetime] = {}
+
+# Thread references
+telegram_thread: Optional[threading.Thread] = None
+monitor_thread_obj: Optional[threading.Thread] = None
+monitor_stop_event = threading.Event()
+
+# Tasks
+scan_task = None
+
+# -------------------------
+# Utilities
+# -------------------------
+def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 200] + "\n\n[...] (truncated)\n\n" + text[-200:]
+
+def get_public_ip() -> str:
+    try:
+        return requests.get("https://api.ipify.org", timeout=5).text
+    except Exception:
+        return "unable-to-fetch-ip"
+
+def send_telegram_sync(msg: str):
+    """Synchronous send_message using telegram.Bot — safe if called from a thread."""
+    if not telegram_bot or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured; message: %s", msg[:200])
+        return
+    try:
+        telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=msg)
+    except Exception:
+        log.exception("Failed to send telegram message (sync)")
+
+async def send_telegram(msg: str):
+    """Async wrapper that sends telegram via thread to avoid blocking loop."""
+    if not telegram_bot or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured; message: %s", msg[:200])
+        return
+    safe_msg = _shorten_for_telegram(msg)
+    await asyncio.to_thread(send_telegram_sync, safe_msg)
+
+# -------------------------
+# DB helpers
+# -------------------------
+def init_db():
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id TEXT PRIMARY KEY,
+        symbol TEXT,
+        side TEXT,
+        entry_price REAL,
+        exit_price REAL,
+        qty REAL,
+        notional REAL,
+        pnl REAL,
+        open_time TEXT,
+        close_time TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def record_trade(rec: Dict[str, Any]):
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT OR REPLACE INTO trades (id,symbol,side,entry_price,exit_price,qty,notional,pnl,open_time,close_time)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec.get('exit_price'),
+          rec['qty'], rec['notional'], rec.get('pnl'), rec['open_time'], rec.get('close_time')))
+    conn.commit()
+    conn.close()
+
+# -------------------------
+# Indicators (pure pandas / numpy)
+# -------------------------
+def kama(series: pd.Series, length: int, fast: int, slow: int) -> pd.Series:
+    price = series.values
+    n = len(price)
+    kama_arr = np.zeros(n)
+    sc_fast = 2 / (fast + 1)
+    sc_slow = 2 / (slow + 1)
+    if n >= length:
+        kama_arr[:length] = np.mean(price[:length])
+    else:
+        kama_arr[:] = price.mean()
+    for i in range(length, n):
+        change = abs(price[i] - price[i - length])
+        volatility = np.sum(np.abs(price[i - length + 1:i + 1] - price[i - length:i]))
+        er = 0.0
+        if volatility != 0:
+            er = change / volatility
+        sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
+        kama_arr[i] = kama_arr[i - 1] + sc * (price[i] - kama_arr[i - 1])
+    return pd.Series(kama_arr, index=series.index)
+
+def atr(df: pd.DataFrame, length: int) -> pd.Series:
+    high = df['high']; low = df['low']; close = df['close']
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(length, min_periods=1).mean()
+
+def adx(df: pd.DataFrame, length: int) -> pd.Series:
+    high = df['high']; low = df['low']; close = df['close']
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
+    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
+    tr1 = (high - low)
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_w = tr.rolling(length, min_periods=1).mean()
+    plus_di = 100 * (plus_dm.rolling(length, min_periods=1).sum() / atr_w)
+    minus_di = 100 * (minus_dm.rolling(length, min_periods=1).sum() / atr_w)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0) * 100
+    return dx.rolling(length, min_periods=1).mean()
+
+def choppiness_index(df: pd.DataFrame, length: int) -> pd.Series:
+    high = df['high']; low = df['low']; close = df['close']
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    sum_tr = tr.rolling(length, min_periods=1).sum()
+    hh = high.rolling(length, min_periods=1).max()
+    ll = low.rolling(length, min_periods=1).min()
+    denom = hh - ll
+    denom = denom.replace(0, np.nan)
+    chop = 100 * (np.log10(sum_tr / denom) / np.log10(length))
+    chop = chop.replace([np.inf, -np.inf], 100).fillna(100)
+    return chop
+
+def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
+    ma = df['close'].rolling(length, min_periods=1).mean()
+    std = df['close'].rolling(length, min_periods=1).std().fillna(0)
+    upper = ma + std_mult * std
+    lower = ma - std_mult * std
+    mid = ma.replace(0, np.nan)
+    width = (upper - lower) / mid
+    width = width.replace([np.inf, -np.inf], 100).fillna(100)
+    return width
+
+# -------------------------
+# Binance init (sync function, call via asyncio.to_thread where used)
+# -------------------------
+def init_binance_client_sync():
+    global client
+    try:
+        if USE_TESTNET:
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
+            log.warning("Binance client in TESTNET mode (USE_TESTNET=true).")
+        else:
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+            log.info("Binance client in MAINNET mode (default).")
+        try:
+            client.ping()
+            log.info("Connected to Binance API (ping ok).")
+        except Exception:
+            log.warning("Binance ping failed (connection may still succeed for calls).")
+        return True, ""
+    except Exception as e:
+        log.exception("Failed to connect to Binance API: %s", e)
+        ip = get_public_ip()
+        err = f"Binance init error: {e}; server_ip={ip}"
+        try:
+            send_telegram_sync(f"Binance init failed: {e}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
+        except Exception:
+            log.exception("Failed to notify via telegram about Binance init error.")
+        return False, err
+
+# -------------------------
+# Symbol helpers & rounding using Decimal
+# -------------------------
+def get_symbol_info(symbol: str) -> Optional[Dict[str, Any]]:
+    global client
+    if client is None:
+        log.debug("get_symbol_info: client is None")
+        return None
+    try:
+        info = client.futures_exchange_info()
+        symbols = info.get('symbols', []) if isinstance(info, dict) else []
+        return next((s for s in symbols if s.get('symbol') == symbol), None)
+    except Exception:
+        log.exception("get_symbol_info failed")
+    return None
+
+def get_max_leverage(symbol: str) -> int:
+    try:
+        s = get_symbol_info(symbol)
+        if s:
+            ml = s.get('maxLeverage') or s.get('leverage')
+            if ml:
+                try:
+                    return int(float(ml))
+                except Exception:
+                    pass
+        return 125
+    except Exception:
+        pass
+    return 125
+
+def round_qty(symbol: str, qty: float) -> float:
+    global client
+    try:
+        if client is None:
+            return float(qty)
+        info = client.futures_exchange_info()
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return float(qty)
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'LOT_SIZE':
+                step = Decimal(str(f.get('stepSize', '1')))
+                getcontext().prec = 28
+                q = Decimal(str(qty))
+                steps = (q // step)
+                quant = (steps * step).quantize(step, rounding=ROUND_DOWN)
+                if quant <= 0:
+                    return 0.0
+                return float(quant)
+    except Exception:
+        log.exception("round_qty failed; falling back to float")
+    return float(qty)
+
+# -------------------------
+# Orders (sync) - these are blocking; when called from async code use asyncio.to_thread(...)
+# -------------------------
+def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int):
+    global client
+    if client is None:
+        raise RuntimeError("Binance client not initialized")
+    try:
+        try:
+            client.futures_change_leverage(symbol=symbol, leverage=leverage)
+        except Exception:
+            log.exception("Failed to change leverage (non-fatal).")
+        order = client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=qty)
+        return order
+    except BinanceAPIException as e:
+        log.exception("BinanceAPIException opening position: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception opening position: %s", e)
+        raise
+
+def place_sl_tp_orders_sync(symbol: str, side: str, stop_price: float, take_price: float):
+    global client
+    out = {}
+    if client is None:
+        out['error'] = "client not initialized"
+        return out
+    try:
+        out['stop_order'] = client.futures_create_order(
+            symbol=symbol,
+            side='SELL' if side == 'BUY' else 'BUY',
+            type='STOP_MARKET',
+            stopPrice=round(stop_price, 8),
+            closePosition=True,
+            reduceOnly=True
+        )
+    except Exception as e:
+        out['stop_error'] = str(e)
+        log.exception("Failed to create stop loss order: %s", e)
+    try:
+        out['tp_order'] = client.futures_create_order(
+            symbol=symbol,
+            side='SELL' if side == 'BUY' else 'BUY',
+            type='TAKE_PROFIT_MARKET',
+            stopPrice=round(take_price, 8),
+            closePosition=True,
+            reduceOnly=True
+        )
+    except Exception as e:
+        out['tp_error'] = str(e)
+        log.exception("Failed to create take profit order: %s", e)
+    return out
+
+def cancel_close_orders_sync(symbol: str):
+    global client
+    if client is None:
+        return
+    try:
+        orders = client.futures_get_open_orders(symbol=symbol)
+        for o in orders:
+            if o.get('type') in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] or o.get('closePosition'):
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=o['orderId'])
+                except Exception:
+                    log.exception("Failed to cancel order %s", o.get('orderId'))
+    except Exception:
+        log.exception("Error canceling close orders: %s", symbol)
+
+# -------------------------
+# Risk function
+# -------------------------
+def calculate_risk_amount(account_balance: float) -> float:
+    if account_balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
+        risk = CONFIG["RISK_SMALL_FIXED_USDT"]
+    else:
+        risk = account_balance * CONFIG["RISK_PCT_LARGE"]
+    max_cap = CONFIG.get("MAX_RISK_USDT", 0.0)
+    if max_cap and max_cap > 0:
+        risk = min(risk, max_cap)
+    return float(risk)
+
+# -------------------------
+# Validation (sync). We'll call via asyncio.to_thread
+# -------------------------
+def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
+    results = {"ok": True, "checks": []}
+    # env presence
+    missing = []
+    for name in ("BINANCE_API_KEY", "BINANCE_API_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        if not globals().get(name):
+            missing.append(name)
+    if missing:
+        results["ok"] = False
+        results["checks"].append({"type": "env", "ok": False, "detail": f"Missing env: {missing}"})
+    else:
+        results["checks"].append({"type": "env", "ok": True})
+    # adx range
+    adx_val = CONFIG["ADX_THRESHOLD"]
+    if not (0 <= adx_val <= 100):
+        results["ok"] = False
+        results["checks"].append({"type": "adx_threshold", "ok": False, "detail": adx_val})
+    else:
+        results["checks"].append({"type": "adx_threshold", "ok": True})
+    # binance init
+    ok, err = init_binance_client_sync()
+    if not ok:
+        results["ok"] = False
+        results["checks"].append({"type": "binance_connect", "ok": False, "detail": err})
+    else:
+        results["checks"].append({"type": "binance_connect", "ok": True})
+    # sample fetch indicators
+    sample_sym = CONFIG["SYMBOLS"][0].strip().upper() if CONFIG["SYMBOLS"] else None
+    if sample_sym and ok:
+        try:
+            raw = client.futures_klines(symbol=sample_sym, interval=CONFIG["TIMEFRAME"], limit=120)
+            cols = ['open_time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore']
+            raw_df = pd.DataFrame(raw, columns=cols)
+            raw_df['open_time'] = pd.to_datetime(raw_df['open_time'], unit='ms')
+            raw_df['close_time'] = pd.to_datetime(raw_df['close_time'], unit='ms')
+            for c in ['open','high','low','close','volume']:
+                raw_df[c] = raw_df[c].astype(float)
+            raw_df.set_index('close_time', inplace=True)
+            k = kama(raw_df['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
+            a = atr(raw_df, CONFIG["ATR_LENGTH"])
+            ad = adx(raw_df, CONFIG["ADX_LENGTH"])
+            ch = choppiness_index(raw_df, CONFIG["CHOP_LENGTH"])
+            bw = bb_width(raw_df, CONFIG["BB_LENGTH"], CONFIG["BB_STD"])
+            results["checks"].append({"type": "indicators_sample", "ok": True, "detail": {
+                "kama": float(k.iloc[-1]), "atr": float(a.iloc[-1]), "adx": float(ad.iloc[-1]),
+                "chop": float(ch.iloc[-1]), "bbw": float(bw.iloc[-1])
+            }})
+        except Exception as e:
+            results["ok"] = False
+            results["checks"].append({"type": "indicators_sample", "ok": False, "detail": str(e)})
+    report_lines = [f"Validation results: OK={results['ok']}"]
+    for c in results["checks"]:
+        report_lines.append(f"- {c['type']}: ok={c['ok']} detail={c.get('detail')}")
+    report_text = "\n".join(report_lines)
+    if send_report:
+        send_telegram_sync(report_text)
+    return results
+
+# -------------------------
+# Candle counting helper
+# -------------------------
+def candles_since_close(df: pd.DataFrame, close_time: Optional[datetime]) -> int:
+    if not close_time:
+        return 99999
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=timezone.utc)
+    return int((df.index > close_time).sum())
+
+# -------------------------
+# Wrapper fetch_klines (sync) - blocking; call via asyncio.to_thread
+# -------------------------
+def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    global client
+    if client is None:
+        raise RuntimeError("Binance client not initialized")
+    raw = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    cols = ['open_time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore']
+    df = pd.DataFrame(raw, columns=cols)
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+    df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
+    for c in ['open','high','low','close','volume']:
+        df[c] = df[c].astype(float)
+    df.set_index('close_time', inplace=True)
+    return df[['open','high','low','close','volume']]
+
+# -------------------------
+# Core evaluate & entry (async)
+# -------------------------
+async def evaluate_and_enter(symbol: str):
+    global managed_trades, running, frozen
+    if frozen or not running:
+        return
+    try:
+        # fetch entry timeframe candles (blocking in thread)
+        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 500)
+        # compute indicators
+        df['kama'] = kama(df['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
+        df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
+        df['adx'] = adx(df, CONFIG["ADX_LENGTH"])
+        df['chop'] = choppiness_index(df, CONFIG["CHOP_LENGTH"])
+        df['bbw'] = bb_width(df, CONFIG["BB_LENGTH"], CONFIG["BB_STD"])
+
+        last = df.iloc[-1]; prev = df.iloc[-2]
+        price = last['close']
+        kama_now = last['kama']; kama_prev = prev['kama']
+        atr_now = last['atr']; adx_now = last['adx']; chop_now = last['chop']; bbw_now = last['bbw']
+
+        trend_small = 'bull' if (kama_now - kama_prev) > 0 else 'bear'
+
+        # big timeframe KAMA (blocking)
+        df_big = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["BIG_TIMEFRAME"], 200)
+        df_big['kama'] = kama(df_big['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
+        trend_big = 'bull' if (df_big['kama'].iloc[-1] - df_big['kama'].iloc[-2]) > 0 else 'bear'
+
+        # filters
+        if adx_now < CONFIG["ADX_THRESHOLD"]:
+            log.debug("%s skip: ADX %.2f < %.2f", symbol, adx_now, CONFIG["ADX_THRESHOLD"]); return
+        if chop_now >= CONFIG["CHOP_THRESHOLD"]:
+            log.debug("%s skip: CHOP %.2f >= %.2f", symbol, chop_now, CONFIG["CHOP_THRESHOLD"]); return
+        if (bbw_now * 100.0) >= CONFIG["BBWIDTH_THRESHOLD"]:
+            log.debug("%s skip: BBwidth*100 %.4f >= %.2f", symbol, (bbw_now * 100.0), CONFIG["BBWIDTH_THRESHOLD"]); return
+        if trend_small != trend_big:
+            log.debug("%s skip: trend mismatch small=%s big=%s", symbol, trend_small, trend_big); return
+
+        crossed_above = (prev['close'] <= prev['kama']) and (last['close'] > kama_now)
+        crossed_below = (prev['close'] >= prev['kama']) and (last['close'] < kama_now)
+        if not (crossed_above or crossed_below):
+            return
+
+        side = None
+        if crossed_above and trend_small == 'bull':
+            side = 'BUY'
+        elif crossed_below and trend_small == 'bear':
+            side = 'SELL'
+        if not side:
+            return
+
+        # concurrency atomic check & add must be performed under lock
+        async with managed_trades_lock:
+            if len(managed_trades) >= CONFIG["MAX_CONCURRENT_TRADES"]:
+                log.debug("Max concurrent trades reached")
+                return
+
+        # cooldown
+        async with managed_trades_lock:
+            last_close = last_trade_close_time.get(symbol)
+        if last_close:
+            n_since = candles_since_close(df, last_close)
+            if n_since < CONFIG["MIN_CANDLES_AFTER_CLOSE"]:
+                log.info("%s skip due to cooldown: %d/%d", symbol, n_since, CONFIG["MIN_CANDLES_AFTER_CLOSE"])
+                return
+
+        # calculate SL/TP
+        sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
+        if sl_distance <= 0 or math.isnan(sl_distance):
+            return
+        stop_price = price - sl_distance if side == 'BUY' else price + sl_distance
+        take_price = price + sl_distance if side == 'BUY' else price - sl_distance
+
+        # sizing: use calculate_risk_amount
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        risk_usdt = calculate_risk_amount(balance)
+        if risk_usdt <= 0:
+            log.warning("Risk amount non-positive"); return
+        price_distance = abs(price - stop_price)
+        if price_distance <= 0:
+            return
+        qty = risk_usdt / price_distance
+        qty = await asyncio.to_thread(round_qty, symbol, qty)
+        if qty <= 0:
+            log.warning("Qty rounded to zero; skipping"); return
+        notional = qty * price
+        target_initial_margin = risk_usdt
+        leverage = max(1, int(min(get_max_leverage(symbol), math.floor(notional / max(target_initial_margin, 1e-8)))))
+        if notional <= target_initial_margin:
+            leverage = 1
+
+        # Create order (blocking) on thread
+        try:
+            order = await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
+            order_id = str(order.get('orderId', f"mkt_{int(time.time())}"))
+            sltp = await asyncio.to_thread(place_sl_tp_orders_sync, symbol, side, stop_price, take_price)
+            trade_id = f"{symbol}_{order_id}"
+            meta = {
+                "id": trade_id, "symbol": symbol, "side": side, "entry_price": price,
+                "qty": qty, "notional": notional, "leverage": leverage,
+                "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
+                "sltp_orders": sltp, "trailing": CONFIG["TRAILING_ENABLED"]
+            }
+            # add to managed_trades under lock
+            async with managed_trades_lock:
+                managed_trades[trade_id] = meta
+            record_trade({'id': trade_id, 'symbol': symbol, 'side': side, 'entry_price': price,
+                          'exit_price': None, 'qty': qty, 'notional': notional, 'pnl': None,
+                          'open_time': meta['open_time'], 'close_time': None})
+            await send_telegram(f"Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
+            log.info("Opened trade: %s", meta)
+        except Exception as e:
+            log.exception("Failed to open trade for %s: %s", symbol, e)
+            tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+            safe_tb = _shorten_for_telegram(tb)
+            await send_telegram(f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+            # pause new entries
+            global running
+            running = False
+        return
+
+    except Exception as e:
+        log.exception("evaluate_and_enter error %s: %s", symbol, e)
+        tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+        safe_tb = _shorten_for_telegram(tb)
+        await send_telegram(f"Scan error for {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+
+# -------------------------
+# get_account_balance_usdt (sync) - used via to_thread
+# -------------------------
+def get_account_balance_usdt():
+    global client
+    try:
+        if client is None:
+            return 0.0
+        acct = client.futures_account_balance()
+        for entry in acct:
+            if entry.get('asset') == 'USDT':
+                return float(entry.get('withdrawAvailable') or entry.get('balance') or 0.0)
+    except Exception:
+        log.exception("Failed to fetch account balance")
+    return 0.0
+
+# -------------------------
+# Monitor thread (sync)
+# -------------------------
+def monitor_thread_func():
+    """
+    Dedicated monitor thread that periodically:
+      - fetches positions
+      - detects closed positions and records them
+      - runs trailing stop adjustments when enabled
+    """
+    global managed_trades, last_trade_close_time, running
+    log.info("Monitor thread started.")
+    while not monitor_stop_event.is_set():
+        try:
+            if client is None:
+                time.sleep(5)
+                continue
+            try:
+                positions = client.futures_position_information()
+            except Exception as e:
+                log.exception("Error fetching positions in monitor thread: %s", e)
+                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                safe_tb = _shorten_for_telegram(tb)
+                send_telegram_sync(f"Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+                running = False
+                time.sleep(10)
+                continue
+
+            # snapshot trades under thread lock
+            managed_trades_lock.acquire()
+            try:
+                trades_snapshot = dict(managed_trades)
+            finally:
+                managed_trades_lock.release()
+
+            to_remove = []
+            for tid, meta in trades_snapshot.items():
+                try:
+                    sym = meta['symbol']
+                    pos = next((p for p in positions if p.get('symbol') == sym), None)
+                    if not pos:
+                        continue
+                    pos_amt = float(pos.get('positionAmt') or 0.0)
+                    unreal = float(pos.get('unRealizedProfit') or 0.0)
+                    # closed / no position
+                    if abs(pos_amt) < 1e-8:
+                        close_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+                        meta['close_time'] = close_time.isoformat()
+                        record_trade({'id': meta['id'], 'symbol': meta['symbol'], 'side': meta['side'],
+                                      'entry_price': meta['entry_price'], 'exit_price': float(pos.get('entryPrice') or 0.0),
+                                      'qty': meta['qty'], 'notional': meta['notional'], 'pnl': unreal,
+                                      'open_time': meta['open_time'], 'close_time': meta['close_time']})
+                        # update last_trade_close_time under lock
+                        managed_trades_lock.acquire()
+                        try:
+                            last_trade_close_time[sym] = close_time
+                        finally:
+                            managed_trades_lock.release()
+                        send_telegram_sync(f"Trade closed {meta['id']} on {sym}\nPNL: {unreal:.6f} USDT\nCooldown: {CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles")
+                        to_remove.append(tid)
+                        continue
+
+                    # trailing logic (use sync fetch + order methods)
+                    if meta.get('trailing'):
+                        try:
+                            df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
+                            atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
+                            current_price = df['close'].iloc[-1]
+                            moved = False
+                            if meta['side'] == 'BUY':
+                                if current_price > meta['entry_price'] + 1.0 * atr_now:
+                                    new_sl = meta['entry_price'] + 0.5 * atr_now
+                                    if new_sl > meta['sl'] and new_sl < current_price:
+                                        cancel_close_orders_sync(sym)
+                                        place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
+                                        meta['sl'] = new_sl
+                                        moved = True
+                            else:
+                                if current_price < meta['entry_price'] - 1.0 * atr_now:
+                                    new_sl = meta['entry_price'] - 0.5 * atr_now
+                                    if new_sl < meta['sl'] and new_sl > current_price:
+                                        cancel_close_orders_sync(sym)
+                                        place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
+                                        meta['sl'] = new_sl
+                                        moved = True
+                            if moved:
+                                send_telegram_sync(f"Adjusted SL for {meta['id']} ({sym}) -> {meta['sl']:.6f}")
+                        except Exception:
+                            log.exception("Trailing internal error in monitor thread")
+                except Exception:
+                    log.exception("Error handling trade in monitor thread")
+            # perform removals under lock
+            if to_remove:
+                managed_trades_lock.acquire()
+                try:
+                    for tid in to_remove:
+                        managed_trades.pop(tid, None)
+                finally:
+                    managed_trades_lock.release()
+            # sleep short
+            time.sleep(5)
+        except Exception:
+            log.exception("Unhandled exception in monitor thread")
+            time.sleep(5)
+    log.info("Monitor thread exiting.")
+
+# -------------------------
+# Scanning loop (async)
+# -------------------------
+async def scanning_loop():
+    while True:
+        try:
+            if not running:
+                await asyncio.sleep(2)
+                continue
+            symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"]]
+            for s in symbols:
+                try:
+                    await evaluate_and_enter(s)
+                except Exception:
+                    log.exception("Error in evaluate loop for %s", s)
+                await asyncio.sleep(max(0.5, CONFIG["SCAN_INTERVAL"] / max(1, len(symbols))))
+        except Exception:
+            log.exception("Scanning loop error")
+        await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
+
+# -------------------------
+# Telegram: Helper coroutine to snapshot managed trades (for telegram thread)
+# -------------------------
+async def get_managed_trades_snapshot():
+    async with managed_trades_lock:
+        return dict(managed_trades)
+
+# -------------------------
+# Telegram handling: dedicated polling thread (sync)
+# -------------------------
+def build_control_keyboard():
+    buttons = [
+        [InlineKeyboardButton("Start", callback_data="start") , InlineKeyboardButton("Stop", callback_data="stop")],
+        [InlineKeyboardButton("Freeze", callback_data="freeze"), InlineKeyboardButton("Unfreeze", callback_data="unfreeze")],
+        [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+def handle_update_sync(update, loop):
+    """
+    Runs in the telegram thread. For actions that need to interact with async state,
+    we schedule coroutines on the main event loop using run_coroutine_threadsafe.
+    """
+    try:
+        if update is None:
+            return
+        if getattr(update, 'message', None):
+            msg = update.message
+            text = (msg.text or "").strip()
+            chat_id = msg.chat_id
+            # quick commands handled synchronously or schedule async where needed
+            if text.startswith("/startbot"):
+                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot state -> RUNNING")
+            elif text.startswith("/stopbot"):
+                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot state -> STOPPED")
+            elif text.startswith("/freeze"):
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot -> FROZEN (no new entries)")
+            elif text.startswith("/unfreeze"):
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot -> UNFROZEN")
+            elif text.startswith("/status"):
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try:
+                    trades = fut.result(timeout=5)
+                except Exception:
+                    pass
+                txt = f"Status:\nrunning={running}\nfrozen={frozen}\nmanaged_trades={len(trades)}"
+                send_telegram_sync(txt)
+                try:
+                    telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
+                except Exception:
+                    pass
+            elif text.startswith("/ip"):
+                ip = get_public_ip()
+                send_telegram_sync(f"Server IP: {ip}")
+            elif text.startswith("/listorders"):
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try:
+                    trades = fut.result(timeout=5)
+                except Exception:
+                    pass
+                if not trades:
+                    send_telegram_sync("No managed trades.")
+                else:
+                    out = "Open trades:\n"
+                    for k, v in trades.items():
+                        out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f}\n"
+                    send_telegram_sync(out)
+            elif text.startswith("/showparams"):
+                out = "Current runtime params:\n"
+                for k,v in CONFIG.items():
+                    out += f"{k} = {v}\n"
+                send_telegram_sync(out)
+            elif text.startswith("/setparam"):
+                # /setparam KEY VALUE
+                parts = text.split()
+                if len(parts) >= 3:
+                    key = parts[1]
+                    val = " ".join(parts[2:])
+                    if key not in CONFIG:
+                        send_telegram_sync(f"Parameter {key} not found.")
+                    else:
+                        old = CONFIG[key]
+                        try:
+                            if isinstance(old, bool):
+                                CONFIG[key] = val.lower() in ("1","true","yes","on")
+                            elif isinstance(old, int):
+                                CONFIG[key] = int(val)
+                            elif isinstance(old, float):
+                                CONFIG[key] = float(val)
+                            elif isinstance(old, list):
+                                CONFIG[key] = [x.strip().upper() for x in val.split(",")]
+                            else:
+                                CONFIG[key] = val
+                            send_telegram_sync(f"Set {key} = {CONFIG[key]}")
+                        except Exception as e:
+                            send_telegram_sync(f"Failed to set {key}: {e}")
+                else:
+                    send_telegram_sync("Usage: /setparam KEY VALUE")
+            elif text.startswith("/validate"):
+                result = validate_and_sanity_check_sync(send_report=False)
+                send_telegram_sync("Validation result: " + ("OK" if result["ok"] else "ERROR"))
+                # send details
+                for c in result["checks"]:
+                    send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+            else:
+                send_telegram_sync("Unknown command. Use /status or buttons.")
+        elif getattr(update, 'callback_query', None):
+            cq = update.callback_query
+            data = cq.data
+            # answer callback immediately
+            try:
+                telegram_bot.answer_callback_query(callback_query_id=cq.id, text=f"Action: {data}")
+            except Exception:
+                pass
+            # map actions
+            if data == "start":
+                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot state -> RUNNING")
+            elif data == "stop":
+                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot state -> STOPPED")
+            elif data == "freeze":
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot -> FROZEN")
+            elif data == "unfreeze":
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
+                send_telegram_sync("Bot -> UNFROZEN")
+            elif data == "listorders":
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try:
+                    trades = fut.result(timeout=5)
+                except Exception:
+                    pass
+                if not trades:
+                    send_telegram_sync("No managed trades.")
+                else:
+                    out = "Open trades:\n"
+                    for k, v in trades.items():
+                        out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f}\n"
+                    send_telegram_sync(out)
+            elif data == "showparams":
+                out = "Current runtime params:\n"
+                for k,v in CONFIG.items():
+                    out += f"{k} = {v}\n"
+                send_telegram_sync(out)
+    except Exception:
+        log.exception("Error in handle_update_sync")
+
+def telegram_polling_thread(loop):
+    """
+    Dedicated thread to poll telegram (blocking). Delegates actions to asyncio loop when required.
+    """
+    global telegram_bot
+    if not telegram_bot:
+        log.info("telegram thread not started: bot not configured")
+        return
+    offset = None
+    while True:
+        try:
+            updates = telegram_bot.get_updates(offset=offset, timeout=20)
+            for u in updates:
+                offset = u.update_id + 1
+                handle_update_sync(u, loop)
+            time.sleep(0.2)
+        except Exception:
+            log.exception("Telegram polling thread error")
+            try:
+                ip = get_public_ip()
+                send_telegram_sync(f"Telegram polling error. Server IP: {ip}")
+            except Exception:
+                pass
+            time.sleep(5)
+
+# -------------------------
+# Small coroutines to set flags from telegram thread
+# -------------------------
+async def _set_running(val: bool):
+    global running
+    running = val
+
+async def _set_frozen(val: bool):
+    global frozen
+    frozen = val
+
+# -------------------------
+# Error handler helper (async)
+# -------------------------
+async def handle_critical_error_async(exc: Exception, context: str = None):
+    global running
+    running = False
+    ip = await asyncio.to_thread(get_public_ip)
+    tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else "No traceback"
+    safe_tb = _shorten_for_telegram(tb)
+    msg = f"CRITICAL ERROR: {context or ''}\nException: {str(exc)}\n\nTraceback:\n{safe_tb}\nServer IP: {ip}\nBot paused."
+    await send_telegram(msg)
+
+# -------------------------
+# FastAPI endpoint
+# -------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "running": running, "managed_trades": len(managed_trades)}
+
+# -------------------------
+# Startup / Shutdown
+# -------------------------
+@app.on_event("startup")
+async def startup_event():
+    global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
+    init_db()
+    # init binance client in thread (blocking)
+    ok, err = await asyncio.to_thread(init_binance_client_sync)
+    # run validate in thread and send report
+    await asyncio.to_thread(validate_and_sanity_check_sync, True)
+    # start scan task
+    loop = asyncio.get_running_loop()
+    scan_task = loop.create_task(scanning_loop())
+    # start monitor thread (dedicated)
+    monitor_stop_event.clear()
+    monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
+    monitor_thread_obj.start()
+    log.info("Started monitor thread.")
+    # start telegram thread if configured
+    if telegram_bot:
+        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
+        telegram_thread.start()
+        log.info("Started telegram polling thread.")
+    else:
+        log.info("Telegram not configured; telegram thread not started.")
+    # final notification
+    try:
+        await send_telegram("KAMA strategy bot started. Running={}".format(running))
+    except Exception:
+        log.exception("Failed to send startup telegram")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    # signal monitor thread to stop and join
+    try:
+        monitor_stop_event.set()
+        if monitor_thread_obj and monitor_thread_obj.is_alive():
+            monitor_thread_obj.join(timeout=5)
+    except Exception:
+        log.exception("Error stopping monitor thread")
+    # notify
+    try:
+        await send_telegram("KAMA strategy bot shutting down.")
+    except Exception:
+        pass
+
+# graceful signal handlers
+def _signal_handler(sig, frame):
+    log.info("Received signal %s, shutting down", sig)
+    try:
+        send_telegram_sync(f"Received signal {sig}. Shutting down.")
+    except Exception:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+# If run as main (uvicorn will run app normally)
+if __name__ == "__main__":
+    # quick local test entry point
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(startup_event())
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
