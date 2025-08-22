@@ -33,6 +33,7 @@ from binance.exceptions import BinanceAPIException
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
+from telegram.utils.request import Request
 
 # -------------------------
 # CONFIG (edit values here)
@@ -90,7 +91,11 @@ app = FastAPI()
 
 # Globals
 client: Optional[Client] = None
-telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+if TELEGRAM_BOT_TOKEN:
+    tg_request = Request(con_pool_size=8)
+    telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN, request=tg_request)
+else:
+    telegram_bot: Optional[telegram.Bot] = None
 
 running = (CONFIG["START_MODE"] == "running")
 frozen = False
@@ -745,6 +750,12 @@ def monitor_thread_func():
             except Exception as e:
                 # sanitize the Binance response (may be HTML)
                 raw = str(e)
+                if isinstance(e, BinanceAPIException) and "<html" in raw.lower():
+                    log.warning(
+                        "Binance API returned an HTML page instead of JSON. "
+                        "This commonly happens when the server's IP address is not whitelisted in the Binance API key settings. "
+                        "Please verify the IP whitelist."
+                    )
                 teaser = sanitize_error_for_telegram(raw, max_len=1500)
                 log.exception("Error fetching positions in monitor thread: %s", teaser)
                 send_telegram_sync(f"Error fetching positions: {teaser}\nServer IP: {get_public_ip()}")
@@ -1085,12 +1096,13 @@ async def startup_event():
     monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
     monitor_thread_obj.start()
     log.info("Started monitor thread.")
-    if telegram_bot:
+    run_poller = os.getenv("RUN_TELEGRAM_POLLER", "true").lower() in ("true", "1", "yes")
+    if telegram_bot and run_poller:
         telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
         telegram_thread.start()
-        log.info("Started telegram polling thread.")
+        log.info("Started telegram polling thread (RUN_TELEGRAM_POLLER=true).")
     else:
-        log.info("Telegram not configured; telegram thread not started.")
+        log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
     try:
         await send_telegram("KAMA strategy bot started. Running={}".format(running))
     except Exception:
