@@ -1304,8 +1304,8 @@ async def startup_event():
 
 async def initialize_bot():
     global scan_task, monitor_thread_obj, client, monitor_stop_event
-    
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    try:
+        WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if telegram_bot and WEBHOOK_URL:
         webhook_url_with_token = f"{WEBHOOK_URL}/webhook/{TELEGRAM_BOT_TOKEN}"
         success = await asyncio.to_thread(telegram_bot.set_webhook, url=webhook_url_with_token)
@@ -1362,6 +1362,9 @@ async def initialize_bot():
         await send_telegram("KAMA strategy bot started. Running={}".format(running))
     except Exception:
         log.exception("Failed to send startup telegram")
+    except Exception as e:
+        log.exception("A critical error occurred during bot initialization.")
+        await handle_critical_error_async(e, "Bot Initialization Failed")
 
 @app.on_event("shutdown")
 async def shutdown_event():
