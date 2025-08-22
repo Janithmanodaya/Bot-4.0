@@ -431,8 +431,8 @@ def init_binance_client_sync():
     if tunnel_server and tunnel_server.is_active:
         local_bind_port = TUNNEL_CONFIG["local_bind_port"]
         proxies = {
-            'http': f'socks5h://127.0.0.1:{local_bind_port}',
-            'https': f'socks5h://127.0.0.1:{local_bind_port}'
+            'http': f'socks5://127.0.0.1:{local_bind_port}',
+            'https': f'socks5://127.0.0.1:{local_bind_port}'
         }
         req_params['proxies'] = proxies
         log.info(f"Tunnel active, using proxies: {proxies}")
@@ -1305,8 +1305,8 @@ async def startup_event():
         if tunnel_server and tunnel_server.is_active:
             local_bind_port = TUNNEL_CONFIG["local_bind_port"]
             proxies = {
-                'http': f'socks5h://127.0.0.1:{local_bind_port}',
-                'https': f'socks5h://127.0.0.1:{local_bind_port}'
+                'http': f'socks5://127.0.0.1:{local_bind_port}',
+                'https': f'socks5://127.0.0.1:{local_bind_port}'
             }
             tunnel_ip = get_public_ip(proxies=proxies)
             startup_message += f"\nTunnel IP: {tunnel_ip}"
