@@ -1091,6 +1091,11 @@ async def startup_event():
     global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
     init_db()
     ok, err = await asyncio.to_thread(init_binance_client_sync)
+    if not ok:
+        log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
+        await send_telegram(f"CRITICAL: Bot failed to start. Binance client initialization failed: {err}")
+        return
+
     await asyncio.to_thread(validate_and_sanity_check_sync, True)
     loop = asyncio.get_running_loop()
     scan_task = loop.create_task(scanning_loop())
