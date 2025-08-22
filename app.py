@@ -1,4 +1,3 @@
-
 # app.py
 """
 KAMA trend-following bot — fixed for:
@@ -624,14 +623,23 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
         results["checks"].append({"type": "adx_threshold", "ok": False, "detail": adx_val})
     else:
         results["checks"].append({"type": "adx_threshold", "ok": True})
-    ok, err = init_binance_client_sync()
-    if not ok:
-        results["ok"] = False
-        results["checks"].append({"type": "binance_connect", "ok": False, "detail": err})
+    
+    # Check Binance connection status
+    binance_ok = False
+    if client:
+        try:
+            client.ping()
+            results["checks"].append({"type": "binance_connect", "ok": True})
+            binance_ok = True
+        except Exception as e:
+            results["ok"] = False
+            results["checks"].append({"type": "binance_connect", "ok": False, "detail": str(e)})
     else:
-        results["checks"].append({"type": "binance_connect", "ok": True})
+        results["ok"] = False
+        results["checks"].append({"type": "binance_connect", "ok": False, "detail": "Client not initialized"})
+
     sample_sym = CONFIG["SYMBOLS"][0].strip().upper() if CONFIG["SYMBOLS"] else None
-    if sample_sym and ok:
+    if sample_sym and binance_ok:
         try:
             raw = client.futures_klines(symbol=sample_sym, interval=CONFIG["TIMEFRAME"], limit=120)
             cols = ['open_time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore']
