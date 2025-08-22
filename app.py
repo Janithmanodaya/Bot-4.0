@@ -34,6 +34,7 @@ import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.utils.request import Request
+import sshtunnel
 
 # -------------------------
 # CONFIG (edit values here)
@@ -92,6 +93,18 @@ app = FastAPI()
 
 # Globals
 client: Optional[Client] = None
+TUNNEL_CONFIG = {
+    "enabled": os.getenv("TUNNEL_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "host": os.getenv("TUNNEL_HOST"),
+    "port": int(os.getenv("TUNNEL_PORT", "22")),
+    "user": os.getenv("TUNNEL_USER"),
+    "password": os.getenv("TUNNEL_PASSWORD"),
+    "local_bind_port": int(os.getenv("TUNNEL_LOCAL_PORT", "1080")),
+    "remote_bind_host": os.getenv("TUNNEL_REMOTE_HOST", "fapi.binance.com"),
+    "remote_bind_port": int(os.getenv("TUNNEL_REMOTE_PORT", "443")),
+}
+tunnel_server = None
+
 if TELEGRAM_BOT_TOKEN:
     tg_request = Request(con_pool_size=8)
     telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN, request=tg_request)
@@ -342,31 +355,92 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
     return width
 
 # -------------------------
+# Tunnel Management
+# -------------------------
+def start_tunnel_sync():
+    global tunnel_server
+    if not TUNNEL_CONFIG.get("enabled"):
+        return True, "Tunnel not enabled."
+    
+    if tunnel_server and tunnel_server.is_active:
+        log.info("Tunnel is already active.")
+        return True, "Tunnel already active."
+
+    try:
+        # Use a fixed local bind address. The port can be configured.
+        local_bind_address = '127.0.0.1'
+        
+        tunnel_server = sshtunnel.SSHTunnelForwarder(
+            (TUNNEL_CONFIG["host"], TUNNEL_CONFIG["port"]),
+            ssh_username=TUNNEL_CONFIG["user"],
+            ssh_password=TUNNEL_CONFIG["password"],
+            remote_bind_address=(TUNNEL_CONFIG["remote_bind_host"], TUNNEL_CONFIG["remote_bind_port"]),
+            local_bind_address=(local_bind_address, TUNNEL_CONFIG["local_bind_port"])
+        )
+        tunnel_server.start()
+        log.info(f"SSH tunnel started: {local_bind_address}:{tunnel_server.local_bind_port} -> {TUNNEL_CONFIG['remote_bind_host']}:{TUNNEL_CONFIG['remote_bind_port']}")
+        return True, "Tunnel started successfully."
+    except Exception as e:
+        log.exception("Failed to start SSH tunnel.")
+        tunnel_server = None
+        return False, str(e)
+
+def stop_tunnel_sync():
+    global tunnel_server
+    if tunnel_server and tunnel_server.is_active:
+        log.info("Stopping SSH tunnel.")
+        tunnel_server.stop()
+        tunnel_server = None
+    else:
+        log.info("SSH tunnel is not running or already stopped.")
+
+# -------------------------
 # Binance init (sync)
 # -------------------------
 def init_binance_client_sync():
-    global client, EXCHANGE_INFO_CACHE
+    global client, tunnel_server, EXCHANGE_INFO_CACHE
+    
+    # Reset client at the start of initialization
+    client = None
+    EXCHANGE_INFO_CACHE['data'] = None
+    EXCHANGE_INFO_CACHE['ts'] = 0.0
+
+    # Start the tunnel if it's enabled
+    tunnel_ok, tunnel_msg = start_tunnel_sync()
+    if not tunnel_ok:
+        return False, f"Tunnel failed to start: {tunnel_msg}"
+
+    # Prepare requests parameters (for proxy, if tunnel is active)
+    req_params = {}
+    if tunnel_server and tunnel_server.is_active:
+        local_bind_port = TUNNEL_CONFIG["local_bind_port"]
+        proxies = {
+            'http': f'socks5h://127.0.0.1:{local_bind_port}',
+            'https': f'socks5h://127.0.0.1:{local_bind_port}'
+        }
+        req_params['proxies'] = proxies
+        log.info(f"Tunnel active, using proxies: {proxies}")
+
     try:
+        log.info("Initializing Binance client...")
         if USE_TESTNET:
-            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
-            log.warning("Binance client in TESTNET mode (USE_TESTNET=true).")
+            # Note: Tunneling for testnet might require different remote_bind_address.
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True, requests_params=req_params)
+            log.warning("Binance client in TESTNET mode.")
         else:
-            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, tld=BINANCE_TLD)
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, tld=BINANCE_TLD, requests_params=req_params)
             log.info(f"Binance client in MAINNET mode (tld={BINANCE_TLD}).")
-        try:
-            client.ping()
-            log.info("Connected to Binance API (ping ok).")
-        except Exception:
-            log.warning("Binance ping failed (connection may still succeed for calls).")
-        EXCHANGE_INFO_CACHE['data'] = None
-        EXCHANGE_INFO_CACHE['ts'] = 0.0
+        
+        client.ping()
+        log.info("Connected to Binance API (ping ok).")
         return True, ""
     except Exception as e:
-        log.exception("Failed to connect to Binance API: %s", e)
-        ip = get_public_ip()
-        err = f"Binance init error: {e}; server_ip={ip}"
+        log.exception("Failed to connect to Binance API")
+        stop_tunnel_sync() # Stop tunnel if connection failed, to allow clean retry
+        err = f"Binance init error: {e}"
+        # No need to get public IP if we are using a tunnel or failing for other reasons
         try:
-            send_telegram_sync(f"Binance init failed: {sanitize_error_for_telegram(str(e))}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
+            send_telegram_sync(f"Binance init failed: {sanitize_error_for_telegram(str(e))}")
         except Exception:
             log.exception("Failed to notify via telegram about Binance init error.")
         return False, err
@@ -889,7 +963,8 @@ def build_control_keyboard():
     buttons = [
         [InlineKeyboardButton("Start", callback_data="start"), InlineKeyboardButton("Stop", callback_data="stop")],
         [InlineKeyboardButton("Freeze", callback_data="freeze"), InlineKeyboardButton("Unfreeze", callback_data="unfreeze")],
-        [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")]
+        [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")],
+        [InlineKeyboardButton("Tunnel Status", callback_data="tunnelstatus")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -953,6 +1028,13 @@ def handle_update_sync(update, loop):
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
                 send_telegram_sync(out)
+            elif data == "tunnelstatus":
+                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                out = f"Tunnel Status: {status}\\n-- Config --\\n"
+                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                for k,v in cfg_safe.items():
+                    out += f"{k} = {v}\\n"
+                send_telegram_sync(out)
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
@@ -983,6 +1065,34 @@ def handle_update_sync(update, loop):
                 send_telegram_sync("Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
                     send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+            elif text.startswith("/tunnelstatus"):
+                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                out = f"Tunnel Status: {status}\\n-- Config --\\n"
+                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                for k,v in cfg_safe.items():
+                    out += f"{k} = {v}\\n"
+                send_telegram_sync(out)
+            elif text.startswith("/settunnel"):
+                parts = text.split()
+                if len(parts) >= 3:
+                    key = parts[1].lower()
+                    val = " ".join(parts[2:])
+                    if key not in TUNNEL_CONFIG:
+                        send_telegram_sync(f"Tunnel parameter {key} not found.")
+                    else:
+                        try:
+                            if key == 'enabled':
+                                TUNNEL_CONFIG[key] = val.lower() in ("1","true","yes","on")
+                            elif key in ['port', 'local_bind_port', 'remote_bind_port']:
+                                TUNNEL_CONFIG[key] = int(val)
+                            else:
+                                TUNNEL_CONFIG[key] = val
+                            send_telegram_sync(f"Set tunnel param {key} = {TUNNEL_CONFIG[key]}")
+                            send_telegram_sync("NOTE: A restart is required for tunnel changes to take effect.")
+                        except Exception as e:
+                            send_telegram_sync(f"Failed to set {key}: {e}")
+                else:
+                    send_telegram_sync("Usage: /settunnel <param> <value>")
             else:
                 send_telegram_sync("Unknown command. Use /status or buttons.")
         elif getattr(update, 'callback_query', None):
@@ -1117,6 +1227,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    stop_tunnel_sync()
     try:
         monitor_stop_event.set()
         if monitor_thread_obj and monitor_thread_obj.is_alive():
