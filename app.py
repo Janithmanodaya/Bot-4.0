@@ -34,7 +34,8 @@ import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.utils.request import Request
-import sshtunnel
+import subprocess
+import shlex
 
 def _get_env_int(key: str, default: int) -> int:
     """Safely get an integer from environment variables."""
@@ -104,12 +105,12 @@ TUNNEL_CONFIG = {
     "host": os.getenv("TUNNEL_HOST"),
     "port": _get_env_int("TUNNEL_PORT", 22),
     "user": os.getenv("TUNNEL_USER"),
-    "password": os.getenv("TUNNEL_PASSWORD"),
+    "pkey_path": os.getenv("TUNNEL_PKEY_PATH"),
     "local_bind_port": _get_env_int("TUNNEL_LOCAL_PORT", 1080),
     "remote_bind_host": os.getenv("TUNNEL_REMOTE_HOST", "fapi.binance.com"),
     "remote_bind_port": _get_env_int("TUNNEL_REMOTE_PORT", 443),
 }
-tunnel_server = None
+tunnel_process: Optional[subprocess.Popen] = None
 
 if TELEGRAM_BOT_TOKEN:
     tg_request = Request(con_pool_size=8)
@@ -364,51 +365,68 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
 # Tunnel Management
 # -------------------------
 def start_tunnel_sync():
-    global tunnel_server
+    global tunnel_process
     if not TUNNEL_CONFIG.get("enabled"):
         return True, "Tunnel not enabled."
 
-    # Validate required fields if tunnel is enabled
-    required_fields = ["host", "user", "password"]
+    # Validate required fields
+    required_fields = ["host", "user", "pkey_path", "local_bind_port"]
     missing_fields = [f for f in required_fields if not TUNNEL_CONFIG.get(f)]
     if missing_fields:
-        error_msg = (
-            f"Tunnel is enabled but required configuration is missing: {', '.join(missing_fields)}. "
-            "Please set them using /settunnel or environment variables and restart."
-        )
+        error_msg = f"Tunnel is enabled but required config is missing: {', '.join(missing_fields)}."
         return False, error_msg
-    
-    if tunnel_server and tunnel_server.is_active:
-        log.info("Tunnel is already active.")
+
+    if tunnel_process and tunnel_process.poll() is None:
+        log.info("Tunnel process is already running.")
         return True, "Tunnel already active."
 
     try:
-        # Use a fixed local bind address. The port can be configured.
-        local_bind_address = '127.0.0.1'
-        
-        tunnel_server = sshtunnel.SSHTunnelForwarder(
-            (TUNNEL_CONFIG["host"], TUNNEL_CONFIG["port"]),
-            ssh_username=TUNNEL_CONFIG["user"],
-            ssh_password=TUNNEL_CONFIG["password"],
-            remote_bind_address=(TUNNEL_CONFIG["remote_bind_host"], TUNNEL_CONFIG["remote_bind_port"]),
-            local_bind_address=(local_bind_address, TUNNEL_CONFIG["local_bind_port"])
+        # Use SSH with a private key for non-interactive authentication.
+        # StrictHostKeyChecking=no is used to avoid interactive prompts.
+        ssh_command = (
+            f"ssh -i {shlex.quote(TUNNEL_CONFIG['pkey_path'])} "
+            f"-N -D 127.0.0.1:{TUNNEL_CONFIG['local_bind_port']} "
+            f"-o StrictHostKeyChecking=no "
+            f"-p {TUNNEL_CONFIG['port']} "
+            f"{shlex.quote(TUNNEL_CONFIG['user'])}@{shlex.quote(TUNNEL_CONFIG['host'])}"
         )
-        tunnel_server.start()
-        log.info(f"SSH tunnel started: {local_bind_address}:{tunnel_server.local_bind_port} -> {TUNNEL_CONFIG['remote_bind_host']}:{TUNNEL_CONFIG['remote_bind_port']}")
-        return True, "Tunnel started successfully."
+        
+        log.info(f"Starting tunnel with command: ssh -i ...")
+        
+        tunnel_process = subprocess.Popen(shlex.split(ssh_command), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        time.sleep(3)
+        
+        if tunnel_process.poll() is not None:
+            stderr_output = tunnel_process.stderr.read().decode('utf-8', errors='ignore')
+            error_msg = f"Failed to start SSH tunnel process. Return code: {tunnel_process.returncode}. Stderr: {stderr_output}"
+            log.error(error_msg)
+            tunnel_process = None
+            return False, error_msg
+
+        log.info(f"SSH SOCKS proxy process started successfully on 127.0.0.1:{TUNNEL_CONFIG['local_bind_port']}.")
+        return True, "Tunnel process started."
+
     except Exception as e:
-        log.exception("Failed to start SSH tunnel.")
-        tunnel_server = None
+        log.exception("Failed to start SSH tunnel process.")
+        if tunnel_process:
+            tunnel_process.terminate()
+            tunnel_process = None
         return False, str(e)
 
 def stop_tunnel_sync():
-    global tunnel_server
-    if tunnel_server and tunnel_server.is_active:
-        log.info("Stopping SSH tunnel.")
-        tunnel_server.stop()
-        tunnel_server = None
+    global tunnel_process
+    if tunnel_process and tunnel_process.poll() is None:
+        log.info("Stopping SSH tunnel process.")
+        tunnel_process.terminate()
+        try:
+            tunnel_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("Tunnel process did not terminate in time, killing.")
+            tunnel_process.kill()
+        tunnel_process = None
     else:
-        log.info("SSH tunnel is not running or already stopped.")
+        log.info("SSH tunnel process is not running or already stopped.")
 
 # -------------------------
 # Binance init (sync)
@@ -431,8 +449,8 @@ def init_binance_client_sync():
     if tunnel_server and tunnel_server.is_active:
         local_bind_port = TUNNEL_CONFIG["local_bind_port"]
         proxies = {
-            'http': f'socks5://127.0.0.1:{local_bind_port}',
-            'https': f'socks5://127.0.0.1:{local_bind_port}'
+            'http': f'socks5h://127.0.0.1:{local_bind_port}',
+            'https': f'socks5h://127.0.0.1:{local_bind_port}'
         }
         req_params['proxies'] = proxies
         log.info(f"Tunnel active, using proxies: {proxies}")
@@ -1104,9 +1122,9 @@ def handle_update_sync(update, loop):
                 for c in result["checks"]:
                     send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             elif text.startswith("/tunnelstatus"):
-                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                status = "active" if tunnel_process and tunnel_process.poll() is None else "inactive"
                 out = f"Tunnel Status: {status}\\n-- Config --\\n"
-                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                cfg_safe = {k: v for k, v in TUNNEL_CONFIG.items() if k != 'password'}
                 for k,v in cfg_safe.items():
                     out += f"{k} = {v}\\n"
                 send_telegram_sync(out)
@@ -1180,9 +1198,9 @@ def handle_update_sync(update, loop):
                     out += f"{k} = {v}\n"
                 send_telegram_sync(out)
             elif data == "tunnelstatus":
-                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                status = "active" if tunnel_process and tunnel_process.poll() is None else "inactive"
                 out = f"Tunnel Status: {status}\\n-- Config --\\n"
-                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                cfg_safe = {k: v for k, v in TUNNEL_CONFIG.items() if k != 'password'}
                 for k,v in cfg_safe.items():
                     out += f"{k} = {v}\\n"
                 send_telegram_sync(out)
@@ -1302,11 +1320,11 @@ async def startup_event():
         server_ip = get_public_ip()
         startup_message = f"KAMA strategy bot started. Running={running}\nServer IP: {server_ip}"
         
-        if tunnel_server and tunnel_server.is_active:
+        if tunnel_process and tunnel_process.poll() is None:
             local_bind_port = TUNNEL_CONFIG["local_bind_port"]
             proxies = {
-                'http': f'socks5://127.0.0.1:{local_bind_port}',
-                'https': f'socks5://127.0.0.1:{local_bind_port}'
+                'http': f'socks5h://127.0.0.1:{local_bind_port}',
+                'https': f'socks5h://127.0.0.1:{local_bind_port}'
             }
             tunnel_ip = get_public_ip(proxies=proxies)
             startup_message += f"\nTunnel IP: {tunnel_ip}"
