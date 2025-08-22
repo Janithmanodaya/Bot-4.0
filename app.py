@@ -36,6 +36,13 @@ from telegram.error import BadRequest
 from telegram.utils.request import Request
 import sshtunnel
 
+def _get_env_int(key: str, default: int) -> int:
+    """Safely get an integer from environment variables."""
+    val = os.getenv(key)
+    if val is None or not val.strip().isdigit():
+        return default
+    return int(val)
+
 # -------------------------
 # CONFIG (edit values here)
 # -------------------------
@@ -44,15 +51,15 @@ CONFIG = {
     "TIMEFRAME": os.getenv("TIMEFRAME", "1h"),
     "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
 
-    "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
-    "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
+    "SCAN_INTERVAL": _get_env_int("SCAN_INTERVAL", 20),
+    "MAX_CONCURRENT_TRADES": _get_env_int("MAX_CONCURRENT_TRADES", 3),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
-    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
-    "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
-    "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
+    "KAMA_LENGTH": _get_env_int("KAMA_LENGTH", 10),
+    "KAMA_FAST": _get_env_int("KAMA_FAST", 2),
+    "KAMA_SLOW": _get_env_int("KAMA_SLOW", 30),
 
-    "ATR_LENGTH": int(os.getenv("ATR_LENGTH", "14")),
+    "ATR_LENGTH": _get_env_int("ATR_LENGTH", 14),
     "SL_TP_ATR_MULT": float(os.getenv("SL_TP_ATR_MULT", "2.5")),
 
     "RISK_SMALL_BALANCE_THRESHOLD": float(os.getenv("RISK_SMALL_BALANCE_THRESHOLD", "50.0")),
@@ -60,17 +67,17 @@ CONFIG = {
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),
 
-    "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
+    "ADX_LENGTH": _get_env_int("ADX_LENGTH", 14),
     "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "50.0")),
 
-    "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
+    "CHOP_LENGTH": _get_env_int("CHOP_LENGTH", 14),
     "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "50.0")),
 
-    "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
+    "BB_LENGTH": _get_env_int("BB_LENGTH", 20),
     "BB_STD": float(os.getenv("BB_STD", "2.0")),
     "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "7.0")),
 
-    "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
+    "MIN_CANDLES_AFTER_CLOSE": _get_env_int("MIN_CANDLES_AFTER_CLOSE", 10),
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
 
@@ -95,12 +102,12 @@ client: Optional[Client] = None
 TUNNEL_CONFIG = {
     "enabled": os.getenv("TUNNEL_ENABLED", "false").lower() in ("true", "1", "yes"),
     "host": os.getenv("TUNNEL_HOST"),
-    "port": int(os.getenv("TUNNEL_PORT", "22")),
+    "port": _get_env_int("TUNNEL_PORT", 22),
     "user": os.getenv("TUNNEL_USER"),
     "password": os.getenv("TUNNEL_PASSWORD"),
-    "local_bind_port": int(os.getenv("TUNNEL_LOCAL_PORT", "1080")),
+    "local_bind_port": _get_env_int("TUNNEL_LOCAL_PORT", 1080),
     "remote_bind_host": os.getenv("TUNNEL_REMOTE_HOST", "fapi.binance.com"),
-    "remote_bind_port": int(os.getenv("TUNNEL_REMOTE_PORT", "443")),
+    "remote_bind_port": _get_env_int("TUNNEL_REMOTE_PORT", 443),
 }
 tunnel_server = None
 
