@@ -274,19 +274,101 @@ def init_db():
         close_time TEXT
     )
     """)
+
+    # Add new columns for state persistence if they don't exist
+    try:
+        cur.execute("PRAGMA table_info(trades)")
+        columns = [info[1] for info in cur.fetchall()]
+        if 'sl' not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN sl REAL")
+        if 'tp' not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN tp REAL")
+        if 'leverage' not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN leverage INTEGER")
+        if 'trailing_enabled' not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN trailing_enabled INTEGER")
+    except Exception as e:
+        log.error(f"Error updating database schema: {e}")
+
     conn.commit()
     conn.close()
 
 def record_trade(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cur = conn.cursor()
-    cur.execute("""
-    INSERT OR REPLACE INTO trades (id,symbol,side,entry_price,exit_price,qty,notional,pnl,open_time,close_time)
-    VALUES (?,?,?,?,?,?,?,?,?,?)
-    """, (rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec.get('exit_price'),
-          rec['qty'], rec['notional'], rec.get('pnl'), rec['open_time'], rec.get('close_time')))
+    
+    # For open trades, we store all details
+    if 'close_time' not in rec or rec['close_time'] is None:
+        cur.execute("""
+        INSERT OR REPLACE INTO trades (id,symbol,side,entry_price,exit_price,qty,notional,pnl,open_time,close_time,sl,tp,leverage,trailing_enabled)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec.get('exit_price'),
+              rec['qty'], rec['notional'], rec.get('pnl'), rec['open_time'], rec.get('close_time'),
+              rec.get('sl'), rec.get('tp'), rec.get('leverage'), int(rec.get('trailing', False))))
+    else:
+        # For closed trades, we only need to update the exit details.
+        cur.execute("""
+        UPDATE trades SET exit_price = ?, pnl = ?, close_time = ? WHERE id = ?
+        """, (rec.get('exit_price'), rec.get('pnl'), rec.get('close_time'), rec['id']))
+
     conn.commit()
     conn.close()
+
+def restore_state_from_db():
+    global managed_trades, last_trade_close_time
+    log.info("Restoring state from database...")
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Restore open trades
+    try:
+        cur.execute("SELECT * FROM trades WHERE close_time IS NULL")
+        open_trades = cur.fetchall()
+        if open_trades:
+            log.info(f"Found {len(open_trades)} open trades to restore.")
+            restored_trades = {}
+            for row in open_trades:
+                trade_id = row['id']
+                restored_trades[trade_id] = {
+                    "id": trade_id,
+                    "symbol": row['symbol'],
+                    "side": row['side'],
+                    "entry_price": row['entry_price'],
+                    "qty": row['qty'],
+                    "notional": row['notional'],
+                    "leverage": row['leverage'],
+                    "sl": row['sl'],
+                    "tp": row['tp'],
+                    "open_time": row['open_time'],
+                    "sltp_orders": {}, # This cannot be restored from DB, will be checked by monitor
+                    "trailing": bool(row['trailing_enabled'])
+                }
+            
+            managed_trades_lock.acquire()
+            try:
+                managed_trades.update(restored_trades)
+            finally:
+                managed_trades_lock.release()
+            log.info(f"Restored {len(managed_trades)} trades into memory.")
+    except Exception as e:
+        log.exception(f"Error restoring open trades from DB: {e}")
+
+    # Restore last close times for cooldown
+    try:
+        cur.execute("SELECT symbol, MAX(close_time) as last_close FROM trades WHERE close_time IS NOT NULL GROUP BY symbol")
+        last_closes = cur.fetchall()
+        if last_closes:
+            log.info(f"Found {len(last_closes)} symbols with previous trades for cooldown tracking.")
+            for row in last_closes:
+                if row['last_close']:
+                    last_trade_close_time[row['symbol']] = datetime.fromisoformat(row['last_close'])
+    except Exception as e:
+        log.exception(f"Error restoring last close times from DB: {e}")
+
+    conn.close()
+    log.info("State restoration complete.")
+
 
 # -------------------------
 # Indicators (same as before)
@@ -799,9 +881,7 @@ async def evaluate_and_enter(symbol: str):
             }
             async with managed_trades_lock:
                 managed_trades[trade_id] = meta
-            record_trade({'id': trade_id, 'symbol': symbol, 'side': side, 'entry_price': price,
-                          'exit_price': None, 'qty': qty, 'notional': notional, 'pnl': None,
-                          'open_time': meta['open_time'], 'close_time': None})
+            record_trade(meta)
             await send_telegram(f"Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
             log.info("Opened trade: %s", meta)
         except Exception as e:
@@ -1238,6 +1318,8 @@ async def initialize_bot():
     
     # --- Pre-startup Network Diagnostic Test ---
     try:
+        init_db()
+        restore_state_from_db() # Restore state after initializing DB
         log.info("Performing pre-startup network diagnostic test to Binance...")
         diag_url = "https://fapi.binance.com/fapi/v1/ping"
         response = requests.get(diag_url, timeout=10)
