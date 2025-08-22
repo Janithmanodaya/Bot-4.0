@@ -1306,62 +1306,42 @@ async def initialize_bot():
     global scan_task, monitor_thread_obj, client, monitor_stop_event
     try:
         WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    if telegram_bot and WEBHOOK_URL:
-        webhook_url_with_token = f"{WEBHOOK_URL}/webhook/{TELEGRAM_BOT_TOKEN}"
-        success = await asyncio.to_thread(telegram_bot.set_webhook, url=webhook_url_with_token)
-        if success:
-            log.info(f"Webhook set to {webhook_url_with_token}")
-        else:
-            log.error("Failed to set webhook.")
-    elif telegram_bot:
-        log.warning("WEBHOOK_URL not set. Bot will not receive updates from Telegram.")
-    
-    # --- Pre-startup Network Diagnostic Test ---
-    try:
+        if telegram_bot and WEBHOOK_URL:
+            webhook_url_with_token = f"{WEBHOOK_URL}/webhook/{TELEGRAM_BOT_TOKEN}"
+            success = await asyncio.to_thread(telegram_bot.set_webhook, url=webhook_url_with_token)
+            if success:
+                log.info(f"Webhook set to {webhook_url_with_token}")
+            else:
+                log.error("Failed to set webhook.")
+        elif telegram_bot:
+            log.warning("WEBHOOK_URL not set. Bot will not receive updates from Telegram.")
+        
+        # --- Pre-startup Network Diagnostic Test ---
         init_db()
         restore_state_from_db() # Restore state after initializing DB
         log.info("Performing pre-startup network diagnostic test to Binance...")
         diag_url = "https://fapi.binance.com/fapi/v1/ping"
         response = requests.get(diag_url, timeout=10)
-        if response.status_code != 200:
-            err_msg = f"Network diagnostic test failed: Received status code {response.status_code} from Binance."
-            log.critical(err_msg)
-            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
-            return
+        response.raise_for_status()
         if "text/html" in response.headers.get('Content-Type', ''):
-            err_msg = "Network diagnostic test failed: Binance returned an HTML page. This confirms a network block or firewall issue."
-            log.critical(err_msg)
-            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
-            return
+            raise RuntimeError("Binance returned an HTML page, indicating a network block or firewall issue.")
         log.info("Network diagnostic test successful.")
-    except requests.exceptions.RequestException as e:
-        err_msg = f"Network diagnostic test failed with a connection error: {e}"
-        log.critical(err_msg)
-        await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
-        return
 
-    init_db()
-    ok, err = await asyncio.to_thread(init_binance_client_sync)
-    if not ok:
-        log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
-        if "Tunnel is enabled but required configuration is missing" in err:
-            await send_telegram(f"CRITICAL: Bot startup failed. {err}")
-        else:
-            await send_telegram(f"CRITICAL: Bot startup failed. Binance client initialization failed: {err}")
-        return
+        ok, err = await asyncio.to_thread(init_binance_client_sync)
+        if not ok:
+            raise RuntimeError(f"Binance client failed to initialize: {err}")
 
-    await asyncio.to_thread(validate_and_sanity_check_sync, True)
-    
-    # Start trading-related tasks only if initialization was successful
-    scan_task = loop.create_task(scanning_loop())
-    monitor_stop_event.clear()
-    monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
-    monitor_thread_obj.start()
-    log.info("Started monitor thread.")
-    try:
+        await asyncio.to_thread(validate_and_sanity_check_sync, True)
+        
+        # Start trading-related tasks only if initialization was successful
+        loop = asyncio.get_running_loop()
+        scan_task = loop.create_task(scanning_loop())
+        monitor_stop_event.clear()
+        monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
+        monitor_thread_obj.start()
+        log.info("Started monitor thread.")
         await send_telegram("KAMA strategy bot started. Running={}".format(running))
-    except Exception:
-        log.exception("Failed to send startup telegram")
+
     except Exception as e:
         log.exception("A critical error occurred during bot initialization.")
         await handle_critical_error_async(e, "Bot Initialization Failed")
