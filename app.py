@@ -1,13 +1,9 @@
 # app.py
 """
-KAMA trend-following bot — complete version with fixes:
- - DualLock for cross-thread locking
- - Exchange info cache to avoid repeated futures_exchange_info calls
- - Monitor thread persists unrealized PnL and SL updates back to managed_trades
- - Telegram thread with commands and Inline Buttons; includes /forceip
- - Blocking Binance/requests calls kept sync and invoked from async via asyncio.to_thread
- - Risk sizing: fixed 0.5 USDT when balance < 50, else 2% (configurable)
- - Defaults to MAINNET unless USE_TESTNET=true
+KAMA trend-following bot — fixed for:
+ - HTML error pages returned by Binance (sanitize and summarize before notifying)
+ - Telegram 'Message is too long' handled (truncate and fallback to send_document)
+ - Maintains DualLock, monitor thread, telegram thread, exchange-info cache, etc.
 """
 import os
 import sys
@@ -19,9 +15,12 @@ import sqlite3
 import signal
 import traceback
 import threading
+import io
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from decimal import Decimal, ROUND_DOWN, getcontext
+import html
 
 import requests
 import numpy as np
@@ -33,6 +32,7 @@ from binance.exceptions import BinanceAPIException
 
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 
 # -------------------------
 # CONFIG (edit values here)
@@ -56,7 +56,7 @@ CONFIG = {
     "RISK_SMALL_BALANCE_THRESHOLD": float(os.getenv("RISK_SMALL_BALANCE_THRESHOLD", "50.0")),
     "RISK_SMALL_FIXED_USDT": float(os.getenv("RISK_SMALL_FIXED_USDT", "0.5")),
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
-    "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
+    "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),
 
     "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
     "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "50.0")),
@@ -75,7 +75,6 @@ CONFIG = {
     "DB_FILE": os.getenv("DB_FILE", "trades.db"),
 }
 # -------------------------
-# Secrets (must be set in environment)
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -117,7 +116,7 @@ class DualLock:
         self._lock.release()
 
 managed_trades: Dict[str, Dict[str, Any]] = {}
-managed_trades_lock = DualLock()  # used by both async and sync code
+managed_trades_lock = DualLock()
 
 last_trade_close_time: Dict[str, datetime] = {}
 
@@ -127,11 +126,10 @@ monitor_stop_event = threading.Event()
 
 scan_task = None
 
-# Exchange info cache
-EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
+EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}
 
 # -------------------------
-# Utilities
+# Helpers for sanitized error messages
 # -------------------------
 def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
     if not isinstance(text, str):
@@ -140,27 +138,81 @@ def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
         return text
     return text[: max_len - 200] + "\n\n[...] (truncated)\n\n" + text[-200:]
 
-def get_public_ip() -> str:
-    try:
-        return requests.get("https://api.ipify.org", timeout=5).text
-    except Exception:
-        return "unable-to-fetch-ip"
+def sanitize_error_for_telegram(raw: str, max_len: int = 1000) -> str:
+    """
+    If raw looks like HTML, extract a small plaintext summary (title + first paragraph).
+    Otherwise, return a shortened raw string.
+    """
+    if not raw:
+        return ""
+    low = raw.lower()
+    # HTML-like response
+    if "<html" in low or "<!doctype html" in low or "<head" in low:
+        # try to extract <title> and text content (strip tags)
+        title_match = re.search(r"<title>(.*?)</title>", raw, flags=re.IGNORECASE | re.DOTALL)
+        title = title_match.group(1).strip() if title_match else ""
+        # remove tags for a text body preview
+        text = re.sub(r"<[^>]+>", " ", raw)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        preview = f"HTML error page: {title}\n{ text[: max_len] }"
+        return preview
+    # long JSON / traceback or other text
+    text = raw.strip()
+    if len(text) > max_len:
+        return text[:max_len] + "\n\n[...] (truncated)"
+    return text
 
+# -------------------------
+# Robust Telegram send (sync)
+# -------------------------
 def send_telegram_sync(msg: str):
+    """
+    Send a Telegram message synchronously from threads.
+    - Truncates message to safe length.
+    - If Telegram rejects due to length, attempt to send as a document (file).
+    - If document fails, send a short fallback message.
+    """
     if not telegram_bot or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured; message: %s", msg[:200])
+        log.warning("Telegram not configured; message (trimmed): %s", (msg or "")[:200])
         return
     try:
-        telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=msg)
+        # first attempt: truncated text message
+        safe_msg = _shorten_for_telegram(msg, max_len=3500)
+        telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=safe_msg)
+        return
+    except BadRequest as bre:
+        # message too long or other bad request: try fallback
+        msg_err = str(bre)
+        log.warning("Telegram BadRequest: %s -- attempting document fallback", msg_err)
+        # attempt send full content as a document (txt)
+        try:
+            bio = io.BytesIO()
+            bio.write((msg or "").encode("utf-8", errors="replace"))
+            bio.seek(0)
+            telegram_bot.send_document(chat_id=int(TELEGRAM_CHAT_ID), document=bio, filename="bot_log.txt")
+            return
+        except Exception as e2:
+            log.exception("Failed to send telegram document fallback: %s", e2)
+            # final fallback: very short message
+            try:
+                short = f"Message too long; failed to send full content. Error: {msg_err[:300]}"
+                telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=short)
+                return
+            except Exception:
+                log.exception("Final telegram fallback failed")
+                return
     except Exception:
-        log.exception("Failed to send telegram message (sync)")
+        log.exception("Telegram send failed (sync)")
+        # nothing else we can do safely here
 
 async def send_telegram(msg: str):
+    """Async wrapper to send telegram via thread so it doesn't block the event loop."""
     if not telegram_bot or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured; message: %s", msg[:200])
+        log.warning("Telegram not configured; message (trimmed): %s", (msg or "")[:200])
         return
-    safe_msg = _shorten_for_telegram(msg)
-    await asyncio.to_thread(send_telegram_sync, safe_msg)
+    # run sync variant in background
+    await asyncio.to_thread(send_telegram_sync, msg)
 
 # -------------------------
 # DB helpers
@@ -197,7 +249,7 @@ def record_trade(rec: Dict[str, Any]):
     conn.close()
 
 # -------------------------
-# Indicators
+# Indicators (same as before)
 # -------------------------
 def kama(series: pd.Series, length: int, fast: int, slow: int) -> pd.Series:
     price = series.values
@@ -272,7 +324,7 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
 # Binance init (sync)
 # -------------------------
 def init_binance_client_sync():
-    global client
+    global client, EXCHANGE_INFO_CACHE
     try:
         if USE_TESTNET:
             client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
@@ -285,7 +337,6 @@ def init_binance_client_sync():
             log.info("Connected to Binance API (ping ok).")
         except Exception:
             log.warning("Binance ping failed (connection may still succeed for calls).")
-        # reset exchange info cache on init
         EXCHANGE_INFO_CACHE['data'] = None
         EXCHANGE_INFO_CACHE['ts'] = 0.0
         return True, ""
@@ -294,7 +345,7 @@ def init_binance_client_sync():
         ip = get_public_ip()
         err = f"Binance init error: {e}; server_ip={ip}"
         try:
-            send_telegram_sync(f"Binance init failed: {e}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
+            send_telegram_sync(f"Binance init failed: {sanitize_error_for_telegram(str(e))}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
         except Exception:
             log.exception("Failed to notify via telegram about Binance init error.")
         return False, err
@@ -319,7 +370,7 @@ def get_exchange_info_sync():
         return EXCHANGE_INFO_CACHE["data"]
 
 # -------------------------
-# Symbol helpers & rounding using Decimal (uses cached exchange info)
+# Symbol helpers & rounding
 # -------------------------
 def get_symbol_info(symbol: str) -> Optional[Dict[str, Any]]:
     info = get_exchange_info_sync()
@@ -436,7 +487,7 @@ def cancel_close_orders_sync(symbol: str):
         log.exception("Error canceling close orders: %s", symbol)
 
 # -------------------------
-# Risk function
+# Risk
 # -------------------------
 def calculate_risk_amount(account_balance: float) -> float:
     if account_balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
@@ -506,7 +557,7 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
     return results
 
 # -------------------------
-# Candle counting helper
+# Candles helper
 # -------------------------
 def candles_since_close(df: pd.DataFrame, close_time: Optional[datetime]) -> int:
     if not close_time:
@@ -516,7 +567,7 @@ def candles_since_close(df: pd.DataFrame, close_time: Optional[datetime]) -> int
     return int((df.index > close_time).sum())
 
 # -------------------------
-# Wrapper fetch_klines (sync)
+# fetch klines (sync)
 # -------------------------
 def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     global client
@@ -533,7 +584,7 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
     return df[['open','high','low','close','volume']]
 
 # -------------------------
-# Core evaluate & entry (async)
+# evaluate & enter (async)
 # -------------------------
 async def evaluate_and_enter(symbol: str):
     global managed_trades, running, frozen
@@ -589,7 +640,7 @@ async def evaluate_and_enter(symbol: str):
         if last_close:
             n_since = candles_since_close(df, last_close)
             if n_since < CONFIG["MIN_CANDLES_AFTER_CLOSE"]:
-                log.info("%s skip due to cooldown: %d/%d", symbol, n_since, CONFIG["MIN_CANDLES_AFTER_CLOSE"])
+                log.info("%s skip due cooldown: %d/%d", symbol, n_since, CONFIG["MIN_CANDLES_AFTER_CLOSE"])
                 return
 
         sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
@@ -636,19 +687,19 @@ async def evaluate_and_enter(symbol: str):
         except Exception as e:
             log.exception("Failed to open trade for %s: %s", symbol, e)
             tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-            safe_tb = _shorten_for_telegram(tb)
-            await send_telegram(f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+            teaser = sanitize_error_for_telegram(tb, max_len=1500)
+            await send_telegram(f"ERROR opening {symbol}:\n{teaser}\nServer IP: {get_public_ip()}")
             running = False
         return
 
     except Exception as e:
         log.exception("evaluate_and_enter error %s: %s", symbol, e)
         tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-        safe_tb = _shorten_for_telegram(tb)
-        await send_telegram(f"Scan error for {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+        teaser = sanitize_error_for_telegram(tb, max_len=1500)
+        await send_telegram(f"Scan error for {symbol}:\n{teaser}\nServer IP: {get_public_ip()}")
 
 # -------------------------
-# get_account_balance_usdt (sync)
+# account balance (sync)
 # -------------------------
 def get_account_balance_usdt():
     global client
@@ -664,7 +715,7 @@ def get_account_balance_usdt():
     return 0.0
 
 # -------------------------
-# Monitor thread (sync) - persists unreal and SL updates to managed_trades
+# Monitor thread (sync)
 # -------------------------
 def monitor_thread_func():
     global managed_trades, last_trade_close_time, running
@@ -677,15 +728,16 @@ def monitor_thread_func():
             try:
                 positions = client.futures_position_information()
             except Exception as e:
-                log.exception("Error fetching positions in monitor thread: %s", e)
-                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-                safe_tb = _shorten_for_telegram(tb)
-                send_telegram_sync(f"Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+                # sanitize the Binance response (may be HTML)
+                raw = str(e)
+                teaser = sanitize_error_for_telegram(raw, max_len=1500)
+                log.exception("Error fetching positions in monitor thread: %s", teaser)
+                send_telegram_sync(f"Error fetching positions: {teaser}\nServer IP: {get_public_ip()}")
                 running = False
                 time.sleep(10)
                 continue
 
-            # snapshot trades under thread lock
+            # snapshot trades under lock
             managed_trades_lock.acquire()
             try:
                 trades_snapshot = dict(managed_trades)
@@ -749,7 +801,6 @@ def monitor_thread_func():
                                         place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
                                         moved = True
                             if moved and new_sl is not None:
-                                # persist new SL and timestamp
                                 managed_trades_lock.acquire()
                                 try:
                                     if tid in managed_trades:
@@ -759,8 +810,9 @@ def monitor_thread_func():
                                     managed_trades_lock.release()
                                 meta['sl'] = new_sl
                                 send_telegram_sync(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
-                        except Exception:
-                            log.exception("Trailing internal error in monitor thread")
+                        except Exception as e_tr:
+                            teaser = sanitize_error_for_telegram(str(e_tr), max_len=1000)
+                            log.exception("Trailing internal error in monitor thread: %s", teaser)
                 except Exception:
                     log.exception("Error handling trade in monitor thread")
             # remove closed trades under lock
@@ -807,7 +859,7 @@ async def get_managed_trades_snapshot():
 
 def build_control_keyboard():
     buttons = [
-        [InlineKeyboardButton("Start", callback_data="start") , InlineKeyboardButton("Stop", callback_data="stop")],
+        [InlineKeyboardButton("Start", callback_data="start"), InlineKeyboardButton("Stop", callback_data="stop")],
         [InlineKeyboardButton("Freeze", callback_data="freeze"), InlineKeyboardButton("Unfreeze", callback_data="unfreeze")],
         [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")]
     ]
@@ -977,7 +1029,7 @@ def telegram_polling_thread(loop):
             time.sleep(5)
 
 # -------------------------
-# Small coroutines to set flags from telegram thread
+# small control coroutines
 # -------------------------
 async def _set_running(val: bool):
     global running
@@ -987,20 +1039,17 @@ async def _set_frozen(val: bool):
     global frozen
     frozen = val
 
-# -------------------------
-# Error handler helper (async)
-# -------------------------
 async def handle_critical_error_async(exc: Exception, context: str = None):
     global running
     running = False
     ip = await asyncio.to_thread(get_public_ip)
     tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else "No traceback"
-    safe_tb = _shorten_for_telegram(tb)
-    msg = f"CRITICAL ERROR: {context or ''}\nException: {str(exc)}\n\nTraceback:\n{safe_tb}\nServer IP: {ip}\nBot paused."
+    teaser = sanitize_error_for_telegram(tb, max_len=1500)
+    msg = f"CRITICAL ERROR: {context or ''}\nException: {teaser}\nServer IP: {ip}\nBot paused."
     await send_telegram(msg)
 
 # -------------------------
-# FastAPI endpoint
+# FastAPI health
 # -------------------------
 @app.get("/")
 async def root():
@@ -1045,7 +1094,6 @@ async def shutdown_event():
     except Exception:
         pass
 
-# graceful signal handlers
 def _signal_handler(sig, frame):
     log.info("Received signal %s, shutting down", sig)
     try:
