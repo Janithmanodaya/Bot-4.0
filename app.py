@@ -78,6 +78,7 @@ CONFIG = {
 # -------------------------
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+BINANCE_TLD = os.getenv("BINANCE_TLD", "com")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("1", "true", "yes")
@@ -350,8 +351,8 @@ def init_binance_client_sync():
             client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
             log.warning("Binance client in TESTNET mode (USE_TESTNET=true).")
         else:
-            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-            log.info("Binance client in MAINNET mode (default).")
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, tld=BINANCE_TLD)
+            log.info(f"Binance client in MAINNET mode (tld={BINANCE_TLD}).")
         try:
             client.ping()
             log.info("Connected to Binance API (ping ok).")
