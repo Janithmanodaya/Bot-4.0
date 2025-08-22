@@ -747,7 +747,8 @@ def monitor_thread_func():
                 time.sleep(5)
                 continue
             try:
-                positions = client.futures_position_information()
+                account_info = client.futures_account()
+                positions = account_info.get('positions', [])
             except Exception as e:
                 # sanitize the Binance response (may be HTML)
                 raw = str(e)
