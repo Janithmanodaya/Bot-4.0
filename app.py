@@ -1323,6 +1323,10 @@ async def root():
 # -------------------------
 @app.on_event("startup")
 async def startup_event():
+    log.info("Web server started. Initializing bot in background.")
+    asyncio.create_task(initialize_bot())
+
+async def initialize_bot():
     global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
     
     # Start Telegram listener first to ensure bot is responsive for configuration
