@@ -274,101 +274,19 @@ def init_db():
         close_time TEXT
     )
     """)
-
-    # Add new columns for state persistence if they don't exist
-    try:
-        cur.execute("PRAGMA table_info(trades)")
-        columns = [info[1] for info in cur.fetchall()]
-        if 'sl' not in columns:
-            cur.execute("ALTER TABLE trades ADD COLUMN sl REAL")
-        if 'tp' not in columns:
-            cur.execute("ALTER TABLE trades ADD COLUMN tp REAL")
-        if 'leverage' not in columns:
-            cur.execute("ALTER TABLE trades ADD COLUMN leverage INTEGER")
-        if 'trailing_enabled' not in columns:
-            cur.execute("ALTER TABLE trades ADD COLUMN trailing_enabled INTEGER")
-    except Exception as e:
-        log.error(f"Error updating database schema: {e}")
-
     conn.commit()
     conn.close()
 
 def record_trade(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cur = conn.cursor()
-    
-    # For open trades, we store all details
-    if 'close_time' not in rec or rec['close_time'] is None:
-        cur.execute("""
-        INSERT OR REPLACE INTO trades (id,symbol,side,entry_price,exit_price,qty,notional,pnl,open_time,close_time,sl,tp,leverage,trailing_enabled)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec.get('exit_price'),
-              rec['qty'], rec['notional'], rec.get('pnl'), rec['open_time'], rec.get('close_time'),
-              rec.get('sl'), rec.get('tp'), rec.get('leverage'), int(rec.get('trailing', False))))
-    else:
-        # For closed trades, we only need to update the exit details.
-        cur.execute("""
-        UPDATE trades SET exit_price = ?, pnl = ?, close_time = ? WHERE id = ?
-        """, (rec.get('exit_price'), rec.get('pnl'), rec.get('close_time'), rec['id']))
-
+    cur.execute("""
+    INSERT OR REPLACE INTO trades (id,symbol,side,entry_price,exit_price,qty,notional,pnl,open_time,close_time)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec.get('exit_price'),
+          rec['qty'], rec['notional'], rec.get('pnl'), rec['open_time'], rec.get('close_time')))
     conn.commit()
     conn.close()
-
-def restore_state_from_db():
-    global managed_trades, last_trade_close_time
-    log.info("Restoring state from database...")
-    conn = sqlite3.connect(CONFIG["DB_FILE"])
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    # Restore open trades
-    try:
-        cur.execute("SELECT * FROM trades WHERE close_time IS NULL")
-        open_trades = cur.fetchall()
-        if open_trades:
-            log.info(f"Found {len(open_trades)} open trades to restore.")
-            restored_trades = {}
-            for row in open_trades:
-                trade_id = row['id']
-                restored_trades[trade_id] = {
-                    "id": trade_id,
-                    "symbol": row['symbol'],
-                    "side": row['side'],
-                    "entry_price": row['entry_price'],
-                    "qty": row['qty'],
-                    "notional": row['notional'],
-                    "leverage": row['leverage'],
-                    "sl": row['sl'],
-                    "tp": row['tp'],
-                    "open_time": row['open_time'],
-                    "sltp_orders": {}, # This cannot be restored from DB, will be checked by monitor
-                    "trailing": bool(row['trailing_enabled'])
-                }
-            
-            managed_trades_lock.acquire()
-            try:
-                managed_trades.update(restored_trades)
-            finally:
-                managed_trades_lock.release()
-            log.info(f"Restored {len(managed_trades)} trades into memory.")
-    except Exception as e:
-        log.exception(f"Error restoring open trades from DB: {e}")
-
-    # Restore last close times for cooldown
-    try:
-        cur.execute("SELECT symbol, MAX(close_time) as last_close FROM trades WHERE close_time IS NOT NULL GROUP BY symbol")
-        last_closes = cur.fetchall()
-        if last_closes:
-            log.info(f"Found {len(last_closes)} symbols with previous trades for cooldown tracking.")
-            for row in last_closes:
-                if row['last_close']:
-                    last_trade_close_time[row['symbol']] = datetime.fromisoformat(row['last_close'])
-    except Exception as e:
-        log.exception(f"Error restoring last close times from DB: {e}")
-
-    conn.close()
-    log.info("State restoration complete.")
-
 
 # -------------------------
 # Indicators (same as before)
@@ -881,7 +799,9 @@ async def evaluate_and_enter(symbol: str):
             }
             async with managed_trades_lock:
                 managed_trades[trade_id] = meta
-            record_trade(meta)
+            record_trade({'id': trade_id, 'symbol': symbol, 'side': side, 'entry_price': price,
+                          'exit_price': None, 'qty': qty, 'notional': notional, 'pnl': None,
+                          'open_time': meta['open_time'], 'close_time': None})
             await send_telegram(f"Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
             log.info("Opened trade: %s", meta)
         except Exception as e:
@@ -1072,37 +992,33 @@ def build_control_keyboard():
     ]
     return InlineKeyboardMarkup(buttons)
 
-from fastapi import Request, Response
-
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    if token != TELEGRAM_BOT_TOKEN:
-        return Response(content="unauthorized", status_code=401)
-    
-    update_data = await request.json()
-    asyncio.create_task(handle_update(update_data))
-    return Response(content="ok", status_code=200)
-
-async def handle_update(update: dict):
-    upd = telegram.Update.de_json(update, telegram_bot)
+def handle_update_sync(update, loop):
     try:
-        if upd is None:
+        if update is None:
             return
-        if getattr(upd, 'message', None):
-            msg = upd.message
+        if getattr(update, 'message', None):
+            msg = update.message
             text = (msg.text or "").strip()
             if text.startswith("/startbot"):
-                await _set_running(True)
-                await send_telegram("Bot state -> RUNNING")
+                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot state -> RUNNING")
             elif text.startswith("/stopbot"):
-                await _set_running(False)
-                await send_telegram("Bot state -> STOPPED")
+                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot state -> STOPPED")
             elif text.startswith("/freeze"):
-                await _set_frozen(True)
-                await send_telegram("Bot -> FROZEN (no new entries)")
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot -> FROZEN (no new entries)")
             elif text.startswith("/unfreeze"):
-                await _set_frozen(False)
-                await send_telegram("Bot -> UNFROZEN")
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot -> UNFROZEN")
             elif text.startswith("/help"):
                 help_text = (
                     "**KAMA Bot Commands**\\n\\n"
@@ -1118,43 +1034,59 @@ async def handle_update(update: dict):
                     "/validate: Runs a sanity check of the configuration.\\n"
                     "--- Tunnel Commands ---\\n"
                     "/tunnelstatus: Shows the SSH tunnel configuration and status.\\n"
-                    "/settunnel <host> <user> <password> [port]: Sets tunnel credentials and enables it."
+                    "/settunnel <p> <v>: Sets a tunnel param `p` to value `v` (requires restart)."
                 )
-                await send_telegram(help_text)
+                send_telegram_sync(help_text)
             elif text.startswith("/ip") or text.startswith("/forceip"):
-                ip = await asyncio.to_thread(get_public_ip)
-                await send_telegram(f"Server IP: {ip}")
+                ip = get_public_ip()
+                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/status"):
-                trades = await get_managed_trades_snapshot()
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try: trades = fut.result(timeout=5)
+                except Exception: pass
                 txt = f"Status:\nrunning={running}\nfrozen={frozen}\nmanaged_trades={len(trades)}"
-                await send_telegram(txt)
+                send_telegram_sync(txt)
                 try:
-                    await asyncio.to_thread(telegram_bot.send_message, chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
+                    telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
                     pass
+            elif text.startswith("/ip") or text.startswith("/forceip"):
+                ip = get_public_ip()
+                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/listorders"):
-                trades = await get_managed_trades_snapshot()
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try: trades = fut.result(timeout=5)
+                except Exception: pass
                 if not trades:
-                    await send_telegram("No managed trades.")
+                    send_telegram_sync("No managed trades.")
                 else:
                     out = "Open trades:\n"
                     for k, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    await send_telegram(out)
+                    send_telegram_sync(out)
             elif text.startswith("/showparams"):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
-                await send_telegram(out)
+                send_telegram_sync(out)
+            elif data == "tunnelstatus":
+                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                out = f"Tunnel Status: {status}\\n-- Config --\\n"
+                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                for k,v in cfg_safe.items():
+                    out += f"{k} = {v}\\n"
+                send_telegram_sync(out)
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
                     key = parts[1]
                     val = " ".join(parts[2:])
                     if key not in CONFIG:
-                        await send_telegram(f"Parameter {key} not found.")
+                        send_telegram_sync(f"Parameter {key} not found.")
                     else:
                         old = CONFIG[key]
                         try:
@@ -1168,82 +1100,94 @@ async def handle_update(update: dict):
                                 CONFIG[key] = [x.strip().upper() for x in val.split(",")]
                             else:
                                 CONFIG[key] = val
-                            await send_telegram(f"Set {key} = {CONFIG[key]}")
+                            send_telegram_sync(f"Set {key} = {CONFIG[key]}")
                         except Exception as e:
-                            await send_telegram(f"Failed to set {key}: {e}")
+                            send_telegram_sync(f"Failed to set {key}: {e}")
                 else:
-                    await send_telegram("Usage: /setparam KEY VALUE")
+                    send_telegram_sync("Usage: /setparam KEY VALUE")
             elif text.startswith("/validate"):
-                result = await asyncio.to_thread(validate_and_sanity_check_sync, send_report=False)
-                await send_telegram("Validation result: " + ("OK" if result["ok"] else "ERROR"))
+                result = validate_and_sanity_check_sync(send_report=False)
+                send_telegram_sync("Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
-                    await send_telegram(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+                    send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             elif text.startswith("/tunnelstatus"):
                 status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
                 out = f"Tunnel Status: {status}\\n-- Config --\\n"
                 cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
                 for k,v in cfg_safe.items():
                     out += f"{k} = {v}\\n"
-                await send_telegram(out)
+                send_telegram_sync(out)
             elif text.startswith("/settunnel"):
                 parts = text.split()
-                if len(parts) == 2 and parts[1].lower() == 'off':
-                    TUNNEL_CONFIG['enabled'] = False
-                    await send_telegram("Tunnel disabled. Restart required.")
-                elif len(parts) >= 4:
-                    try:
-                        TUNNEL_CONFIG['host'] = parts[1]
-                        TUNNEL_CONFIG['user'] = parts[2]
-                        TUNNEL_CONFIG['password'] = parts[3]
-                        if len(parts) >= 5:
-                            TUNNEL_CONFIG['port'] = int(parts[4])
-                        else:
-                            TUNNEL_CONFIG['port'] = 22 # Default SSH port
-                        TUNNEL_CONFIG['enabled'] = True
-                        await send_telegram("Tunnel configured and enabled. Restart required.")
-                    except Exception as e:
-                        await send_telegram(f"Error processing command: {e}")
+                if len(parts) >= 3:
+                    key = parts[1].lower()
+                    val = " ".join(parts[2:])
+                    if key not in TUNNEL_CONFIG:
+                        send_telegram_sync(f"Tunnel parameter {key} not found.")
+                    else:
+                        try:
+                            if key == 'enabled':
+                                TUNNEL_CONFIG[key] = val.lower() in ("1","true","yes","on")
+                            elif key in ['port', 'local_bind_port', 'remote_bind_port']:
+                                TUNNEL_CONFIG[key] = int(val)
+                            else:
+                                TUNNEL_CONFIG[key] = val
+                            send_telegram_sync(f"Set tunnel param {key} = {TUNNEL_CONFIG[key]}")
+                            send_telegram_sync("NOTE: A restart is required for tunnel changes to take effect.")
+                        except Exception as e:
+                            send_telegram_sync(f"Failed to set {key}: {e}")
                 else:
-                    await send_telegram("Usage:\n/settunnel <host> <user> <password> [port]\n/settunnel off")
+                    send_telegram_sync("Usage: /settunnel <param> <value>")
             else:
-                await send_telegram("Unknown command. Use /status or buttons.")
-        elif getattr(upd, 'callback_query', None):
-            cq = upd.callback_query
+                send_telegram_sync("Unknown command. Use /status or buttons.")
+        elif getattr(update, 'callback_query', None):
+            cq = update.callback_query
             data = cq.data
             try:
-                await asyncio.to_thread(telegram_bot.answer_callback_query, callback_query_id=cq.id, text=f"Action: {data}")
+                telegram_bot.answer_callback_query(callback_query_id=cq.id, text=f"Action: {data}")
             except Exception:
                 pass
             if data == "start":
-                await _set_running(True)
-                await send_telegram("Bot state -> RUNNING")
+                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot state -> RUNNING")
             elif data == "stop":
-                await _set_running(False)
-                await send_telegram("Bot state -> STOPPED")
+                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot state -> STOPPED")
             elif data == "freeze":
-                await _set_frozen(True)
-                await send_telegram("Bot -> FROZEN")
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot -> FROZEN")
             elif data == "unfreeze":
-                await _set_frozen(False)
-                await send_telegram("Bot -> UNFROZEN")
+                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
+                try: fut.result(timeout=5)
+                except Exception: pass
+                send_telegram_sync("Bot -> UNFROZEN")
             elif data == "listorders":
-                trades = await get_managed_trades_snapshot()
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try: trades = fut.result(timeout=5)
+                except Exception: pass
                 if not trades:
-                    await send_telegram("No managed trades.")
+                    send_telegram_sync("No managed trades.")
                 else:
                     out = "Open trades:\n"
                     for k, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    await send_telegram(out)
+                    send_telegram_sync(out)
             elif data == "showparams":
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
-                await send_telegram(out)
+                send_telegram_sync(out)
     except Exception:
-        log.exception("Error in handle_update")
+        log.exception("Error in handle_update_sync")
 
 def telegram_polling_thread(loop):
     global telegram_bot
@@ -1299,60 +1243,65 @@ async def root():
 # -------------------------
 @app.on_event("startup")
 async def startup_event():
-    log.info("Web server started. Initializing bot in background.")
-    asyncio.create_task(initialize_bot())
+    global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
+    
+    # Start Telegram listener first to ensure bot is responsive for configuration
+    loop = asyncio.get_running_loop()
+    run_poller = os.getenv("RUN_TELEGRAM_POLLER", "true").lower() in ("true", "1", "yes")
+    if telegram_bot and run_poller:
+        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
+        telegram_thread.start()
+        log.info("Started telegram polling thread (RUN_TELEGRAM_POLLER=true).")
+    else:
+        log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
 
-async def initialize_bot():
-    global scan_task, monitor_thread_obj, client, monitor_stop_event
+    # --- Pre-startup Network Diagnostic Test ---
     try:
-        WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-        if telegram_bot and WEBHOOK_URL:
-            webhook_url_with_token = f"{WEBHOOK_URL}/webhook/{TELEGRAM_BOT_TOKEN}"
-            success = await asyncio.to_thread(telegram_bot.set_webhook, url=webhook_url_with_token)
-            if success:
-                log.info(f"Webhook set to {webhook_url_with_token}")
-            else:
-                log.error("Failed to set webhook.")
-        elif telegram_bot:
-            log.warning("WEBHOOK_URL not set. Bot will not receive updates from Telegram.")
-        
-        # --- Pre-startup Network Diagnostic Test ---
-        init_db()
-        restore_state_from_db() # Restore state after initializing DB
         log.info("Performing pre-startup network diagnostic test to Binance...")
         diag_url = "https://fapi.binance.com/fapi/v1/ping"
         response = requests.get(diag_url, timeout=10)
-        response.raise_for_status()
-        if "text/html" in response.headers.get('Content-Type', ''):
-            raise RuntimeError("Binance returned an HTML page, indicating a network block or firewall issue.")
-        log.info("Network diagnostic test successful.")
-
-        ok, err = await asyncio.to_thread(init_binance_client_sync)
-        if not ok:
-            log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
-            await send_telegram(f"CRITICAL: Bot startup failed. Binance client initialization failed: {err}")
+        if response.status_code != 200:
+            err_msg = f"Network diagnostic test failed: Received status code {response.status_code} from Binance."
+            log.critical(err_msg)
+            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
             return
+        if "text/html" in response.headers.get('Content-Type', ''):
+            err_msg = "Network diagnostic test failed: Binance returned an HTML page. This confirms a network block or firewall issue."
+            log.critical(err_msg)
+            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
+            return
+        log.info("Network diagnostic test successful.")
+    except requests.exceptions.RequestException as e:
+        err_msg = f"Network diagnostic test failed with a connection error: {e}"
+        log.critical(err_msg)
+        await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
+        return
 
-        await asyncio.to_thread(validate_and_sanity_check_sync, True)
-        
-        # Start trading-related tasks only if initialization was successful
-        loop = asyncio.get_running_loop()
-        scan_task = loop.create_task(scanning_loop())
-        monitor_stop_event.clear()
-        monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
-        monitor_thread_obj.start()
-        log.info("Started monitor thread.")
+    init_db()
+    ok, err = await asyncio.to_thread(init_binance_client_sync)
+    if not ok:
+        log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
+        if "Tunnel is enabled but required configuration is missing" in err:
+            await send_telegram(f"CRITICAL: Bot startup failed. {err}")
+        else:
+            await send_telegram(f"CRITICAL: Bot startup failed. Binance client initialization failed: {err}")
+        return
+
+    await asyncio.to_thread(validate_and_sanity_check_sync, True)
+    
+    # Start trading-related tasks only if initialization was successful
+    scan_task = loop.create_task(scanning_loop())
+    monitor_stop_event.clear()
+    monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
+    monitor_thread_obj.start()
+    log.info("Started monitor thread.")
+    try:
         await send_telegram("KAMA strategy bot started. Running={}".format(running))
-
-    except Exception as e:
-        log.exception("A critical error occurred during bot initialization.")
-        await handle_critical_error_async(e, "Bot Initialization Failed")
+    except Exception:
+        log.exception("Failed to send startup telegram")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    if telegram_bot:
-        log.info("Deleting webhook...")
-        await asyncio.to_thread(telegram_bot.delete_webhook)
     stop_tunnel_sync()
     try:
         monitor_stop_event.set()
@@ -1384,4 +1333,3 @@ if __name__ == "__main__":
         loop.run_forever()
     except KeyboardInterrupt:
         pass
-
