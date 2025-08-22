@@ -188,11 +188,11 @@ def sanitize_error_for_telegram(raw: str, max_len: int = 1000) -> str:
         return text[:max_len] + "\n\n[...] (truncated)"
     return text
 
-def get_public_ip() -> str:
-    """Fetches the public IP address from an external service."""
+def get_public_ip(proxies: Optional[Dict[str, str]] = None) -> str:
+    """Fetches the public IP address from an external service, optionally via a proxy."""
     try:
         # Use a reliable and simple service that returns JSON
-        response = requests.get("https://api.ipify.org?format=json", timeout=5)
+        response = requests.get("https://api.ipify.org?format=json", timeout=10, proxies=proxies)
         response.raise_for_status()  # Raise an exception for bad status codes
         return response.json().get("ip", "N/A (key missing)")
     except requests.exceptions.RequestException as e:
@@ -1202,6 +1202,9 @@ def telegram_polling_thread(loop):
                 offset = u.update_id + 1
                 handle_update_sync(u, loop)
             time.sleep(0.2)
+        except telegram.error.Conflict:
+            log.warning("Telegram conflict error. Another instance may be running. Ignoring.")
+            time.sleep(5)
         except Exception:
             log.exception("Telegram polling thread error")
             try:
@@ -1296,7 +1299,19 @@ async def startup_event():
     monitor_thread_obj.start()
     log.info("Started monitor thread.")
     try:
-        await send_telegram("KAMA strategy bot started. Running={}".format(running))
+        server_ip = get_public_ip()
+        startup_message = f"KAMA strategy bot started. Running={running}\nServer IP: {server_ip}"
+        
+        if tunnel_server and tunnel_server.is_active:
+            local_bind_port = TUNNEL_CONFIG["local_bind_port"]
+            proxies = {
+                'http': f'socks5h://127.0.0.1:{local_bind_port}',
+                'https': f'socks5h://127.0.0.1:{local_bind_port}'
+            }
+            tunnel_ip = get_public_ip(proxies=proxies)
+            startup_message += f"\nTunnel IP: {tunnel_ip}"
+
+        await send_telegram(startup_message)
     except Exception:
         log.exception("Failed to send startup telegram")
 
