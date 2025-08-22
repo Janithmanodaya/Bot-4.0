@@ -1237,6 +1237,30 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
+
+    # --- Pre-startup Network Diagnostic Test ---
+    try:
+        log.info("Performing pre-startup network diagnostic test to Binance...")
+        diag_url = "https://fapi.binance.com/fapi/v1/ping"
+        response = requests.get(diag_url, timeout=10)
+        if response.status_code != 200:
+            err_msg = f"Network diagnostic test failed: Received status code {response.status_code} from Binance."
+            log.critical(err_msg)
+            await send_telegram(f"CRITICAL: Bot failed to start. {err_msg}")
+            return
+        # Check if the response is JSON, not HTML
+        if "text/html" in response.headers.get('Content-Type', ''):
+            err_msg = "Network diagnostic test failed: Binance returned an HTML page instead of API data. This confirms a network block or firewall issue."
+            log.critical(err_msg)
+            await send_telegram(f"CRITICAL: Bot failed to start. {err_msg}")
+            return
+        log.info("Network diagnostic test successful.")
+    except requests.exceptions.RequestException as e:
+        err_msg = f"Network diagnostic test failed with a connection error: {e}"
+        log.critical(err_msg)
+        await send_telegram(f"CRITICAL: Bot failed to start. {err_msg}")
+        return
+
     init_db()
     ok, err = await asyncio.to_thread(init_binance_client_sync)
     if not ok:
