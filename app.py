@@ -422,9 +422,15 @@ def init_binance_client_sync():
     EXCHANGE_INFO_CACHE['ts'] = 0.0
 
     # Start the tunnel if it's enabled
-    tunnel_ok, tunnel_msg = start_tunnel_sync()
-    if not tunnel_ok:
-        return False, f"Tunnel failed to start: {tunnel_msg}"
+    if TUNNEL_CONFIG.get("enabled"):
+        tunnel_ok, tunnel_msg = start_tunnel_sync()
+        if not tunnel_ok:
+            # Distinguish between configuration error and connection error
+            if "required configuration is missing" in tunnel_msg:
+                log.warning(f"Tunnel is enabled but not configured, proceeding without it. Details: {tunnel_msg}")
+            else:
+                # If configured but fails to start, it's a critical error
+                return False, f"Tunnel failed to start: {tunnel_msg}"
 
     # Prepare requests parameters (for proxy, if tunnel is active)
     req_params = {}
@@ -1073,13 +1079,6 @@ def handle_update_sync(update, loop):
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
                 send_telegram_sync(out)
-            elif data == "tunnelstatus":
-                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
-                out = f"Tunnel Status: {status}\\n-- Config --\\n"
-                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
-                for k,v in cfg_safe.items():
-                    out += f"{k} = {v}\\n"
-                send_telegram_sync(out)
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
@@ -1185,6 +1184,13 @@ def handle_update_sync(update, loop):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
+                send_telegram_sync(out)
+            elif data == "tunnelstatus":
+                status = "active" if tunnel_server and tunnel_server.is_active else "inactive"
+                out = f"Tunnel Status: {status}\\n-- Config --\\n"
+                cfg_safe = {k: (v if k != 'password' else '******') for k,v in TUNNEL_CONFIG.items()}
+                for k,v in cfg_safe.items():
+                    out += f"{k} = {v}\\n"
                 send_telegram_sync(out)
     except Exception:
         log.exception("Error in handle_update_sync")
