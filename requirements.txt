@@ -1,25 +1,26 @@
-# Core dependencies
+# Core libraries
 numpy==1.26.4
-pandas==2.1.4      # Compatible with Python 3.13
+pandas==2.2.2
 scipy==1.12.0
+
+# Machine Learning (if needed)
+scikit-learn==1.4.2
+
+# Binance Trading
+python-binance==1.0.19
+
+# Telegram Bot
+python-telegram-bot==13.15
+
+# API / Websocket
+requests==2.31.0
+websocket-client==1.7.0
 
 # FastAPI for health checks
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
 
-# Binance API
-python-binance==1.0.19
-
-# Telegram bot integration
-python-telegram-bot==13.15
-
-# Networking & requests
-requests==2.31.0
-websocket-client==1.7.0
-
-# Performance & compilation helpers
+# Build tools
 setuptools>=69.5.1
 wheel>=0.43.0
 cython>=3.0.10
-meson>=1.4.0
-ninja>=1.11.1
