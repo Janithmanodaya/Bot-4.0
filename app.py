@@ -1245,11 +1245,17 @@ async def handle_update(update: dict):
                         out += f"{k} = {v}\n"
                     await send_telegram(out)
             elif text.startswith("/tunnelsetup"):
-                await send_telegram(
+                message_text = (
                     "SSH Tunnel Configuration\n\n"
                     "Use the buttons below to set each parameter one-by-one. "
-                    "A restart is required for changes to take effect.",
-                    reply_markup=build_tunnel_setup_keyboard()
+                    "A restart is required for changes to take effect."
+                )
+                keyboard = build_tunnel_setup_keyboard()
+                await asyncio.to_thread(
+                    telegram_bot.send_message,
+                    chat_id=int(TELEGRAM_CHAT_ID),
+                    text=message_text,
+                    reply_markup=keyboard
                 )
             else:
                 await send_telegram("Unknown command. Use /status or buttons.")
