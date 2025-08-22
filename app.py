@@ -1244,6 +1244,16 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
+    
+    # Start Telegram listener first to ensure bot is responsive for configuration
+    loop = asyncio.get_running_loop()
+    run_poller = os.getenv("RUN_TELEGRAM_POLLER", "true").lower() in ("true", "1", "yes")
+    if telegram_bot and run_poller:
+        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
+        telegram_thread.start()
+        log.info("Started telegram polling thread (RUN_TELEGRAM_POLLER=true).")
+    else:
+        log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
 
     # --- Pre-startup Network Diagnostic Test ---
     try:
@@ -1253,46 +1263,38 @@ async def startup_event():
         if response.status_code != 200:
             err_msg = f"Network diagnostic test failed: Received status code {response.status_code} from Binance."
             log.critical(err_msg)
-            await send_telegram(f"CRITICAL: Bot failed to start. {err_msg}")
+            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
             return
-        # Check if the response is JSON, not HTML
         if "text/html" in response.headers.get('Content-Type', ''):
-            err_msg = "Network diagnostic test failed: Binance returned an HTML page instead of API data. This confirms a network block or firewall issue."
+            err_msg = "Network diagnostic test failed: Binance returned an HTML page. This confirms a network block or firewall issue."
             log.critical(err_msg)
-            await send_telegram(f"CRITICAL: Bot failed to start. {err_msg}")
+            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
             return
         log.info("Network diagnostic test successful.")
     except requests.exceptions.RequestException as e:
         err_msg = f"Network diagnostic test failed with a connection error: {e}"
         log.critical(err_msg)
-        await send_telegram(f"CRITICAL: Bot failed to start. {err_msg}")
+        await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
         return
 
     init_db()
     ok, err = await asyncio.to_thread(init_binance_client_sync)
     if not ok:
         log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
-        # Send a more helpful message for the common case of missing tunnel config
         if "Tunnel is enabled but required configuration is missing" in err:
-            await send_telegram(f"CRITICAL: Bot failed to start. {err}")
+            await send_telegram(f"CRITICAL: Bot startup failed. {err}")
         else:
-            await send_telegram(f"CRITICAL: Bot failed to start. Binance client initialization failed: {err}")
+            await send_telegram(f"CRITICAL: Bot startup failed. Binance client initialization failed: {err}")
         return
 
     await asyncio.to_thread(validate_and_sanity_check_sync, True)
-    loop = asyncio.get_running_loop()
+    
+    # Start trading-related tasks only if initialization was successful
     scan_task = loop.create_task(scanning_loop())
     monitor_stop_event.clear()
     monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
     monitor_thread_obj.start()
     log.info("Started monitor thread.")
-    run_poller = os.getenv("RUN_TELEGRAM_POLLER", "true").lower() in ("true", "1", "yes")
-    if telegram_bot and run_poller:
-        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
-        telegram_thread.start()
-        log.info("Started telegram polling thread (RUN_TELEGRAM_POLLER=true).")
-    else:
-        log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
     try:
         await send_telegram("KAMA strategy bot started. Running={}".format(running))
     except Exception:
