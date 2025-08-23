@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from decimal import Decimal, ROUND_DOWN, getcontext
 import html
+import json
 
 import requests
 import numpy as np
@@ -34,8 +35,6 @@ import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.utils.request import Request
-import subprocess
-import shlex
 
 def _get_env_int(key: str, default: int) -> int:
     """Safely get an integer from environment variables."""
@@ -83,6 +82,7 @@ CONFIG = {
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
 
     "DB_FILE": os.getenv("DB_FILE", "trades.db"),
+    "PROXY_FILE": os.getenv("PROXY_FILE", "proxies.json"),
 }
 # -------------------------
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -100,17 +100,32 @@ app = FastAPI()
 
 # Globals
 client: Optional[Client] = None
-TUNNEL_CONFIG = {
-    "enabled": os.getenv("TUNNEL_ENABLED", "false").lower() in ("true", "1", "yes"),
-    "host": os.getenv("TUNNEL_HOST"),
-    "port": _get_env_int("TUNNEL_PORT", 22),
-    "user": os.getenv("TUNNEL_USER"),
-    "pkey_path": os.getenv("TUNNEL_PKEY_PATH"),
-    "local_bind_port": _get_env_int("TUNNEL_LOCAL_PORT", 1080),
-    "remote_bind_host": os.getenv("TUNNEL_REMOTE_HOST", "fapi.binance.com"),
-    "remote_bind_port": _get_env_int("TUNNEL_REMOTE_PORT", 443),
-}
-tunnel_process: Optional[subprocess.Popen] = None
+PROXY_LIST_LOCK = threading.Lock()
+PROXY_LIST = []
+ACTIVE_PROXY = None
+PENDING_PROXY_ACTIVATION = None
+
+def load_proxies():
+    global PROXY_LIST
+    try:
+        with open(CONFIG["PROXY_FILE"], 'r') as f:
+            data = json.load(f)
+            with PROXY_LIST_LOCK:
+                PROXY_LIST = data.get("proxies", [])
+            log.info(f"Loaded {len(PROXY_LIST)} proxies from {CONFIG['PROXY_FILE']}.")
+    except FileNotFoundError:
+        log.warning(f"Proxy file not found at {CONFIG['PROXY_FILE']}. Starting with an empty proxy list.")
+        save_proxies() # Create the file
+    except Exception:
+        log.exception(f"Error loading proxies from {CONFIG['PROXY_FILE']}.")
+
+def save_proxies():
+    with PROXY_LIST_LOCK:
+        try:
+            with open(CONFIG["PROXY_FILE"], 'w') as f:
+                json.dump({"proxies": PROXY_LIST}, f, indent=2)
+        except Exception:
+            log.exception(f"Error saving proxies to {CONFIG['PROXY_FILE']}.")
 
 if TELEGRAM_BOT_TOKEN:
     tg_request = Request(con_pool_size=8)
@@ -362,103 +377,18 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
     return width
 
 # -------------------------
-# Tunnel Management
-# -------------------------
-def start_tunnel_sync():
-    global tunnel_process
-    if not TUNNEL_CONFIG.get("enabled"):
-        return True, "Tunnel not enabled."
-
-    # Validate required fields
-    required_fields = ["host", "user", "pkey_path", "local_bind_port"]
-    missing_fields = [f for f in required_fields if not TUNNEL_CONFIG.get(f)]
-    if missing_fields:
-        error_msg = f"Tunnel is enabled but required config is missing: {', '.join(missing_fields)}."
-        return False, error_msg
-
-    if tunnel_process and tunnel_process.poll() is None:
-        log.info("Tunnel process is already running.")
-        return True, "Tunnel already active."
-
-    try:
-        # Use SSH with a private key for non-interactive authentication.
-        # StrictHostKeyChecking=no is used to avoid interactive prompts.
-        ssh_command = (
-            f"ssh -i {shlex.quote(TUNNEL_CONFIG['pkey_path'])} "
-            f"-N -D 127.0.0.1:{TUNNEL_CONFIG['local_bind_port']} "
-            f"-o StrictHostKeyChecking=no "
-            f"-p {TUNNEL_CONFIG['port']} "
-            f"{shlex.quote(TUNNEL_CONFIG['user'])}@{shlex.quote(TUNNEL_CONFIG['host'])}"
-        )
-        
-        log.info(f"Starting tunnel with command: ssh -i ...")
-        
-        tunnel_process = subprocess.Popen(shlex.split(ssh_command), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        time.sleep(3)
-        
-        if tunnel_process.poll() is not None:
-            stderr_output = tunnel_process.stderr.read().decode('utf-8', errors='ignore')
-            error_msg = f"Failed to start SSH tunnel process. Return code: {tunnel_process.returncode}. Stderr: {stderr_output}"
-            log.error(error_msg)
-            tunnel_process = None
-            return False, error_msg
-
-        log.info(f"SSH SOCKS proxy process started successfully on 127.0.0.1:{TUNNEL_CONFIG['local_bind_port']}.")
-        return True, "Tunnel process started."
-
-    except Exception as e:
-        log.exception("Failed to start SSH tunnel process.")
-        if tunnel_process:
-            tunnel_process.terminate()
-            tunnel_process = None
-        return False, str(e)
-
-def stop_tunnel_sync():
-    global tunnel_process
-    if tunnel_process and tunnel_process.poll() is None:
-        log.info("Stopping SSH tunnel process.")
-        tunnel_process.terminate()
-        try:
-            tunnel_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            log.warning("Tunnel process did not terminate in time, killing.")
-            tunnel_process.kill()
-        tunnel_process = None
-    else:
-        log.info("SSH tunnel process is not running or already stopped.")
-
-# -------------------------
 # Binance init (sync)
 # -------------------------
-def init_binance_client_sync():
-    global client, tunnel_server, EXCHANGE_INFO_CACHE
+def init_binance_client_sync(req_params: Dict[str, Any] = {}):
+    global client, EXCHANGE_INFO_CACHE
     
-    # Reset client at the start of initialization
     client = None
     EXCHANGE_INFO_CACHE['data'] = None
     EXCHANGE_INFO_CACHE['ts'] = 0.0
 
-    # Start the tunnel if it's enabled
-    tunnel_ok, tunnel_msg = start_tunnel_sync()
-    if not tunnel_ok:
-        return False, f"Tunnel failed to start: {tunnel_msg}"
-
-    # Prepare requests parameters (for proxy, if tunnel is active)
-    req_params = {}
-    if tunnel_server and tunnel_server.is_active:
-        local_bind_port = TUNNEL_CONFIG["local_bind_port"]
-        proxies = {
-            'http': f'socks5h://127.0.0.1:{local_bind_port}',
-            'https': f'socks5h://127.0.0.1:{local_bind_port}'
-        }
-        req_params['proxies'] = proxies
-        log.info(f"Tunnel active, using proxies: {proxies}")
-
     try:
         log.info("Initializing Binance client...")
         if USE_TESTNET:
-            # Note: Tunneling for testnet might require different remote_bind_address.
             client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True, requests_params=req_params)
             log.warning("Binance client in TESTNET mode.")
         else:
@@ -470,13 +400,7 @@ def init_binance_client_sync():
         return True, ""
     except Exception as e:
         log.exception("Failed to connect to Binance API")
-        stop_tunnel_sync() # Stop tunnel if connection failed, to allow clean retry
         err = f"Binance init error: {e}"
-        # No need to get public IP if we are using a tunnel or failing for other reasons
-        try:
-            send_telegram_sync(f"Binance init failed: {sanitize_error_for_telegram(str(e))}")
-        except Exception:
-            log.exception("Failed to notify via telegram about Binance init error.")
         return False, err
 
 # -------------------------
@@ -725,7 +649,10 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
 # evaluate & enter (async)
 # -------------------------
 async def evaluate_and_enter(symbol: str):
-    global managed_trades, running, frozen
+    global managed_trades, running, frozen, client
+    if client is None:
+        log.debug("Client not available, skipping evaluation for %s", symbol)
+        return
     if frozen or not running:
         return
     try:
@@ -856,13 +783,14 @@ def get_account_balance_usdt():
 # Monitor thread (sync)
 # -------------------------
 def monitor_thread_func():
-    global managed_trades, last_trade_close_time, running
+    global client, managed_trades, last_trade_close_time, running
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
         try:
             if client is None:
                 time.sleep(5)
                 continue
+            
             try:
                 positions = client.futures_position_information()
             except Exception as e:
@@ -1005,8 +933,7 @@ def build_control_keyboard():
     buttons = [
         [InlineKeyboardButton("Start", callback_data="start"), InlineKeyboardButton("Stop", callback_data="stop")],
         [InlineKeyboardButton("Freeze", callback_data="freeze"), InlineKeyboardButton("Unfreeze", callback_data="unfreeze")],
-        [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")],
-        [InlineKeyboardButton("Tunnel Status", callback_data="tunnelstatus")]
+        [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")]
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -1017,7 +944,93 @@ def handle_update_sync(update, loop):
         if getattr(update, 'message', None):
             msg = update.message
             text = (msg.text or "").strip()
-            if text.startswith("/startbot"):
+            if text.startswith("/addproxy"):
+                parts = text.split()
+                if len(parts) == 2:
+                    proxy_url = parts[1]
+                    with PROXY_LIST_LOCK:
+                        PROXY_LIST.append({"url": proxy_url, "status": "untested", "public_ip": None})
+                        save_proxies()
+                    send_telegram_sync(f"Proxy `{proxy_url}` added successfully.")
+                else:
+                    send_telegram_sync("Usage: /addproxy <proxy_url> (e.g., http://user:pass@host:port)")
+            elif text.startswith("/proxies"):
+                with PROXY_LIST_LOCK:
+                    if not PROXY_LIST:
+                        send_telegram_sync("No proxies configured. Use /addproxy to add one.")
+                        return
+                    out = "Configured Proxies:\n"
+                    for i, p in enumerate(PROXY_LIST):
+                        out += f"`{i+1}`: `{p['url']}` (Status: {p['status']})\n"
+                    send_telegram_sync(out)
+            elif text.startswith("/testproxy"):
+                parts = text.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    idx = int(parts[1]) - 1
+                    with PROXY_LIST_LOCK:
+                        if 0 <= idx < len(PROXY_LIST):
+                            proxy_info = PROXY_LIST[idx]
+                        else:
+                            proxy_info = None
+                    
+                    if proxy_info:
+                        send_telegram_sync(f"Testing proxy `{idx+1}`: `{proxy_info['url']}`...")
+                        proxies = {'http': proxy_info['url'], 'https': proxy_info['url']}
+                        ip = get_public_ip(proxies=proxies)
+                        if "N/A" not in ip:
+                            with PROXY_LIST_LOCK:
+                                PROXY_LIST[idx]['public_ip'] = ip
+                                PROXY_LIST[idx]['status'] = 'pending_activation'
+                                global PENDING_PROXY_ACTIVATION
+                                PENDING_PROXY_ACTIVATION = PROXY_LIST[idx]
+                                save_proxies()
+                            send_telegram_sync(f"Proxy test successful!\nPublic IP: `{ip}`\nPlease add this IP to your Binance whitelist, then run `/activateproxy {idx+1}`.")
+                        else:
+                            with PROXY_LIST_LOCK:
+                                PROXY_LIST[idx]['status'] = 'failed'
+                                save_proxies()
+                            send_telegram_sync("Proxy test failed. Could not retrieve public IP.")
+                    else:
+                        send_telegram_sync("Invalid proxy number. Use /proxies to see the list.")
+                else:
+                    send_telegram_sync("Usage: /testproxy <number>")
+            elif text.startswith("/activateproxy"):
+                global ACTIVE_PROXY, client
+                parts = text.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                     idx = int(parts[1]) - 1
+                     with PROXY_LIST_LOCK:
+                         if 0 <= idx < len(PROXY_LIST):
+                             proxy_info = PROXY_LIST[idx]
+                         else:
+                             proxy_info = None
+                     if proxy_info and proxy_info['status'] == 'pending_activation':
+                         send_telegram_sync(f"Activating proxy `{proxy_info['url']}` and connecting to Binance...")
+                         req_params = {'proxies': {'http': proxy_info['url'], 'https': proxy_info['url']}}
+                         try:
+                             test_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=req_params)
+                             test_client.ping()
+                             client = test_client
+                             ACTIVE_PROXY = proxy_info
+                             with PROXY_LIST_LOCK:
+                                 PROXY_LIST[idx]['status'] = 'active'
+                                 save_proxies()
+                             send_telegram_sync(f"Successfully connected to Binance via proxy: `{ACTIVE_PROXY['url']}`")
+                         except Exception as e:
+                             log.exception("Failed to activate proxy.")
+                             with PROXY_LIST_LOCK:
+                                 PROXY_LIST[idx]['status'] = 'failed'
+                                 save_proxies()
+                             send_telegram_sync(f"Failed to connect to Binance with this proxy. Error: {e}")
+                     else:
+                         send_telegram_sync("Proxy not found or not pending activation. Use `/testproxy` first.")
+                else:
+                    send_telegram_sync("Usage: /activateproxy <number>")
+            elif text.startswith("/stopproxy"):
+                client = None
+                ACTIVE_PROXY = None
+                send_telegram_sync("Proxy connection stopped. Trading is paused.")
+            elif text.startswith("/startbot"):
                 fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
                 try: fut.result(timeout=5)
                 except Exception: pass
@@ -1039,25 +1052,26 @@ def handle_update_sync(update, loop):
                 send_telegram_sync("Bot -> UNFROZEN")
             elif text.startswith("/help"):
                 help_text = (
-                    "**KAMA Bot Commands**\\n\\n"
-                    "/startbot: Starts the trading bot.\\n"
-                    "/stopbot: Stops the trading bot.\\n"
-                    "/status: Shows current bot status.\\n"
-                    "/freeze: Freezes new trades, but continues monitoring existing ones.\\n"
-                    "/unfreeze: Unfreezes the bot to allow new trades.\\n"
-                    "/ip: Shows the server's public IP address.\\n"
-                    "/listorders: Lists all currently managed open trades.\\n"
-                    "/showparams: Shows the current trading parameters.\\n"
-                    "/setparam <p> <v>: Sets a trading parameter `p` to value `v`.\\n"
-                    "/validate: Runs a sanity check of the configuration.\\n"
-                    "--- Tunnel Commands ---\\n"
-                    "/tunnelstatus: Shows the SSH tunnel configuration and status.\\n"
-                    "/settunnel <p> <v>: Sets a tunnel param `p` to value `v` (requires restart)."
+                    "**KAMA Bot Commands**\n\n"
+                    "__Bot Control__\n"
+                    "`/startbot` - Start the trading bot.\n"
+                    "`/stopbot` - Stop the trading bot.\n"
+                    "`/status` - Show current status, trade count.\n"
+                    "`/freeze` - Stop opening new trades.\n"
+                    "`/unfreeze` - Allow opening new trades.\n\n"
+                    "__Proxy Management__\n"
+                    "`/addproxy <url>` - Add a new proxy.\n"
+                    "`/proxies` - List configured proxies.\n"
+                    "`/testproxy <n>` - Test proxy `n` and get its IP.\n"
+                    "`/activateproxy <n>` - Activate proxy `n` to start trading.\n"
+                    "`/stopproxy` - Deactivate proxy and pause trading.\n\n"
+                    "__Info & Config__\n"
+                    "`/listorders` - List open trades.\n"
+                    "`/showparams` - Show current parameters.\n"
+                    "`/setparam <p> <v>` - Set a parameter.\n"
+                    "`/validate` - Run a configuration sanity check."
                 )
                 send_telegram_sync(help_text)
-            elif text.startswith("/ip") or text.startswith("/forceip"):
-                ip = get_public_ip()
-                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/status"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -1069,9 +1083,6 @@ def handle_update_sync(update, loop):
                     telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
                     pass
-            elif text.startswith("/ip") or text.startswith("/forceip"):
-                ip = get_public_ip()
-                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/listorders"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -1121,34 +1132,6 @@ def handle_update_sync(update, loop):
                 send_telegram_sync("Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
                     send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
-            elif text.startswith("/tunnelstatus"):
-                status = "active" if tunnel_process and tunnel_process.poll() is None else "inactive"
-                out = f"Tunnel Status: {status}\\n-- Config --\\n"
-                cfg_safe = {k: v for k, v in TUNNEL_CONFIG.items() if k != 'password'}
-                for k,v in cfg_safe.items():
-                    out += f"{k} = {v}\\n"
-                send_telegram_sync(out)
-            elif text.startswith("/settunnel"):
-                parts = text.split()
-                if len(parts) >= 3:
-                    key = parts[1].lower()
-                    val = " ".join(parts[2:])
-                    if key not in TUNNEL_CONFIG:
-                        send_telegram_sync(f"Tunnel parameter {key} not found.")
-                    else:
-                        try:
-                            if key == 'enabled':
-                                TUNNEL_CONFIG[key] = val.lower() in ("1","true","yes","on")
-                            elif key in ['port', 'local_bind_port', 'remote_bind_port']:
-                                TUNNEL_CONFIG[key] = int(val)
-                            else:
-                                TUNNEL_CONFIG[key] = val
-                            send_telegram_sync(f"Set tunnel param {key} = {TUNNEL_CONFIG[key]}")
-                            send_telegram_sync("NOTE: A restart is required for tunnel changes to take effect.")
-                        except Exception as e:
-                            send_telegram_sync(f"Failed to set {key}: {e}")
-                else:
-                    send_telegram_sync("Usage: /settunnel <param> <value>")
             else:
                 send_telegram_sync("Unknown command. Use /status or buttons.")
         elif getattr(update, 'callback_query', None):
@@ -1196,13 +1179,6 @@ def handle_update_sync(update, loop):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
-                send_telegram_sync(out)
-            elif data == "tunnelstatus":
-                status = "active" if tunnel_process and tunnel_process.poll() is None else "inactive"
-                out = f"Tunnel Status: {status}\\n-- Config --\\n"
-                cfg_safe = {k: v for k, v in TUNNEL_CONFIG.items() if k != 'password'}
-                for k,v in cfg_safe.items():
-                    out += f"{k} = {v}\\n"
                 send_telegram_sync(out)
     except Exception:
         log.exception("Error in handle_update_sync")
@@ -1264,7 +1240,7 @@ async def root():
 # -------------------------
 @app.on_event("startup")
 async def startup_event():
-    global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
+    global scan_task, telegram_thread, monitor_thread_obj
     
     # Start Telegram listener first to ensure bot is responsive for configuration
     loop = asyncio.get_running_loop()
@@ -1276,66 +1252,45 @@ async def startup_event():
     else:
         log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
 
-    # --- Pre-startup Network Diagnostic Test ---
-    try:
-        log.info("Performing pre-startup network diagnostic test to Binance...")
-        diag_url = "https://fapi.binance.com/fapi/v1/ping"
-        response = requests.get(diag_url, timeout=10)
-        if response.status_code != 200:
-            err_msg = f"Network diagnostic test failed: Received status code {response.status_code} from Binance."
-            log.critical(err_msg)
-            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
-            return
-        if "text/html" in response.headers.get('Content-Type', ''):
-            err_msg = "Network diagnostic test failed: Binance returned an HTML page. This confirms a network block or firewall issue."
-            log.critical(err_msg)
-            await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
-            return
-        log.info("Network diagnostic test successful.")
-    except requests.exceptions.RequestException as e:
-        err_msg = f"Network diagnostic test failed with a connection error: {e}"
-        log.critical(err_msg)
-        await send_telegram(f"CRITICAL: Bot startup failed. {err_msg}")
-        return
-
     init_db()
-    ok, err = await asyncio.to_thread(init_binance_client_sync)
-    if not ok:
-        log.critical(f"Binance client failed to initialize: {err}. The trading loops will not be started.")
-        if "Tunnel is enabled but required configuration is missing" in err:
-            await send_telegram(f"CRITICAL: Bot startup failed. {err}")
-        else:
-            await send_telegram(f"CRITICAL: Bot startup failed. Binance client initialization failed: {err}")
-        return
-
-    await asyncio.to_thread(validate_and_sanity_check_sync, True)
+    load_proxies()
     
-    # Start trading-related tasks only if initialization was successful
+    # Start all background threads
     scan_task = loop.create_task(scanning_loop())
     monitor_stop_event.clear()
+    
     monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
     monitor_thread_obj.start()
     log.info("Started monitor thread.")
-    try:
-        server_ip = get_public_ip()
-        startup_message = f"KAMA strategy bot started. Running={running}\nServer IP: {server_ip}"
-        
-        if tunnel_process and tunnel_process.poll() is None:
-            local_bind_port = TUNNEL_CONFIG["local_bind_port"]
-            proxies = {
-                'http': f'socks5h://127.0.0.1:{local_bind_port}',
-                'https': f'socks5h://127.0.0.1:{local_bind_port}'
-            }
-            tunnel_ip = get_public_ip(proxies=proxies)
-            startup_message += f"\nTunnel IP: {tunnel_ip}"
 
+    try:
+        if not PROXY_LIST:
+            startup_message = (
+                "**Welcome! KAMA Bot is running but requires setup.**\n\n"
+                "No proxies are configured. Trading is disabled until a proxy is added and activated.\n\n"
+                "Please add a proxy to begin:\n"
+                "`/addproxy <url>`"
+            )
+        else:
+            startup_message = (
+                "**KAMA Bot Started**\n\n"
+                "This bot now uses an interactive proxy system.\n"
+                "Trading is PAUSED until a proxy is activated.\n\n"
+                "**Proxy Commands:**\n"
+                "`/addproxy <url>` - Add a new proxy.\n"
+                "`/proxies` - List available proxies.\n"
+                "`/testproxy <n>` - Test a proxy and get its IP for whitelisting.\n"
+                "`/activateproxy <n>` - Activate a tested proxy to start trading.\n"
+                "`/stopproxy` - Stop using the current proxy and pause trading."
+            )
         await send_telegram(startup_message)
     except Exception:
         log.exception("Failed to send startup telegram")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    stop_tunnel_sync()
+    global client
+    client = None
     try:
         monitor_stop_event.set()
         if monitor_thread_obj and monitor_thread_obj.is_alive():
