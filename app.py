@@ -100,7 +100,7 @@ app = FastAPI()
 
 # Globals
 client: Optional[Client] = None
-PROXY_LIST_LOCK = threading.Lock()
+PROXY_LIST_LOCK = threading.RLock()
 PROXY_LIST = []
 ACTIVE_PROXY = None
 PENDING_PROXY_ACTIVATION = None
