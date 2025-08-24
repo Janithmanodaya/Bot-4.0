@@ -658,89 +658,158 @@ def round_qty(symbol: str, qty: float) -> float:
         log.exception("round_qty failed; falling back to float")
     return float(qty)
 
-def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int):
+def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, leverage: int, stop_price: float, take_price: float):
+    """
+    Places a market order and associated SL/TP orders in a single batch request.
+    This is not an atomic operation on Binance's side. Error handling is included
+    to attempt to clean up if some orders in the batch fail.
+    """
     global client
     if CONFIG["DRY_RUN"]:
-        log.info(f"[DRY RUN] Would open {side} position for {qty} {symbol} with {leverage}x leverage.")
-        # Return a mock order response
-        return {
-            "orderId": f"dryrun_{int(time.time())}",
-            "symbol": symbol,
-            "status": "FILLED",
-            "side": side,
-            "type": "MARKET",
-            "origQty": qty,
-            "executedQty": qty,
-            "cumQuote": "0",
-            "avgPrice": "0"
-        }
+        log.info(f"[DRY RUN] Would open {side} position for {qty} {symbol} with {leverage}x leverage, SL {stop_price}, TP {take_price}.")
+        dry_run_id = int(time.time())
+        # The first element MUST be the market order for the downstream logic to work
+        return [
+            {
+                "orderId": f"dryrun_mkt_{dry_run_id}", "symbol": symbol, "status": "FILLED",
+                "side": side, "type": "MARKET", "origQty": qty, "executedQty": qty,
+                "avgPrice": "0", "cumQuote": "0"
+            },
+            {"orderId": f"dryrun_sl_{dry_run_id}", "status": "NEW", "type": "STOP_MARKET"},
+            {"orderId": f"dryrun_tp_{dry_run_id}", "status": "NEW", "type": "TAKE_PROFIT_MARKET"}
+        ]
 
     if client is None:
         raise RuntimeError("Binance client not initialized")
-    
+
     try:
         log.info(f"Attempting to change leverage to {leverage}x for {symbol}")
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
     except Exception as e:
         log.warning("Failed to change leverage (non-fatal, may use previous leverage): %s", e)
 
+    position_side = 'LONG' if side == 'BUY' else 'SHORT'
+    close_side = 'SELL' if side == 'BUY' else 'BUY'
+
+    order_batch = [
+        {
+            'symbol': symbol,
+            'side': side,
+            'type': 'MARKET',
+            'quantity': str(qty),
+            'positionSide': position_side
+        },
+        {
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'STOP_MARKET',
+            'stopPrice': str(round(stop_price, 8)),
+            'closePosition': True,
+        },
+        {
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'TAKE_PROFIT_MARKET',
+            'stopPrice': str(round(take_price, 8)),
+            'closePosition': True,
+        }
+    ]
+
     try:
-        position_side = 'LONG' if side == 'BUY' else 'SHORT'
-        log.info(f"Placing real market order: {side} ({position_side}) {qty} {symbol}")
-        order = client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type='MARKET',
-            quantity=qty,
-            positionSide=position_side
-        )
-        return order
+        log.info(f"Placing batch order for {symbol}: {order_batch}")
+        batch_response = client.futures_create_batch_order(batchOrders=order_batch)
+
+        errors = [resp for resp in batch_response if 'code' in resp]
+        successful_orders = [resp for resp in batch_response if 'orderId' in resp]
+
+        if errors:
+            log.error(f"Batch order placement had failures for {symbol}. Errors: {errors}. Successful: {successful_orders}")
+
+            market_order_resp = batch_response[0]
+            if 'orderId' in market_order_resp:
+                log.warning(f"Market order for {symbol} was successful but SL/TP failed. Attempting to close the naked position.")
+                try:
+                    time.sleep(1) # Give exchange time to register position
+                    client.futures_create_order(
+                        symbol=symbol,
+                        side=close_side,
+                        type='MARKET',
+                        quantity=str(qty),
+                        positionSide=position_side,
+                        reduceOnly=True
+                    )
+                    log.info(f"Successfully closed naked position for {symbol}.")
+                except Exception as close_e:
+                    log.exception(f"CRITICAL: FAILED TO CLOSE NAKED POSITION for {symbol}. Manual intervention required. Error: {close_e}")
+                    send_telegram(f"🚨 CRITICAL: FAILED TO CLOSE NAKED POSITION for {symbol}. Manual intervention required.")
+
+            sl_tp_orders = [o for o in successful_orders if o.get('type') in ('STOP_MARKET', 'TAKE_PROFIT_MARKET')]
+            if sl_tp_orders:
+                cancel_ids = [o['orderId'] for o in sl_tp_orders]
+                try:
+                    client.futures_cancel_batch_order(symbol=symbol, orderIdList=cancel_ids)
+                    log.info(f"Successfully cancelled {len(cancel_ids)} pending SL/TP orders for {symbol}.")
+                except Exception as cancel_e:
+                    log.exception(f"CRITICAL: Failed to cancel pending SL/TP orders for {symbol}. Manual intervention required. Error: {cancel_e}")
+
+            raise BinanceAPIException(f"Batch order failed: {errors}", -1)
+
+        log.info(f"Batch order successful for {symbol}. Response: {batch_response}")
+        return batch_response
     except BinanceAPIException as e:
-        log.exception("BinanceAPIException opening position: %s", e)
+        log.exception("BinanceAPIException placing batch order: %s", e)
         raise
     except Exception as e:
-        log.exception("Exception opening position: %s", e)
+        log.exception("Exception placing batch order: %s", e)
         raise
 
-def place_sl_tp_orders_sync(symbol: str, side: str, stop_price: float, take_price: float):
+def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = None, tp_price: Optional[float] = None):
+    """
+    Places SL and/or TP orders in a single batch request.
+    """
     global client
     if CONFIG["DRY_RUN"]:
-        log.info(f"[DRY RUN] Would place SL at {stop_price:.4f} and TP at {take_price:.4f} for {symbol}.")
-        # Return a mock response
-        return {
-            "stop_order": {"orderId": f"dryrun_sl_{int(time.time())}"},
-            "tp_order": {"orderId": f"dryrun_tp_{int(time.time())}"}
-        }
+        if sl_price: log.info(f"[DRY RUN] Would place SL at {sl_price:.4f} for {symbol}.")
+        if tp_price: log.info(f"[DRY RUN] Would place TP at {tp_price:.4f} for {symbol}.")
+        return [{"status": "NEW"}] # Mock response
 
-    out = {}
     if client is None:
-        out['error'] = "client not initialized"
-        return out
+        raise RuntimeError("Binance client not initialized")
+
+    close_side = 'SELL' if side == 'BUY' else 'BUY'
+    order_batch = []
+    
+    if sl_price:
+        order_batch.append({
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'STOP_MARKET',
+            'stopPrice': str(round(sl_price, 8)),
+            'closePosition': True,
+        })
+    
+    if tp_price:
+        order_batch.append({
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'TAKE_PROFIT_MARKET',
+            'stopPrice': str(round(tp_price, 8)),
+            'closePosition': True,
+        })
+
+    if not order_batch:
+        log.warning(f"place_batch_sl_tp_sync called for {symbol} without sl_price or tp_price.")
+        return []
+
     try:
-        out['stop_order'] = client.futures_create_order(
-            symbol=symbol,
-            side='SELL' if side == 'BUY' else 'BUY',
-            type='STOP_MARKET',
-            stopPrice=round(stop_price, 8),
-            closePosition=True,
-            reduceOnly=True
-        )
+        log.info(f"Placing batch SL/TP order for {symbol}: {order_batch}")
+        return client.futures_create_batch_order(batchOrders=order_batch)
+    except BinanceAPIException as e:
+        log.exception("BinanceAPIException placing batch SL/TP: %s", e)
+        raise
     except Exception as e:
-        out['stop_error'] = str(e)
-        log.exception("Failed to create stop loss order: %s", e)
-    try:
-        out['tp_order'] = client.futures_create_order(
-            symbol=symbol,
-            side='SELL' if side == 'BUY' else 'BUY',
-            type='TAKE_PROFIT_MARKET',
-            stopPrice=round(take_price, 8),
-            closePosition=True,
-            reduceOnly=True
-        )
-    except Exception as e:
-        out['tp_error'] = str(e)
-        log.exception("Failed to create take profit order: %s", e)
-    return out
+        log.exception("Exception placing batch SL/TP: %s", e)
+        raise
 
 def close_partial_market_position_sync(symbol: str, side: str, qty_to_close: float):
     global client
@@ -772,28 +841,6 @@ def close_partial_market_position_sync(symbol: str, side: str, qty_to_close: flo
         log.exception("Exception closing partial position: %s", e)
         raise
 
-def place_sl_order_sync(symbol: str, side: str, stop_price: float):
-    global client
-    if CONFIG["DRY_RUN"]:
-        log.info(f"[DRY RUN] Would place SL at {stop_price:.4f} for {symbol}.")
-        return {"orderId": f"dryrun_sl_{int(time.time())}"}
-
-    if client is None:
-        raise RuntimeError("Binance client not initialized")
-    try:
-        sl_order = client.futures_create_order(
-            symbol=symbol,
-            side='SELL' if side == 'BUY' else 'BUY',
-            type='STOP_MARKET',
-            stopPrice=round(stop_price, 8),
-            closePosition=True,
-            reduceOnly=True
-        )
-        return sl_order
-    except Exception as e:
-        log.exception("Failed to create stop loss order: %s", e)
-        raise
-
 def cancel_close_orders_sync(symbol: str):
     global client
     if CONFIG["DRY_RUN"]:
@@ -804,14 +851,26 @@ def cancel_close_orders_sync(symbol: str):
         return
     try:
         orders = client.futures_get_open_orders(symbol=symbol)
-        for o in orders:
-            if o.get('type') in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] or o.get('closePosition'):
-                try:
-                    client.futures_cancel_order(symbol=symbol, orderId=o['orderId'])
-                except Exception:
-                    log.exception("Failed to cancel order %s", o.get('orderId'))
-    except Exception:
-        log.exception("Error canceling close orders: %s", symbol)
+        order_ids_to_cancel = [
+            o['orderId'] for o in orders 
+            if o.get('type') in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'] or o.get('closePosition')
+        ]
+        
+        if not order_ids_to_cancel:
+            log.info(f"No open SL/TP orders to cancel for {symbol}.")
+            return
+
+        log.info(f"Cancelling batch of {len(order_ids_to_cancel)} orders for {symbol}.")
+        client.futures_cancel_batch_order(symbol=symbol, orderIdList=order_ids_to_cancel)
+
+    except BinanceAPIException as e:
+        # If the error is "Order does not exist", it's ok, it might have been filled or already cancelled.
+        if e.code == -2011:
+            log.warning(f"Some orders could not be cancelled for {symbol} (may already be filled/cancelled): {e}")
+        else:
+            log.exception("Error batch canceling close orders for %s: %s", symbol, e)
+    except Exception as e:
+        log.exception("Error batch canceling close orders for %s: %s", symbol, e)
 
 def calculate_risk_amount(account_balance: float) -> float:
     if account_balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
@@ -1059,9 +1118,16 @@ async def evaluate_and_enter(symbol: str):
         if notional <= target_initial_margin:
             leverage = 1
         try:
-            order = await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
-            order_id = str(order.get('orderId', f"mkt_{int(time.time())}"))
-            sltp = await asyncio.to_thread(place_sl_tp_orders_sync, symbol, side, stop_price, take_price)
+            batch_response = await asyncio.to_thread(
+                place_market_order_with_sl_tp_sync, symbol, side, qty, leverage, stop_price, take_price
+            )
+            
+            market_order = batch_response[0]
+            sl_order = batch_response[1]
+            tp_order = batch_response[2]
+
+            order_id = str(market_order.get('orderId', f"mkt_{int(time.time())}"))
+            sltp = {"stop_order": sl_order, "tp_order": tp_order}
             trade_id = f"{symbol}_{order_id}"
             
             meta = {
@@ -1223,13 +1289,13 @@ def monitor_thread_func():
                     if side == 'BUY' and current_price_be >= profit_target_price:
                         if entry_price > meta['sl']:
                             cancel_close_orders_sync(sym)
-                            place_sl_tp_orders_sync(sym, side, entry_price, meta['tp'])
+                            place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
                             moved_to_be = True
                             
                     elif side == 'SELL' and current_price_be <= profit_target_price:
                         if entry_price < meta['sl']:
                             cancel_close_orders_sync(sym)
-                            place_sl_tp_orders_sync(sym, side, entry_price, meta['tp'])
+                            place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
                             moved_to_be = True
 
                     if moved_to_be:
@@ -1266,7 +1332,7 @@ def monitor_thread_func():
                             new_qty = meta['qty'] - qty_to_close
                             cancel_close_orders_sync(sym)
                             new_sl = meta['entry_price']
-                            place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp3'])
+                            place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp3'])
                             
                             with managed_trades_lock:
                                 if tid in managed_trades:
@@ -1293,7 +1359,7 @@ def monitor_thread_func():
                             new_qty = meta['qty'] - qty_to_close
                             cancel_close_orders_sync(sym)
                             new_sl = meta['tp1']
-                            place_sl_order_sync(sym, meta['side'], new_sl)
+                            place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl)
 
                             with managed_trades_lock:
                                 if tid in managed_trades:
@@ -1317,14 +1383,14 @@ def monitor_thread_func():
                             new_sl = meta['entry_price'] + 0.5 * atr_now
                             if new_sl > meta['sl'] and new_sl < current_price:
                                 cancel_close_orders_sync(sym)
-                                place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
+                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
                                 moved = True
                     else: # SELL
                         if current_price < meta['entry_price'] - 1.0 * atr_now:
                             new_sl = meta['entry_price'] - 0.5 * atr_now
                             if new_sl < meta['sl'] and new_sl > current_price:
                                 cancel_close_orders_sync(sym)
-                                place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
+                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
                                 moved = True
                     
                     if moved and new_sl is not None:
