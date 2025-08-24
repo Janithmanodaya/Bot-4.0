@@ -14,7 +14,7 @@ pandas
 numpy
 requests
 
-# Version constraints (to prevent dependency conflicts)
+# Version constraints (to prevent dependency conflicts
 urllib3<2.0
 
 # SSH Tunneling
