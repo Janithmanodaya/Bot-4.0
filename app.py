@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 
+from sshtunnel import SSHTunnelForwarder
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
@@ -50,6 +52,14 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 USE_TESTNET = False  # Force MAINNET — testnet mode removed per user request
+
+# SSH Tunnel Config (optional)
+SSH_ENABLED = os.getenv("SSH_ENABLED", "false").lower() in ("true", "1", "yes")
+SSH_HOST = os.getenv("SSH_HOST")
+SSH_PORT = int(os.getenv("SSH_PORT", "22"))
+SSH_USER = os.getenv("SSH_USER")
+SSH_PASSWORD = os.getenv("SSH_PASSWORD") # For password-based auth
+SSH_PRIVATE_KEY_PATH = os.getenv("SSH_PRIVATE_KEY_PATH") # For key-based auth
 # -------------------------
 
 # Logging
@@ -105,7 +115,12 @@ CONFIG = {
 }
 
 running = (CONFIG["START_MODE"] == "running")
+# If SSH is enabled, always start in a paused state until connection is verified.
+if SSH_ENABLED:
+    running = False
 frozen = False
+
+ssh_tunnel_server: Optional[SSHTunnelForwarder] = None
 
 # DualLock for cross-thread (thread + async) coordination
 class DualLock:
@@ -362,43 +377,88 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
     return width
 
 # -------------------------
-# Binance init (sync)
+# SSH Tunnel and Binance Init
 # -------------------------
+
+def start_ssh_tunnel():
+    """Starts the SSH tunnel and returns the local proxy port."""
+    global ssh_tunnel_server
+    try:
+        if not all([SSH_HOST, SSH_USER, (SSH_PASSWORD or SSH_PRIVATE_KEY_PATH)]):
+            log.error("SSH credentials not fully configured. Tunnel not started.")
+            return None
+
+        # Define the local SOCKS5 proxy port
+        local_proxy_port = 1080
+
+        server = SSHTunnelForwarder(
+            (SSH_HOST, SSH_PORT),
+            ssh_username=SSH_USER,
+            ssh_password=SSH_PASSWORD,
+            ssh_pkey=SSH_PRIVATE_KEY_PATH,
+            local_bind_address=('127.0.0.1', local_proxy_port)
+        )
+        server.start()
+        log.info(f"SSH tunnel started. Local SOCKS5 proxy is running on 127.0.0.1:{local_proxy_port}")
+        ssh_tunnel_server = server
+        return local_proxy_port
+    except Exception as e:
+        log.exception("Failed to start SSH tunnel.")
+        send_telegram(f"🚨 CRITICAL: Failed to start SSH tunnel: {e}")
+        return None
 
 def init_binance_client_sync():
     """
-    Initialize Binance client only when API key + secret are provided.
+    Initialize Binance client, with an optional SSH tunnel proxy.
     Returns (ok: bool, error_message: str)
     """
-    global client, BINANCE_API_KEY, BINANCE_API_SECRET, USE_TESTNET
+    global client, BINANCE_API_KEY, BINANCE_API_SECRET
+
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         log.warning("Binance API key/secret not set; Binance client will not be initialized.")
         client = None
         return False, "Missing BINANCE_API_KEY or BINANCE_API_SECRET"
 
+    proxies = None
+    if SSH_ENABLED:
+        log.info("SSH tunnel is enabled. Attempting to start...")
+        local_port = start_ssh_tunnel()
+        if local_port:
+            proxy_url = f'socks5://127.0.0.1:{local_port}'
+            proxies = {'http': proxy_url, 'https': proxy_url}
+            log.info(f"Proxy configured to use: {proxy_url}")
+        else:
+            err_msg = "SSH tunnel enabled but failed to start. Cannot initialize Binance client."
+            log.error(err_msg)
+            return False, err_msg
+    
     try:
-        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        log.info("Binance client in MAINNET mode (forced).")
-        try:
-            client.ping()
-            log.info("Connected to Binance API (ping ok).")
-        except Exception:
-            log.warning("Binance ping failed (connection may still succeed for calls).")
+        # Initialize client with or without proxy
+        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params={'proxies': proxies})
         
+        # Verify connection
+        client.ping()
+        log.info("Binance client ping successful.")
+
+        # If using SSH, get the new IP and notify user
+        if SSH_ENABLED and proxies:
+            new_ip = get_public_ip()
+            log.info(f"Successfully connected through SSH tunnel. New public IP: {new_ip}")
+            msg = (f"✅ SSH tunnel connection successful!\n\n"
+                   f"The bot is now running through the server at `{SSH_HOST}`.\n"
+                   f"Your new public IP address is: `{new_ip}`\n\n"
+                   f"Please ensure this IP is whitelisted on Binance.\n\n"
+                   f"The bot is currently **PAUSED**. Use /startbot to begin trading.")
+            send_telegram(msg)
+
         EXCHANGE_INFO_CACHE['data'] = None
         EXCHANGE_INFO_CACHE['ts'] = 0.0
         return True, ""
     except Exception as e:
         log.exception("Failed to connect to Binance API: %s", e)
-        try:
-            ip = get_public_ip()
-        except Exception:
-            ip = "<unknown>"
+        ip = get_public_ip() # This will use the proxy if active, or direct if not
         err = f"Binance init error: {e}; server_ip={ip}"
-        try:
-            send_telegram(f"Binance init failed: {e}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
-        except Exception:
-            log.exception("Failed to notify via telegram about Binance init error.")
+        send_telegram(f"🚨 Binance init failed: {e}\nServer IP: {ip}\nPlease check keys and/or proxy connection.")
         client = None
         return False, err
 
@@ -773,10 +833,36 @@ def get_account_balance_usdt():
     return 0.0
 
 def monitor_thread_func():
-    global managed_trades, last_trade_close_time, running
+    global managed_trades, last_trade_close_time, running, ssh_tunnel_server
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
         try:
+            # --- SSH Tunnel Monitoring ---
+            if SSH_ENABLED and (ssh_tunnel_server is None or not ssh_tunnel_server.is_active):
+                log.error("SSH tunnel is not active! Pausing bot and attempting to reconnect.")
+                if running:
+                    running = False
+                    send_telegram("🚨 CRITICAL: SSH tunnel connection lost. Trading is paused. Attempting to reconnect...")
+                
+                # Stop the old server if it exists
+                if ssh_tunnel_server:
+                    try:
+                        ssh_tunnel_server.stop()
+                    except Exception as e:
+                        log.warning(f"Error stopping old SSH tunnel server: {e}")
+
+                # Attempt to restart
+                ok, err = init_binance_client_sync()
+                
+                if ok:
+                    log.info("SSH tunnel reconnected successfully.")
+                    # init_binance_client_sync will send a notification. Bot remains paused.
+                else:
+                    log.error(f"Failed to reconnect SSH tunnel: {err}. Bot remains paused.")
+                
+                time.sleep(15) # Wait before next check
+                continue
+
             if client is None:
                 time.sleep(5)
                 continue
