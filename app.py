@@ -964,10 +964,9 @@ def handle_update_sync(update, loop):
                 txt = f"Status:\nrunning={running}\nfrozen={frozen}\nmanaged_trades={len(trades)}"
                 send_telegram(txt)
                 try:
-                    coro = telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
-                    asyncio.run_coroutine_threadsafe(coro, loop)
+                    telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
-                    log.exception("Failed to schedule telegram keyboard")
+                    log.exception("Failed to send telegram keyboard")
             elif text.startswith("/ip") or text.startswith("/forceip"):
                 ip = get_public_ip()
                 send_telegram(f"Server IP: {ip}")
