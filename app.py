@@ -72,7 +72,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
-    "TIMEFRAME": os.getenv("TIMEFRAME", "1h"),
+    "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
     "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
 
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
