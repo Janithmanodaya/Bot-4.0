@@ -783,10 +783,10 @@ def monitor_thread_func():
             try:
                 positions = client.futures_position_information()
             except BinanceAPIException as e:
-                log.exception("Binance API error in monitor thread: %s", e)
+                log.error("Caught Binance API error in monitor thread. Type: %s. See Telegram for details.", type(e).__name__)
                 ip = get_public_ip()
                 is_html_error = e.text and e.text.strip().lower().startswith('<!doctype html>')
-                
+
                 if is_html_error:
                     # Binance returned an HTML page instead of JSON
                     error_msg = f"Binance API returned an HTML error page. This could be an IP ban, a WAF block, or a server issue.\nServer IP: {ip}"
