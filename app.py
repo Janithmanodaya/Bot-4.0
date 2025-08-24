@@ -122,8 +122,8 @@ CONFIG = {
     "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")), # 50%
     "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.25")), # 25%
 
-    "MAX_DAILY_LOSS": float(os.getenv("MAX_DAILY_LOSS", "-50.0")), # Negative value, e.g. -50.0 for $50 loss
-    "MAX_DAILY_PROFIT": float(os.getenv("MAX_DAILY_PROFIT", "100.0")), # 0 disables this
+    "MAX_DAILY_LOSS": float(os.getenv("MAX_DAILY_LOSS", "-2.0")), # Negative value, e.g. -50.0 for $50 loss
+    "MAX_DAILY_PROFIT": float(os.getenv("MAX_DAILY_PROFIT", "5.0")), # 0 disables this
     "AUTO_FREEZE_ON_PROFIT": os.getenv("AUTO_FREEZE_ON_PROFIT", "true").lower() in ("true", "1", "yes"),
     "DAILY_PNL_CHECK_INTERVAL": int(os.getenv("DAILY_PNL_CHECK_INTERVAL", "60")), # In seconds
 
