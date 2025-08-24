@@ -1,48 +1,69 @@
 # app.py
 """
-KAMA trend-following bot — fixed for:
- - HTML error pages returned by Binance (sanitize and summarize before notifying)
- - Telegram 'Message is too long' handled (truncate and fallback to send_document)
- - Maintains DualLock, monitor thread, telegram thread, exchange-info cache, etc.
+KAMA trend-following bot — complete version with fixes:
+- DualLock for cross-thread locking
+- Exchange info cache to avoid repeated futures_exchange_info calls
+- Monitor thread persists unrealized PnL and SL updates back to managed_trades
+- Telegram thread with commands and Inline Buttons; includes /forceip
+- Blocking Binance/requests calls kept sync and invoked from async via asyncio.to_thread
+- Risk sizing: fixed 0.5 USDT when balance < 50, else 2% (configurable)
+- Defaults to MAINNET unless USE_TESTNET=true
 """
 import os
 import sys
 import time
 import math
 import asyncio
-import logging
-import sqlite3
-import signal
-import traceback
 import threading
-import io
-import re
+import logging
+import json
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from decimal import Decimal, ROUND_DOWN, getcontext
-import html
-import json
+
 
 import requests
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
+
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
-from telegram.utils.request import Request
 
-def _get_env_int(key: str, default: int) -> int:
-    """Safely get an integer from environment variables."""
-    val = os.getenv(key)
-    if val is None or not val.strip().isdigit():
-        return default
-    return int(val)
 
+from dotenv import load_dotenv
+
+
+# Load .env file into environment (if present)
+load_dotenv()
+
+
+# -------------------------
+# Secrets (must be set in environment)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+USE_TESTNET = False # Force MAINNET — testnet mode removed per user request
+# -------------------------
+
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("kama-bot")
+
+
+app = FastAPI()
+
+
+# Globals
+client: Optional[Client] = None
+telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 # -------------------------
 # CONFIG (edit values here)
 # -------------------------
@@ -51,40 +72,40 @@ CONFIG = {
     "TIMEFRAME": os.getenv("TIMEFRAME", "1h"),
     "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
 
-    "SCAN_INTERVAL": _get_env_int("SCAN_INTERVAL", 20),
-    "MAX_CONCURRENT_TRADES": _get_env_int("MAX_CONCURRENT_TRADES", 3),
+    "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
+    "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
-    "KAMA_LENGTH": _get_env_int("KAMA_LENGTH", 10),
-    "KAMA_FAST": _get_env_int("KAMA_FAST", 2),
-    "KAMA_SLOW": _get_env_int("KAMA_SLOW", 30),
+    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
+    "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
+    "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
 
-    "ATR_LENGTH": _get_env_int("ATR_LENGTH", 14),
+    "ATR_LENGTH": int(os.getenv("ATR_LENGTH", "14")),
     "SL_TP_ATR_MULT": float(os.getenv("SL_TP_ATR_MULT", "2.5")),
 
     "RISK_SMALL_BALANCE_THRESHOLD": float(os.getenv("RISK_SMALL_BALANCE_THRESHOLD", "50.0")),
     "RISK_SMALL_FIXED_USDT": float(os.getenv("RISK_SMALL_FIXED_USDT", "0.5")),
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
-    "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),
+    "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
 
-    "ADX_LENGTH": _get_env_int("ADX_LENGTH", 14),
+    "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
     "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "50.0")),
 
-    "CHOP_LENGTH": _get_env_int("CHOP_LENGTH", 14),
+    "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
     "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "50.0")),
 
-    "BB_LENGTH": _get_env_int("BB_LENGTH", 20),
+    "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
     "BB_STD": float(os.getenv("BB_STD", "2.0")),
     "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "7.0")),
 
-    "MIN_CANDLES_AFTER_CLOSE": _get_env_int("MIN_CANDLES_AFTER_CLOSE", 10),
+    "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
 
     "DB_FILE": os.getenv("DB_FILE", "trades.db"),
-    "PROXY_FILE": os.getenv("PROXY_FILE", "proxies.json"),
 }
 # -------------------------
+# Secrets (must be set in environment)
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -100,38 +121,7 @@ app = FastAPI()
 
 # Globals
 client: Optional[Client] = None
-PROXY_LIST_LOCK = threading.RLock()
-PROXY_LIST = []
-ACTIVE_PROXY = None
-PENDING_PROXY_ACTIVATION = None
-
-def load_proxies():
-    global PROXY_LIST
-    try:
-        with open(CONFIG["PROXY_FILE"], 'r') as f:
-            data = json.load(f)
-            with PROXY_LIST_LOCK:
-                PROXY_LIST = data.get("proxies", [])
-            log.info(f"Loaded {len(PROXY_LIST)} proxies from {CONFIG['PROXY_FILE']}.")
-    except FileNotFoundError:
-        log.warning(f"Proxy file not found at {CONFIG['PROXY_FILE']}. Starting with an empty proxy list.")
-        save_proxies() # Create the file
-    except Exception:
-        log.exception(f"Error loading proxies from {CONFIG['PROXY_FILE']}.")
-
-def save_proxies():
-    with PROXY_LIST_LOCK:
-        try:
-            with open(CONFIG["PROXY_FILE"], 'w') as f:
-                json.dump({"proxies": PROXY_LIST}, f, indent=2)
-        except Exception:
-            log.exception(f"Error saving proxies to {CONFIG['PROXY_FILE']}.")
-
-if TELEGRAM_BOT_TOKEN:
-    tg_request = Request(con_pool_size=8)
-    telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN, request=tg_request)
-else:
-    telegram_bot: Optional[telegram.Bot] = None
+telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 running = (CONFIG["START_MODE"] == "running")
 frozen = False
@@ -157,7 +147,7 @@ class DualLock:
         self._lock.release()
 
 managed_trades: Dict[str, Dict[str, Any]] = {}
-managed_trades_lock = DualLock()
+managed_trades_lock = DualLock()  # used by both async and sync code
 
 last_trade_close_time: Dict[str, datetime] = {}
 
@@ -167,10 +157,11 @@ monitor_stop_event = threading.Event()
 
 scan_task = None
 
-EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}
+# Exchange info cache
+EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
 # -------------------------
-# Helpers for sanitized error messages
+# Utilities
 # -------------------------
 def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
     if not isinstance(text, str):
@@ -179,96 +170,27 @@ def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
         return text
     return text[: max_len - 200] + "\n\n[...] (truncated)\n\n" + text[-200:]
 
-def sanitize_error_for_telegram(raw: str, max_len: int = 1000) -> str:
-    """
-    If raw looks like HTML, extract a small plaintext summary (title + first paragraph).
-    Otherwise, return a shortened raw string.
-    """
-    if not raw:
-        return ""
-    low = raw.lower()
-    # HTML-like response
-    if "<html" in low or "<!doctype html" in low or "<head" in low:
-        # try to extract <title> and text content (strip tags)
-        title_match = re.search(r"<title>(.*?)</title>", raw, flags=re.IGNORECASE | re.DOTALL)
-        title = title_match.group(1).strip() if title_match else ""
-        # remove tags for a text body preview
-        text = re.sub(r"<[^>]+>", " ", raw)
-        text = html.unescape(text)
-        text = re.sub(r"\s+", " ", text).strip()
-        preview = f"HTML error page: {title}\n{ text[: max_len] }"
-        return preview
-    # long JSON / traceback or other text
-    text = raw.strip()
-    if len(text) > max_len:
-        return text[:max_len] + "\n\n[...] (truncated)"
-    return text
-
-def get_public_ip(proxies: Optional[Dict[str, str]] = None) -> str:
-    """Fetches the public IP address from an external service, optionally via a proxy."""
+def get_public_ip() -> str:
     try:
-        # Use a reliable and simple service that returns JSON
-        response = requests.get("https://api.ipify.org?format=json", timeout=10, proxies=proxies)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        return response.json().get("ip", "N/A (key missing)")
-    except requests.exceptions.RequestException as e:
-        log.warning(f"Could not get public IP via requests: {e}")
-        return "N/A (request failed)"
-    except Exception as e:
-        # Catch any other exceptions, e.g., JSON parsing
-        log.warning(f"An unexpected error occurred while getting public IP: {e}")
-        return "N/A (unexpected error)"
-
-# -------------------------
-# Robust Telegram send (sync)
-# -------------------------
-def send_telegram_sync(msg: str):
-    """
-    Send a Telegram message synchronously from threads.
-    - Truncates message to safe length.
-    - If Telegram rejects due to length, attempt to send as a document (file).
-    - If document fails, send a short fallback message.
-    """
-    if not telegram_bot or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured; message (trimmed): %s", (msg or "")[:200])
-        return
-    try:
-        # first attempt: truncated text message
-        safe_msg = _shorten_for_telegram(msg, max_len=3500)
-        telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=safe_msg)
-        return
-    except BadRequest as bre:
-        # message too long or other bad request: try fallback
-        msg_err = str(bre)
-        log.warning("Telegram BadRequest: %s -- attempting document fallback", msg_err)
-        # attempt send full content as a document (txt)
-        try:
-            bio = io.BytesIO()
-            bio.write((msg or "").encode("utf-8", errors="replace"))
-            bio.seek(0)
-            telegram_bot.send_document(chat_id=int(TELEGRAM_CHAT_ID), document=bio, filename="bot_log.txt")
-            return
-        except Exception as e2:
-            log.exception("Failed to send telegram document fallback: %s", e2)
-            # final fallback: very short message
-            try:
-                short = f"Message too long; failed to send full content. Error: {msg_err[:300]}"
-                telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=short)
-                return
-            except Exception:
-                log.exception("Final telegram fallback failed")
-                return
+        return requests.get("https://api.ipify.org", timeout=5).text
     except Exception:
-        log.exception("Telegram send failed (sync)")
-        # nothing else we can do safely here
+        return "unable-to-fetch-ip"
+
+def send_telegram_sync(msg: str):
+    if not telegram_bot or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured; message: %s", msg[:200])
+        return
+    try:
+        telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=msg)
+    except Exception:
+        log.exception("Failed to send telegram message (sync)")
 
 async def send_telegram(msg: str):
-    """Async wrapper to send telegram via thread so it doesn't block the event loop."""
     if not telegram_bot or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured; message (trimmed): %s", (msg or "")[:200])
+        log.warning("Telegram not configured; message: %s", msg[:200])
         return
-    # run sync variant in background
-    await asyncio.to_thread(send_telegram_sync, msg)
+    safe_msg = _shorten_for_telegram(msg)
+    await asyncio.to_thread(send_telegram_sync, safe_msg)
 
 # -------------------------
 # DB helpers
@@ -305,7 +227,7 @@ def record_trade(rec: Dict[str, Any]):
     conn.close()
 
 # -------------------------
-# Indicators (same as before)
+# Indicators
 # -------------------------
 def kama(series: pd.Series, length: int, fast: int, slow: int) -> pd.Series:
     price = series.values
@@ -379,28 +301,32 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
 # -------------------------
 # Binance init (sync)
 # -------------------------
-def init_binance_client_sync(req_params: Dict[str, Any] = {}):
-    global client, EXCHANGE_INFO_CACHE
-    
-    client = None
-    EXCHANGE_INFO_CACHE['data'] = None
-    EXCHANGE_INFO_CACHE['ts'] = 0.0
-
+def init_binance_client_sync():
+    global client
     try:
-        log.info("Initializing Binance client...")
         if USE_TESTNET:
-            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True, requests_params=req_params)
-            log.warning("Binance client in TESTNET mode.")
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
+            log.warning("Binance client in TESTNET mode (USE_TESTNET=true).")
         else:
-            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=req_params)
-            log.info("Binance client in MAINNET mode.")
-        
-        client.ping()
-        log.info("Connected to Binance API (ping ok).")
+            client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+            log.info("Binance client in MAINNET mode (default).")
+        try:
+            client.ping()
+            log.info("Connected to Binance API (ping ok).")
+        except Exception:
+            log.warning("Binance ping failed (connection may still succeed for calls).")
+        # reset exchange info cache on init
+        EXCHANGE_INFO_CACHE['data'] = None
+        EXCHANGE_INFO_CACHE['ts'] = 0.0
         return True, ""
     except Exception as e:
-        log.exception("Failed to connect to Binance API")
-        err = f"Binance init error: {e}"
+        log.exception("Failed to connect to Binance API: %s", e)
+        ip = get_public_ip()
+        err = f"Binance init error: {e}; server_ip={ip}"
+        try:
+            send_telegram_sync(f"Binance init failed: {e}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
+        except Exception:
+            log.exception("Failed to notify via telegram about Binance init error.")
         return False, err
 
 # -------------------------
@@ -423,7 +349,7 @@ def get_exchange_info_sync():
         return EXCHANGE_INFO_CACHE["data"]
 
 # -------------------------
-# Symbol helpers & rounding
+# Symbol helpers & rounding using Decimal (uses cached exchange info)
 # -------------------------
 def get_symbol_info(symbol: str) -> Optional[Dict[str, Any]]:
     info = get_exchange_info_sync()
@@ -540,7 +466,7 @@ def cancel_close_orders_sync(symbol: str):
         log.exception("Error canceling close orders: %s", symbol)
 
 # -------------------------
-# Risk
+# Risk function
 # -------------------------
 def calculate_risk_amount(account_balance: float) -> float:
     if account_balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
@@ -572,23 +498,14 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
         results["checks"].append({"type": "adx_threshold", "ok": False, "detail": adx_val})
     else:
         results["checks"].append({"type": "adx_threshold", "ok": True})
-    
-    # Check Binance connection status
-    binance_ok = False
-    if client:
-        try:
-            client.ping()
-            results["checks"].append({"type": "binance_connect", "ok": True})
-            binance_ok = True
-        except Exception as e:
-            results["ok"] = False
-            results["checks"].append({"type": "binance_connect", "ok": False, "detail": str(e)})
-    else:
+    ok, err = init_binance_client_sync()
+    if not ok:
         results["ok"] = False
-        results["checks"].append({"type": "binance_connect", "ok": False, "detail": "Client not initialized"})
-
+        results["checks"].append({"type": "binance_connect", "ok": False, "detail": err})
+    else:
+        results["checks"].append({"type": "binance_connect", "ok": True})
     sample_sym = CONFIG["SYMBOLS"][0].strip().upper() if CONFIG["SYMBOLS"] else None
-    if sample_sym and binance_ok:
+    if sample_sym and ok:
         try:
             raw = client.futures_klines(symbol=sample_sym, interval=CONFIG["TIMEFRAME"], limit=120)
             cols = ['open_time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore']
@@ -619,7 +536,7 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
     return results
 
 # -------------------------
-# Candles helper
+# Candle counting helper
 # -------------------------
 def candles_since_close(df: pd.DataFrame, close_time: Optional[datetime]) -> int:
     if not close_time:
@@ -629,7 +546,7 @@ def candles_since_close(df: pd.DataFrame, close_time: Optional[datetime]) -> int
     return int((df.index > close_time).sum())
 
 # -------------------------
-# fetch klines (sync)
+# Wrapper fetch_klines (sync)
 # -------------------------
 def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     global client
@@ -646,13 +563,10 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
     return df[['open','high','low','close','volume']]
 
 # -------------------------
-# evaluate & enter (async)
+# Core evaluate & entry (async)
 # -------------------------
 async def evaluate_and_enter(symbol: str):
-    global managed_trades, running, frozen, client
-    if client is None:
-        log.debug("Client not available, skipping evaluation for %s", symbol)
-        return
+    global managed_trades, running, frozen
     if frozen or not running:
         return
     try:
@@ -705,7 +619,7 @@ async def evaluate_and_enter(symbol: str):
         if last_close:
             n_since = candles_since_close(df, last_close)
             if n_since < CONFIG["MIN_CANDLES_AFTER_CLOSE"]:
-                log.info("%s skip due cooldown: %d/%d", symbol, n_since, CONFIG["MIN_CANDLES_AFTER_CLOSE"])
+                log.info("%s skip due to cooldown: %d/%d", symbol, n_since, CONFIG["MIN_CANDLES_AFTER_CLOSE"])
                 return
 
         sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
@@ -752,19 +666,19 @@ async def evaluate_and_enter(symbol: str):
         except Exception as e:
             log.exception("Failed to open trade for %s: %s", symbol, e)
             tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-            teaser = sanitize_error_for_telegram(tb, max_len=1500)
-            await send_telegram(f"ERROR opening {symbol}:\n{teaser}\nServer IP: {get_public_ip()}")
+            safe_tb = _shorten_for_telegram(tb)
+            await send_telegram(f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
             running = False
         return
 
     except Exception as e:
         log.exception("evaluate_and_enter error %s: %s", symbol, e)
         tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-        teaser = sanitize_error_for_telegram(tb, max_len=1500)
-        await send_telegram(f"Scan error for {symbol}:\n{teaser}\nServer IP: {get_public_ip()}")
+        safe_tb = _shorten_for_telegram(tb)
+        await send_telegram(f"Scan error for {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
 
 # -------------------------
-# account balance (sync)
+# get_account_balance_usdt (sync)
 # -------------------------
 def get_account_balance_usdt():
     global client
@@ -780,36 +694,28 @@ def get_account_balance_usdt():
     return 0.0
 
 # -------------------------
-# Monitor thread (sync)
+# Monitor thread (sync) - persists unreal and SL updates to managed_trades
 # -------------------------
 def monitor_thread_func():
-    global client, managed_trades, last_trade_close_time, running
+    global managed_trades, last_trade_close_time, running
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
         try:
             if client is None:
                 time.sleep(5)
                 continue
-            
             try:
                 positions = client.futures_position_information()
             except Exception as e:
-                # sanitize the Binance response (may be HTML)
-                raw = str(e)
-                if isinstance(e, BinanceAPIException) and "<html" in raw.lower():
-                    log.warning(
-                        "Binance API returned an HTML page instead of JSON. "
-                        "This commonly happens when the server's IP address is not whitelisted in the Binance API key settings. "
-                        "Please verify the IP whitelist."
-                    )
-                teaser = sanitize_error_for_telegram(raw, max_len=1500)
-                log.exception("Error fetching positions in monitor thread: %s", teaser)
-                send_telegram_sync(f"Error fetching positions: {teaser}\nServer IP: {get_public_ip()}")
+                log.exception("Error fetching positions in monitor thread: %s", e)
+                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                safe_tb = _shorten_for_telegram(tb)
+                send_telegram_sync(f"Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
                 running = False
                 time.sleep(10)
                 continue
 
-            # snapshot trades under lock
+            # snapshot trades under thread lock
             managed_trades_lock.acquire()
             try:
                 trades_snapshot = dict(managed_trades)
@@ -873,6 +779,7 @@ def monitor_thread_func():
                                         place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
                                         moved = True
                             if moved and new_sl is not None:
+                                # persist new SL and timestamp
                                 managed_trades_lock.acquire()
                                 try:
                                     if tid in managed_trades:
@@ -882,9 +789,8 @@ def monitor_thread_func():
                                     managed_trades_lock.release()
                                 meta['sl'] = new_sl
                                 send_telegram_sync(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
-                        except Exception as e_tr:
-                            teaser = sanitize_error_for_telegram(str(e_tr), max_len=1000)
-                            log.exception("Trailing internal error in monitor thread: %s", teaser)
+                        except Exception:
+                            log.exception("Trailing internal error in monitor thread")
                 except Exception:
                     log.exception("Error handling trade in monitor thread")
             # remove closed trades under lock
@@ -931,7 +837,7 @@ async def get_managed_trades_snapshot():
 
 def build_control_keyboard():
     buttons = [
-        [InlineKeyboardButton("Start", callback_data="start"), InlineKeyboardButton("Stop", callback_data="stop")],
+        [InlineKeyboardButton("Start", callback_data="start") , InlineKeyboardButton("Stop", callback_data="stop")],
         [InlineKeyboardButton("Freeze", callback_data="freeze"), InlineKeyboardButton("Unfreeze", callback_data="unfreeze")],
         [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")]
     ]
@@ -944,93 +850,7 @@ def handle_update_sync(update, loop):
         if getattr(update, 'message', None):
             msg = update.message
             text = (msg.text or "").strip()
-            if text.startswith("/addproxy"):
-                parts = text.split()
-                if len(parts) == 2:
-                    proxy_url = parts[1]
-                    with PROXY_LIST_LOCK:
-                        PROXY_LIST.append({"url": proxy_url, "status": "untested", "public_ip": None})
-                        save_proxies()
-                    send_telegram_sync(f"Proxy `{proxy_url}` added successfully.")
-                else:
-                    send_telegram_sync("Usage: /addproxy <proxy_url> (e.g., http://user:pass@host:port)")
-            elif text.startswith("/proxies"):
-                with PROXY_LIST_LOCK:
-                    if not PROXY_LIST:
-                        send_telegram_sync("No proxies configured. Use /addproxy to add one.")
-                        return
-                    out = "Configured Proxies:\n"
-                    for i, p in enumerate(PROXY_LIST):
-                        out += f"`{i+1}`: `{p['url']}` (Status: {p['status']})\n"
-                    send_telegram_sync(out)
-            elif text.startswith("/testproxy"):
-                parts = text.split()
-                if len(parts) == 2 and parts[1].isdigit():
-                    idx = int(parts[1]) - 1
-                    with PROXY_LIST_LOCK:
-                        if 0 <= idx < len(PROXY_LIST):
-                            proxy_info = PROXY_LIST[idx]
-                        else:
-                            proxy_info = None
-                    
-                    if proxy_info:
-                        send_telegram_sync(f"Testing proxy `{idx+1}`: `{proxy_info['url']}`...")
-                        proxies = {'http': proxy_info['url'], 'https': proxy_info['url']}
-                        ip = get_public_ip(proxies=proxies)
-                        if "N/A" not in ip:
-                            with PROXY_LIST_LOCK:
-                                PROXY_LIST[idx]['public_ip'] = ip
-                                PROXY_LIST[idx]['status'] = 'pending_activation'
-                                global PENDING_PROXY_ACTIVATION
-                                PENDING_PROXY_ACTIVATION = PROXY_LIST[idx]
-                                save_proxies()
-                            send_telegram_sync(f"Proxy test successful!\nPublic IP: `{ip}`\nPlease add this IP to your Binance whitelist, then run `/activateproxy {idx+1}`.")
-                        else:
-                            with PROXY_LIST_LOCK:
-                                PROXY_LIST[idx]['status'] = 'failed'
-                                save_proxies()
-                            send_telegram_sync("Proxy test failed. Could not retrieve public IP.")
-                    else:
-                        send_telegram_sync("Invalid proxy number. Use /proxies to see the list.")
-                else:
-                    send_telegram_sync("Usage: /testproxy <number>")
-            elif text.startswith("/activateproxy"):
-                global ACTIVE_PROXY, client
-                parts = text.split()
-                if len(parts) == 2 and parts[1].isdigit():
-                     idx = int(parts[1]) - 1
-                     with PROXY_LIST_LOCK:
-                         if 0 <= idx < len(PROXY_LIST):
-                             proxy_info = PROXY_LIST[idx]
-                         else:
-                             proxy_info = None
-                     if proxy_info and proxy_info['status'] == 'pending_activation':
-                         send_telegram_sync(f"Activating proxy `{proxy_info['url']}` and connecting to Binance...")
-                         req_params = {'proxies': {'http': proxy_info['url'], 'https': proxy_info['url']}}
-                         try:
-                             test_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=req_params)
-                             test_client.ping()
-                             client = test_client
-                             ACTIVE_PROXY = proxy_info
-                             with PROXY_LIST_LOCK:
-                                 PROXY_LIST[idx]['status'] = 'active'
-                                 save_proxies()
-                             send_telegram_sync(f"Successfully connected to Binance via proxy: `{ACTIVE_PROXY['url']}`")
-                         except Exception as e:
-                             log.exception("Failed to activate proxy.")
-                             with PROXY_LIST_LOCK:
-                                 PROXY_LIST[idx]['status'] = 'failed'
-                                 save_proxies()
-                             send_telegram_sync(f"Failed to connect to Binance with this proxy. Error: {e}")
-                     else:
-                         send_telegram_sync("Proxy not found or not pending activation. Use `/testproxy` first.")
-                else:
-                    send_telegram_sync("Usage: /activateproxy <number>")
-            elif text.startswith("/stopproxy"):
-                client = None
-                ACTIVE_PROXY = None
-                send_telegram_sync("Proxy connection stopped. Trading is paused.")
-            elif text.startswith("/startbot"):
+            if text.startswith("/startbot"):
                 fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
                 try: fut.result(timeout=5)
                 except Exception: pass
@@ -1050,28 +870,6 @@ def handle_update_sync(update, loop):
                 try: fut.result(timeout=5)
                 except Exception: pass
                 send_telegram_sync("Bot -> UNFROZEN")
-            elif text.startswith("/help"):
-                help_text = (
-                    "**KAMA Bot Commands**\n\n"
-                    "__Bot Control__\n"
-                    "`/startbot` - Start the trading bot.\n"
-                    "`/stopbot` - Stop the trading bot.\n"
-                    "`/status` - Show current status, trade count.\n"
-                    "`/freeze` - Stop opening new trades.\n"
-                    "`/unfreeze` - Allow opening new trades.\n\n"
-                    "__Proxy Management__\n"
-                    "`/addproxy <url>` - Add a new proxy.\n"
-                    "`/proxies` - List configured proxies.\n"
-                    "`/testproxy <n>` - Test proxy `n` and get its IP.\n"
-                    "`/activateproxy <n>` - Activate proxy `n` to start trading.\n"
-                    "`/stopproxy` - Deactivate proxy and pause trading.\n\n"
-                    "__Info & Config__\n"
-                    "`/listorders` - List open trades.\n"
-                    "`/showparams` - Show current parameters.\n"
-                    "`/setparam <p> <v>` - Set a parameter.\n"
-                    "`/validate` - Run a configuration sanity check."
-                )
-                send_telegram_sync(help_text)
             elif text.startswith("/status"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -1083,6 +881,9 @@ def handle_update_sync(update, loop):
                     telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
                     pass
+            elif text.startswith("/ip") or text.startswith("/forceip"):
+                ip = get_public_ip()
+                send_telegram_sync(f"Server IP: {ip}")
             elif text.startswith("/listorders"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -1196,9 +997,6 @@ def telegram_polling_thread(loop):
                 offset = u.update_id + 1
                 handle_update_sync(u, loop)
             time.sleep(0.2)
-        except telegram.error.Conflict:
-            log.warning("Telegram conflict error. Another instance may be running. Ignoring.")
-            time.sleep(5)
         except Exception:
             log.exception("Telegram polling thread error")
             try:
@@ -1209,7 +1007,7 @@ def telegram_polling_thread(loop):
             time.sleep(5)
 
 # -------------------------
-# small control coroutines
+# Small coroutines to set flags from telegram thread
 # -------------------------
 async def _set_running(val: bool):
     global running
@@ -1219,17 +1017,20 @@ async def _set_frozen(val: bool):
     global frozen
     frozen = val
 
+# -------------------------
+# Error handler helper (async)
+# -------------------------
 async def handle_critical_error_async(exc: Exception, context: str = None):
     global running
     running = False
     ip = await asyncio.to_thread(get_public_ip)
     tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else "No traceback"
-    teaser = sanitize_error_for_telegram(tb, max_len=1500)
-    msg = f"CRITICAL ERROR: {context or ''}\nException: {teaser}\nServer IP: {ip}\nBot paused."
+    safe_tb = _shorten_for_telegram(tb)
+    msg = f"CRITICAL ERROR: {context or ''}\nException: {str(exc)}\n\nTraceback:\n{safe_tb}\nServer IP: {ip}\nBot paused."
     await send_telegram(msg)
 
 # -------------------------
-# FastAPI health
+# FastAPI endpoint
 # -------------------------
 @app.get("/")
 async def root():
@@ -1240,57 +1041,29 @@ async def root():
 # -------------------------
 @app.on_event("startup")
 async def startup_event():
-    global scan_task, telegram_thread, monitor_thread_obj
-    
-    # Start Telegram listener first to ensure bot is responsive for configuration
-    loop = asyncio.get_running_loop()
-    run_poller = os.getenv("RUN_TELEGRAM_POLLER", "true").lower() in ("true", "1", "yes")
-    if telegram_bot and run_poller:
-        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
-        telegram_thread.start()
-        log.info("Started telegram polling thread (RUN_TELEGRAM_POLLER=true).")
-    else:
-        log.info("Telegram polling thread not started (bot not configured or RUN_TELEGRAM_POLLER is not true).")
-
+    global scan_task, telegram_thread, monitor_thread_obj, client, monitor_stop_event
     init_db()
-    load_proxies()
-    
-    # Start all background threads
+    ok, err = await asyncio.to_thread(init_binance_client_sync)
+    await asyncio.to_thread(validate_and_sanity_check_sync, True)
+    loop = asyncio.get_running_loop()
     scan_task = loop.create_task(scanning_loop())
     monitor_stop_event.clear()
-    
     monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
     monitor_thread_obj.start()
     log.info("Started monitor thread.")
-
+    if telegram_bot:
+        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
+        telegram_thread.start()
+        log.info("Started telegram polling thread.")
+    else:
+        log.info("Telegram not configured; telegram thread not started.")
     try:
-        if not PROXY_LIST:
-            startup_message = (
-                "**Welcome! KAMA Bot is running but requires setup.**\n\n"
-                "No proxies are configured. Trading is disabled until a proxy is added and activated.\n\n"
-                "Please add a proxy to begin:\n"
-                "`/addproxy <url>`"
-            )
-        else:
-            startup_message = (
-                "**KAMA Bot Started**\n\n"
-                "This bot now uses an interactive proxy system.\n"
-                "Trading is PAUSED until a proxy is activated.\n\n"
-                "**Proxy Commands:**\n"
-                "`/addproxy <url>` - Add a new proxy.\n"
-                "`/proxies` - List available proxies.\n"
-                "`/testproxy <n>` - Test a proxy and get its IP for whitelisting.\n"
-                "`/activateproxy <n>` - Activate a tested proxy to start trading.\n"
-                "`/stopproxy` - Stop using the current proxy and pause trading."
-            )
-        await send_telegram(startup_message)
+        await send_telegram("KAMA strategy bot started. Running={}".format(running))
     except Exception:
         log.exception("Failed to send startup telegram")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global client
-    client = None
     try:
         monitor_stop_event.set()
         if monitor_thread_obj and monitor_thread_obj.is_alive():
@@ -1302,6 +1075,7 @@ async def shutdown_event():
     except Exception:
         pass
 
+# graceful signal handlers
 def _signal_handler(sig, frame):
     log.info("Received signal %s, shutting down", sig)
     try:
