@@ -26,6 +26,7 @@ from filelock import FileLock, Timeout
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from decimal import Decimal, ROUND_DOWN, getcontext
+from urllib.parse import urlparse
 
 import requests
 import numpy as np
@@ -53,13 +54,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 USE_TESTNET = False  # Force MAINNET — testnet mode removed per user request
 
-# SSH Tunnel Config (optional)
-SSH_ENABLED = os.getenv("SSH_ENABLED", "false").lower() in ("true", "1", "yes")
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_PORT = int(os.getenv("SSH_PORT", "22"))
-SSH_USER = os.getenv("SSH_USER")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD") # For password-based auth
-SSH_PRIVATE_KEY_PATH = os.getenv("SSH_PRIVATE_KEY_PATH") # For key-based auth
+# SSH Tunnel Config is now managed via ssh_config.json
 # -------------------------
 
 # Logging
@@ -115,12 +110,10 @@ CONFIG = {
 }
 
 running = (CONFIG["START_MODE"] == "running")
-# If SSH is enabled, always start in a paused state until connection is verified.
-if SSH_ENABLED:
-    running = False
 frozen = False
 
 ssh_tunnel_server: Optional[SSHTunnelForwarder] = None
+ssh_config: Dict[str, Any] = {}
 
 # DualLock for cross-thread (thread + async) coordination
 class DualLock:
@@ -166,13 +159,20 @@ async def lifespan(app: FastAPI):
     
     # --- Startup Logic ---
     init_db()
+    load_ssh_config()
 
     main_loop = asyncio.get_running_loop()
 
-    ok, err = await asyncio.to_thread(init_binance_client_sync)
-    await asyncio.to_thread(validate_and_sanity_check_sync, True)
+    ok, err = await asyncio.to_thread(init_binance_client_sync, from_startup=True)
+    
+    if ok:
+        log.info("Client initialized successfully.")
+        await asyncio.to_thread(validate_and_sanity_check_sync, True)
+    else:
+        log.warning(f"Client initialization failed: {err}. Bot will remain idle.")
 
-    if client is not None:
+    # Only start threads if the client was initialized (which requires SSH config if not present)
+    if client is not None and ok:
         scan_task = main_loop.create_task(scanning_loop())
         monitor_stop_event.clear()
         monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
@@ -182,9 +182,17 @@ async def lifespan(app: FastAPI):
         log.warning("Binance client not initialized -> scanning and monitor thread not started.")
 
     if telegram_bot:
-        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(main_loop,), daemon=True)
-        telegram_thread.start()
-        log.info("Started telegram polling thread.")
+        lock_path = "telegram_bot.lock"
+        lock = FileLock(lock_path, timeout=1)
+        try:
+            # Try to acquire the lock. If it fails, another worker already has it.
+            with lock:
+                log.info("Acquired lock, starting telegram polling thread in this worker.")
+                telegram_thread = threading.Thread(target=telegram_polling_thread, args=(main_loop,), daemon=True)
+                telegram_thread.start()
+                log.info("Started telegram polling thread.")
+        except Timeout:
+            log.warning("Could not acquire lock for telegram polling, another worker is likely handling it.")
     else:
         log.info("Telegram not configured; telegram thread not started.")
     
@@ -379,23 +387,41 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
 # -------------------------
 # SSH Tunnel and Binance Init
 # -------------------------
+SSH_CONFIG_FILE = "ssh_config.json"
 
-def start_ssh_tunnel():
-    """Starts the SSH tunnel and returns the local proxy port."""
+def load_ssh_config() -> Dict[str, Any]:
+    """Loads SSH config from the JSON file."""
+    global ssh_config
+    if os.path.exists(SSH_CONFIG_FILE):
+        with open(SSH_CONFIG_FILE, 'r') as f:
+            ssh_config = json.load(f)
+            return ssh_config
+    return {}
+
+def save_ssh_config(config: Dict[str, Any]):
+    """Saves SSH config to the JSON file."""
+    global ssh_config
+    with open(SSH_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
+    ssh_config = config
+
+def start_ssh_tunnel(config: Dict[str, Any]) -> Optional[int]:
+    """Starts the SSH tunnel using config from a dictionary."""
     global ssh_tunnel_server
+    if ssh_tunnel_server and ssh_tunnel_server.is_active:
+        log.info("SSH tunnel is already active.")
+        return ssh_tunnel_server.local_bind_port
+
     try:
-        if not all([SSH_HOST, SSH_USER, (SSH_PASSWORD or SSH_PRIVATE_KEY_PATH)]):
-            log.error("SSH credentials not fully configured. Tunnel not started.")
+        if not all([config.get('host'), config.get('user'), config.get('password')]):
+            log.error("SSH config is incomplete. Tunnel not started.")
             return None
-
-        # Define the local SOCKS5 proxy port
+        
         local_proxy_port = 1080
-
         server = SSHTunnelForwarder(
-            (SSH_HOST, SSH_PORT),
-            ssh_username=SSH_USER,
-            ssh_password=SSH_PASSWORD,
-            ssh_pkey=SSH_PRIVATE_KEY_PATH,
+            (config['host'], config.get('port', 22)),
+            ssh_username=config['user'],
+            ssh_password=config['password'],
             local_bind_address=('127.0.0.1', local_proxy_port)
         )
         server.start()
@@ -407,12 +433,12 @@ def start_ssh_tunnel():
         send_telegram(f"🚨 CRITICAL: Failed to start SSH tunnel: {e}")
         return None
 
-def init_binance_client_sync():
+def init_binance_client_sync(from_startup=False):
     """
     Initialize Binance client, with an optional SSH tunnel proxy.
     Returns (ok: bool, error_message: str)
     """
-    global client, BINANCE_API_KEY, BINANCE_API_SECRET
+    global client, running, BINANCE_API_KEY, BINANCE_API_SECRET, ssh_config
 
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         log.warning("Binance API key/secret not set; Binance client will not be initialized.")
@@ -420,32 +446,36 @@ def init_binance_client_sync():
         return False, "Missing BINANCE_API_KEY or BINANCE_API_SECRET"
 
     proxies = None
-    if SSH_ENABLED:
-        log.info("SSH tunnel is enabled. Attempting to start...")
-        local_port = start_ssh_tunnel()
+    if ssh_config:
+        log.info("SSH config found. Attempting to start tunnel...")
+        # Always start paused when using SSH
+        running = False
+        local_port = start_ssh_tunnel(ssh_config)
         if local_port:
             proxy_url = f'socks5://127.0.0.1:{local_port}'
             proxies = {'http': proxy_url, 'https': proxy_url}
             log.info(f"Proxy configured to use: {proxy_url}")
         else:
-            err_msg = "SSH tunnel enabled but failed to start. Cannot initialize Binance client."
+            err_msg = "SSH config found but tunnel failed to start. Cannot initialize Binance client."
             log.error(err_msg)
+            send_telegram(f"🚨 {err_msg}")
             return False, err_msg
-    
+    elif from_startup:
+        # No SSH config on startup, send one-time message
+        log.warning("SSH config not found. Bot is idle. Please configure via Telegram.")
+        send_telegram("Bot is idle. No SSH tunnel is configured. Please use the `/set_ssh_tunnel` command to provide a configuration URI.")
+        return False, "SSH config missing"
+
     try:
-        # Initialize client with or without proxy
         client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params={'proxies': proxies})
-        
-        # Verify connection
         client.ping()
         log.info("Binance client ping successful.")
 
-        # If using SSH, get the new IP and notify user
-        if SSH_ENABLED and proxies:
+        if ssh_config and proxies:
             new_ip = get_public_ip()
             log.info(f"Successfully connected through SSH tunnel. New public IP: {new_ip}")
             msg = (f"✅ SSH tunnel connection successful!\n\n"
-                   f"The bot is now running through the server at `{SSH_HOST}`.\n"
+                   f"The bot is now running through the server at `{ssh_config.get('host')}`.\n"
                    f"Your new public IP address is: `{new_ip}`\n\n"
                    f"Please ensure this IP is whitelisted on Binance.\n\n"
                    f"The bot is currently **PAUSED**. Use /startbot to begin trading.")
@@ -456,9 +486,9 @@ def init_binance_client_sync():
         return True, ""
     except Exception as e:
         log.exception("Failed to connect to Binance API: %s", e)
-        ip = get_public_ip() # This will use the proxy if active, or direct if not
+        ip = get_public_ip()
         err = f"Binance init error: {e}; server_ip={ip}"
-        send_telegram(f"🚨 Binance init failed: {e}\nServer IP: {ip}\nPlease check keys and/or proxy connection.")
+        send_telegram(f"🚨 Binance init failed: {e}\nServer IP: {ip}\nPlease check keys and/or SSH connection.")
         client = None
         return False, err
 
@@ -1114,6 +1144,37 @@ def handle_update_sync(update, loop):
                 send_telegram("Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
                     send_telegram(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+            elif text.startswith("/set_ssh_tunnel"):
+                parts = text.split()
+                if len(parts) < 2:
+                    send_telegram("Usage: /set_ssh_tunnel ssh://user:password@host:port")
+                    return
+
+                uri = parts[1]
+                try:
+                    parsed = urlparse(uri)
+                    if parsed.scheme != 'ssh':
+                        raise ValueError("Invalid scheme, must be ssh://")
+                    
+                    config = {
+                        "host": parsed.hostname,
+                        "port": parsed.port or 22,
+                        "user": parsed.username,
+                        "password": parsed.password
+                    }
+                    if not all([config['host'], config['user'], config['password']]):
+                        raise ValueError("URI must include user, password, and host.")
+
+                    save_ssh_config(config)
+                    send_telegram("✅ SSH configuration saved. Attempting to reconnect...")
+
+                    # Trigger re-initialization
+                    ok, err = init_binance_client_sync()
+                    if not ok:
+                        send_telegram(f"🚨 Failed to connect with new SSH config: {err}")
+
+                except Exception as e:
+                    send_telegram(f"❌ Invalid SSH URI or connection failed.\nError: {e}\nPlease use the format: `ssh://user:password@host:port`")
             else:
                 send_telegram("Unknown command. Use /status to see the keyboard.")
     except Exception:
@@ -1194,16 +1255,9 @@ if __name__ == "__main__":
         else:
             log.warning("Binance client not initialized, monitor thread not started.")
         if telegram_bot:
-            lock_path = "telegram_bot.lock"
-            lock = FileLock(lock_path, timeout=1)
-            try:
-                with lock:
-                    log.info("Acquired lock for telegram polling, starting thread.")
-                    telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
-                    telegram_thread.start()
-                    log.info("Started telegram polling thread.")
-            except Timeout:
-                log.warning("Could not acquire lock for telegram polling, another instance is likely running.")
+            telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
+            telegram_thread.start()
+            log.info("Started telegram polling thread.")
         scan_task = None
         if ok:
             scan_task = loop.create_task(scanning_loop())
