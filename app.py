@@ -89,8 +89,10 @@ CONFIG = {
 
     "RISK_SMALL_BALANCE_THRESHOLD": float(os.getenv("RISK_SMALL_BALANCE_THRESHOLD", "50.0")),
     "RISK_SMALL_FIXED_USDT": float(os.getenv("RISK_SMALL_FIXED_USDT", "0.5")),
+    "MARGIN_USDT_SMALL_BALANCE": float(os.getenv("MARGIN_USDT_SMALL_BALANCE", "2.0")),
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
+    "MAX_BOT_LEVERAGE": int(os.getenv("MAX_BOT_LEVERAGE", "30")),
 
     "VOLATILITY_ADJUST_ENABLED": os.getenv("VOLATILITY_ADJUST_ENABLED", "true").lower() in ("true", "1", "yes"),
     "TRENDING_ADX": float(os.getenv("TRENDING_ADX", "40.0")),
@@ -1113,10 +1115,26 @@ async def evaluate_and_enter(symbol: str):
             await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: Notional value is too small.\nNotional: {notional:.4f} USDT")
             return
 
-        target_initial_margin = risk_usdt
-        leverage = max(1, int(min(get_max_leverage(symbol), math.floor(notional / max(target_initial_margin, 1e-8)))))
-        if notional <= target_initial_margin:
-            leverage = 1
+        # --- Leverage Calculation ---
+        # For small balances, use a dedicated margin amount for leverage calculation,
+        # separating it from the amount being risked (risk_usdt).
+        if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
+            margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"]
+        else:
+            # For larger balances, the margin used will be equal to the amount risked.
+            margin_to_use = risk_usdt
+
+        # Ensure margin is not greater than the notional value (which would be impossible anyway)
+        margin_to_use = min(margin_to_use, notional)
+        
+        # Calculate leverage based on the desired margin.
+        leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+
+        # Apply safety caps on leverage
+        max_leverage_from_config = CONFIG.get("MAX_BOT_LEVERAGE", 20)
+        max_leverage_from_exchange = get_max_leverage(symbol)
+        leverage = max(1, min(leverage, max_leverage_from_config, max_leverage_from_exchange))
+
         try:
             batch_response = await asyncio.to_thread(
                 place_market_order_with_sl_tp_sync, symbol, side, qty, leverage, stop_price, take_price
