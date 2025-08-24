@@ -221,22 +221,44 @@ def get_public_ip() -> str:
     except Exception:
         return "unable-to-fetch-ip"
 
-def send_telegram_sync(msg: str):
-    if not telegram_bot or not TELEGRAM_CHAT_ID or not main_loop:
-        log.warning("Telegram not configured or event loop not ready; message: %s", msg[:200])
-        return
-    try:
-        coro = telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=msg)
-        asyncio.run_coroutine_threadsafe(coro, main_loop)
-    except Exception:
-        log.exception("Failed to schedule telegram message (sync)")
-
-async def send_telegram(msg: str):
+async def send_telegram(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html"):
+    """
+    Asynchronously sends a message to Telegram. Can optionally attach a document.
+    """
     if not telegram_bot or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured; message: %s", msg[:200])
         return
+    
     safe_msg = _shorten_for_telegram(msg)
-    await asyncio.to_thread(send_telegram_sync, safe_msg)
+    try:
+        if document_content:
+            await telegram_bot.send_document(
+                chat_id=int(TELEGRAM_CHAT_ID),
+                document=document_content,
+                filename=document_name,
+                caption=safe_msg
+            )
+        else:
+            await telegram_bot.send_message(
+                chat_id=int(TELEGRAM_CHAT_ID), 
+                text=safe_msg
+            )
+    except Exception:
+        log.exception("Failed to send telegram message (async)")
+
+def send_telegram_sync(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html"):
+    """
+    Schedules a message to be sent from a synchronous thread.
+    """
+    if not main_loop or not main_loop.is_running():
+        log.warning("Event loop not ready for sync telegram message. Message: %s", msg[:100])
+        return
+
+    # Fire and forget on the running loop
+    asyncio.run_coroutine_threadsafe(
+        send_telegram(msg, document_content=document_content, document_name=document_name), 
+        main_loop
+    )
 
 # (The rest of the file from DB Helpers to the end remains the same, except for removing the old startup/shutdown events)
 # ... I will paste the full code below ...
@@ -760,6 +782,27 @@ def monitor_thread_func():
                 continue
             try:
                 positions = client.futures_position_information()
+            except BinanceAPIException as e:
+                log.exception("Binance API error in monitor thread: %s", e)
+                ip = get_public_ip()
+                is_html_error = e.text and e.text.strip().lower().startswith('<!doctype html>')
+                
+                if is_html_error:
+                    # Binance returned an HTML page instead of JSON
+                    error_msg = f"Binance API returned an HTML error page. This could be an IP ban, a WAF block, or a server issue.\nServer IP: {ip}"
+                    html_content = e.text.encode('utf-8')
+                    send_telegram_sync(error_msg, document_content=html_content, document_name="binance_error.html")
+                else:
+                    # A different kind of API error
+                    tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                    safe_tb = _shorten_for_telegram(tb)
+                    error_msg = f"Binance API Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {ip}"
+                    send_telegram_sync(error_msg)
+                
+                running = False
+                log.info("Pausing bot due to Binance API error.")
+                time.sleep(30) # Sleep longer on API errors
+                continue
             except Exception as e:
                 log.exception("Error fetching positions in monitor thread: %s", e)
                 tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
