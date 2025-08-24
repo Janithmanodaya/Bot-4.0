@@ -1,0 +1,15 @@
+# Local configuration files
+ssh_config.json
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+
+# IDE files
+.vscode/
+.idea/
