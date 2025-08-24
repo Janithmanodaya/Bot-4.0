@@ -22,6 +22,7 @@ import sqlite3
 import io
 import traceback
 from contextlib import asynccontextmanager
+from filelock import FileLock, Timeout
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -1099,9 +1100,16 @@ if __name__ == "__main__":
         else:
             log.warning("Binance client not initialized, monitor thread not started.")
         if telegram_bot:
-            telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
-            telegram_thread.start()
-            log.info("Started telegram polling thread.")
+            lock_path = "telegram_bot.lock"
+            lock = FileLock(lock_path, timeout=1)
+            try:
+                with lock:
+                    log.info("Acquired lock for telegram polling, starting thread.")
+                    telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
+                    telegram_thread.start()
+                    log.info("Started telegram polling thread.")
+            except Timeout:
+                log.warning("Could not acquire lock for telegram polling, another instance is likely running.")
         scan_task = None
         if ok:
             scan_task = loop.create_task(scanning_loop())
