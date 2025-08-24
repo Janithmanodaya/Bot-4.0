@@ -1132,10 +1132,10 @@ def monitor_thread_func():
                     error_msg = (
                         f"🚨 **CRITICAL AUTH ERROR** 🚨\n\n"
                         f"Binance API keys are invalid, have incorrect permissions, or the server's IP address is not whitelisted.\n\n"
-                        f"**Error Code:** `{e.code}`\n"
-                        f"**Server IP:** `{ip}`\n\n"
+                        f"Error Code: `{e.code}`\n"
+                        f"Server IP: {ip} \n\n"
                         f"Please add this IP to your Binance API key's whitelist. "
-                        f"The bot is now **FROZEN** and will retry every 2 minutes."
+                        f"The bot is now FROZEN and will retry every 2 minutes."
                     )
                     send_telegram(error_msg)
                     running = False
