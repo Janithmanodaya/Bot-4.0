@@ -4,7 +4,7 @@ KAMA trend-following bot — complete version with fixes:
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
  - Monitor thread persists unrealized PnL and SL updates back to managed_trades
- - Telegram thread with commands and Inline Buttons; includes /forceip
+ - Telegram thread with commands and Inline Buttons; includes /forcei
  - Blocking Binance/requests calls kept sync and invoked from async via asyncio.to_thread
  - Risk sizing: fixed 0.5 USDT when balance < 50, else 2% (configurable)
  - Defaults to MAINNET unless USE_TESTNET=true
