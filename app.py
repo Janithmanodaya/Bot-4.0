@@ -19,6 +19,7 @@ import logging
 import json
 import signal
 import sqlite3
+import io
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -172,7 +173,7 @@ async def lifespan(app: FastAPI):
         log.info("Telegram not configured; telegram thread not started.")
     
     try:
-        await send_telegram("KAMA strategy bot started. Running={}".format(running))
+        await asyncio.to_thread(send_telegram, "KAMA strategy bot started. Running={}".format(running))
     except Exception:
         log.exception("Failed to send startup telegram")
 
@@ -221,9 +222,10 @@ def get_public_ip() -> str:
     except Exception:
         return "unable-to-fetch-ip"
 
-async def send_telegram(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html"):
+def send_telegram(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html"):
     """
-    Asynchronously sends a message to Telegram. Can optionally attach a document.
+    Synchronously sends a message to Telegram. Can optionally attach a document.
+    This is a blocking call.
     """
     if not telegram_bot or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured; message: %s", msg[:200])
@@ -232,33 +234,22 @@ async def send_telegram(msg: str, document_content: Optional[bytes] = None, docu
     safe_msg = _shorten_for_telegram(msg)
     try:
         if document_content:
-            await telegram_bot.send_document(
+            doc_stream = io.BytesIO(document_content)
+            doc_stream.name = document_name
+            telegram_bot.send_document(
                 chat_id=int(TELEGRAM_CHAT_ID),
-                document=document_content,
-                filename=document_name,
-                caption=safe_msg
+                document=doc_stream,
+                caption=safe_msg,
+                timeout=30  # Add a timeout
             )
         else:
-            await telegram_bot.send_message(
+            telegram_bot.send_message(
                 chat_id=int(TELEGRAM_CHAT_ID), 
-                text=safe_msg
+                text=safe_msg,
+                timeout=30  # Add a timeout
             )
     except Exception:
-        log.exception("Failed to send telegram message (async)")
-
-def send_telegram_sync(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html"):
-    """
-    Schedules a message to be sent from a synchronous thread.
-    """
-    if not main_loop or not main_loop.is_running():
-        log.warning("Event loop not ready for sync telegram message. Message: %s", msg[:100])
-        return
-
-    # Fire and forget on the running loop
-    asyncio.run_coroutine_threadsafe(
-        send_telegram(msg, document_content=document_content, document_name=document_name), 
-        main_loop
-    )
+        log.exception("Failed to send telegram message")
 
 # (The rest of the file from DB Helpers to the end remains the same, except for removing the old startup/shutdown events)
 # ... I will paste the full code below ...
@@ -404,7 +395,7 @@ def init_binance_client_sync():
             ip = "<unknown>"
         err = f"Binance init error: {e}; server_ip={ip}"
         try:
-            send_telegram_sync(f"Binance init failed: {e}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
+            send_telegram(f"Binance init failed: {e}\nServer IP: {ip}\nPlease update IP in Binance API whitelist if needed.")
         except Exception:
             log.exception("Failed to notify via telegram about Binance init error.")
         client = None
@@ -632,7 +623,7 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
         report_lines.append(f"- {c['type']}: ok={c['ok']} detail={c.get('detail')}")
     report_text = "\n".join(report_lines)
     if send_report:
-        send_telegram_sync(report_text)
+        send_telegram(report_text)
     return results
 
 def candles_since_close(df: pd.DataFrame, close_time: Optional[datetime]) -> int:
@@ -744,20 +735,20 @@ async def evaluate_and_enter(symbol: str):
                           'exit_price': None, 'qty': qty, 'notional': notional, 'pnl': None,
                           'open_time': meta['open_time'], 'close_time': None})
             dry_run_prefix = "[DRY RUN] " if CONFIG["DRY_RUN"] else ""
-            await send_telegram(f"{dry_run_prefix}Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
+            await asyncio.to_thread(send_telegram, f"{dry_run_prefix}Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
             log.info("%sOpened trade: %s", dry_run_prefix, meta)
         except Exception as e:
             log.exception("Failed to open trade for %s: %s", symbol, e)
             tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
             safe_tb = _shorten_for_telegram(tb)
-            await send_telegram(f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+            await asyncio.to_thread(send_telegram, f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
             running = False
         return
     except Exception as e:
         log.exception("evaluate_and_enter error %s: %s", symbol, e)
         tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
         safe_tb = _shorten_for_telegram(tb)
-        await send_telegram(f"Scan error for {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+        await asyncio.to_thread(send_telegram, f"Scan error for {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
 
 def get_account_balance_usdt():
     global client
@@ -780,107 +771,108 @@ def monitor_thread_func():
             if client is None:
                 time.sleep(5)
                 continue
+
+            positions = []
             try:
                 positions = client.futures_position_information()
             except BinanceAPIException as e:
-                log.error("Caught Binance API error in monitor thread. Type: %s. See Telegram for details.", type(e).__name__)
-                ip = get_public_ip()
-                is_html_error = e.text and e.text.strip().lower().startswith('<!doctype html>')
+                log.error("Caught BinanceAPIException in monitor thread. Pausing bot and notifying.")
+                html_content = None
+                # Safely access the error message which might contain HTML
+                if len(e.args) >= 3:
+                    html_content = e.args[2]
 
-                if is_html_error:
-                    # Binance returned an HTML page instead of JSON
-                    error_msg = f"Binance API returned an HTML error page. This could be an IP ban, a WAF block, or a server issue.\nServer IP: {ip}"
-                    html_content = e.text.encode('utf-8')
-                    send_telegram_sync(error_msg, document_content=html_content, document_name="binance_error.html")
+                if html_content and isinstance(html_content, str) and html_content.strip().lower().startswith('<!doctype html>'):
+                    error_msg = f"Binance API returned an HTML error page. This could be an IP ban or server issue.\nServer IP: {get_public_ip()}"
+                    send_telegram(error_msg, document_content=html_content.encode('utf-8'), document_name="binance_error.html")
                 else:
-                    # A different kind of API error
+                    # Handle other Binance API errors
                     tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
                     safe_tb = _shorten_for_telegram(tb)
-                    error_msg = f"Binance API Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {ip}"
-                    send_telegram_sync(error_msg)
+                    error_msg = f"Binance API Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}"
+                    send_telegram(error_msg)
                 
                 running = False
-                log.info("Pausing bot due to Binance API error.")
-                time.sleep(30) # Sleep longer on API errors
+                log.info("Bot paused. Waiting 2 minutes before next attempt...")
+                time.sleep(120)
                 continue
-            except Exception as e:
-                log.exception("Error fetching positions in monitor thread: %s", e)
-                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-                safe_tb = _shorten_for_telegram(tb)
-                send_telegram_sync(f"Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
-                running = False
-                time.sleep(10)
-                continue
+            
+            # --- Position monitoring logic (from original code) ---
             managed_trades_lock.acquire()
             try:
                 trades_snapshot = dict(managed_trades)
             finally:
                 managed_trades_lock.release()
+            
             to_remove = []
             for tid, meta in trades_snapshot.items():
+                sym = meta['symbol']
+                pos = next((p for p in positions if p.get('symbol') == sym), None)
+                if not pos:
+                    continue
+                
+                pos_amt = float(pos.get('positionAmt') or 0.0)
+                unreal = float(pos.get('unRealizedProfit') or 0.0)
+                
+                managed_trades_lock.acquire()
                 try:
-                    sym = meta['symbol']
-                    pos = next((p for p in positions if p.get('symbol') == sym), None)
-                    if not pos:
-                        continue
-                    pos_amt = float(pos.get('positionAmt') or 0.0)
-                    unreal = float(pos.get('unRealizedProfit') or 0.0)
+                    if tid in managed_trades:
+                        managed_trades[tid]['unreal'] = unreal
+                finally:
+                    managed_trades_lock.release()
+
+                # Check for closed positions
+                if abs(pos_amt) < 1e-8:
+                    close_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    meta['close_time'] = close_time.isoformat()
+                    record_trade({
+                        'id': meta['id'], 'symbol': meta['symbol'], 'side': meta['side'],
+                        'entry_price': meta['entry_price'], 'exit_price': float(pos.get('entryPrice') or 0.0),
+                        'qty': meta['qty'], 'notional': meta['notional'], 'pnl': unreal,
+                        'open_time': meta['open_time'], 'close_time': meta['close_time']
+                    })
                     managed_trades_lock.acquire()
                     try:
-                        if tid in managed_trades:
-                            managed_trades[tid]['unreal'] = unreal
+                        last_trade_close_time[sym] = close_time
                     finally:
                         managed_trades_lock.release()
-                    if abs(pos_amt) < 1e-8:
-                        close_time = datetime.utcnow().replace(tzinfo=timezone.utc)
-                        meta['close_time'] = close_time.isoformat()
-                        record_trade({'id': meta['id'], 'symbol': meta['symbol'], 'side': meta['side'],
-                                      'entry_price': meta['entry_price'], 'exit_price': float(pos.get('entryPrice') or 0.0),
-                                      'qty': meta['qty'], 'notional': meta['notional'], 'pnl': unreal,
-                                      'open_time': meta['open_time'], 'close_time': meta['close_time']})
+                    send_telegram(f"Trade closed {meta['id']} on {sym}\nPNL: {unreal:.6f} USDT\nCooldown: {CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles")
+                    to_remove.append(tid)
+                    continue
+
+                # Trailing SL logic
+                if meta.get('trailing'):
+                    df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
+                    atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
+                    current_price = df['close'].iloc[-1]
+                    moved = False
+                    new_sl = None
+                    if meta['side'] == 'BUY':
+                        if current_price > meta['entry_price'] + 1.0 * atr_now:
+                            new_sl = meta['entry_price'] + 0.5 * atr_now
+                            if new_sl > meta['sl'] and new_sl < current_price:
+                                cancel_close_orders_sync(sym)
+                                place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
+                                moved = True
+                    else: # SELL
+                        if current_price < meta['entry_price'] - 1.0 * atr_now:
+                            new_sl = meta['entry_price'] - 0.5 * atr_now
+                            if new_sl < meta['sl'] and new_sl > current_price:
+                                cancel_close_orders_sync(sym)
+                                place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
+                                moved = True
+                    
+                    if moved and new_sl is not None:
                         managed_trades_lock.acquire()
                         try:
-                            last_trade_close_time[sym] = close_time
+                            if tid in managed_trades:
+                                managed_trades[tid]['sl'] = new_sl
+                                managed_trades[tid]['sltp_last_updated'] = datetime.utcnow().isoformat()
                         finally:
                             managed_trades_lock.release()
-                        send_telegram_sync(f"Trade closed {meta['id']} on {sym}\nPNL: {unreal:.6f} USDT\nCooldown: {CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles")
-                        to_remove.append(tid)
-                        continue
-                    if meta.get('trailing'):
-                        try:
-                            df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
-                            atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                            current_price = df['close'].iloc[-1]
-                            moved = False
-                            new_sl = None
-                            if meta['side'] == 'BUY':
-                                if current_price > meta['entry_price'] + 1.0 * atr_now:
-                                    new_sl = meta['entry_price'] + 0.5 * atr_now
-                                    if new_sl > meta['sl'] and new_sl < current_price:
-                                        cancel_close_orders_sync(sym)
-                                        place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
-                                        moved = True
-                            else:
-                                if current_price < meta['entry_price'] - 1.0 * atr_now:
-                                    new_sl = meta['entry_price'] - 0.5 * atr_now
-                                    if new_sl < meta['sl'] and new_sl > current_price:
-                                        cancel_close_orders_sync(sym)
-                                        place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp'])
-                                        moved = True
-                            if moved and new_sl is not None:
-                                managed_trades_lock.acquire()
-                                try:
-                                    if tid in managed_trades:
-                                        managed_trades[tid]['sl'] = new_sl
-                                        managed_trades[tid]['sltp_last_updated'] = datetime.utcnow().isoformat()
-                                finally:
-                                    managed_trades_lock.release()
-                                meta['sl'] = new_sl
-                                send_telegram_sync(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
-                        except Exception:
-                            log.exception("Trailing internal error in monitor thread")
-                except Exception:
-                    log.exception("Error handling trade in monitor thread")
+                        meta['sl'] = new_sl
+                        send_telegram(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
+
             if to_remove:
                 managed_trades_lock.acquire()
                 try:
@@ -888,10 +880,20 @@ def monitor_thread_func():
                         managed_trades.pop(tid, None)
                 finally:
                     managed_trades_lock.release()
+            
             time.sleep(5)
-        except Exception:
-            log.exception("Unhandled exception in monitor thread")
-            time.sleep(5)
+
+        except Exception as e:
+            log.exception("An unhandled exception occurred in monitor thread. Bot will be paused.")
+            try:
+                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                safe_tb = _shorten_for_telegram(tb)
+                send_telegram(f"CRITICAL ERROR in monitor thread: {e}\nTrace:\n{safe_tb}\nBot paused.")
+            except Exception as send_exc:
+                log.error("Failed to send critical error notification from monitor thread: %s", send_exc)
+            running = False
+            time.sleep(30) # Sleep before next attempt after a critical failure
+
     log.info("Monitor thread exiting.")
 
 async def scanning_loop():
@@ -938,29 +940,29 @@ def handle_update_sync(update, loop):
                 fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /startbot action: %s", e)
-                send_telegram_sync("Bot state -> RUNNING")
+                send_telegram("Bot state -> RUNNING")
             elif text.startswith("/stopbot"):
                 fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /stopbot action: %s", e)
-                send_telegram_sync("Bot state -> STOPPED")
+                send_telegram("Bot state -> STOPPED")
             elif text.startswith("/freeze"):
                 fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /freeze action: %s", e)
-                send_telegram_sync("Bot -> FROZEN (no new entries)")
+                send_telegram("Bot -> FROZEN (no new entries)")
             elif text.startswith("/unfreeze"):
                 fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
-                send_telegram_sync("Bot -> UNFROZEN")
+                send_telegram("Bot -> UNFROZEN")
             elif text.startswith("/status"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
                 try: trades = fut.result(timeout=5)
                 except Exception as e: log.error("Failed to get managed trades for /status: %s", e)
                 txt = f"Status:\nrunning={running}\nfrozen={frozen}\nmanaged_trades={len(trades)}"
-                send_telegram_sync(txt)
+                send_telegram(txt)
                 try:
                     coro = telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                     asyncio.run_coroutine_threadsafe(coro, loop)
@@ -968,33 +970,33 @@ def handle_update_sync(update, loop):
                     log.exception("Failed to schedule telegram keyboard")
             elif text.startswith("/ip") or text.startswith("/forceip"):
                 ip = get_public_ip()
-                send_telegram_sync(f"Server IP: {ip}")
+                send_telegram(f"Server IP: {ip}")
             elif text.startswith("/listorders"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
                 try: trades = fut.result(timeout=5)
                 except Exception: pass
                 if not trades:
-                    send_telegram_sync("No managed trades.")
+                    send_telegram("No managed trades.")
                 else:
                     out = "Open trades:\n"
                     for k, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    send_telegram_sync(out)
+                    send_telegram(out)
             elif text.startswith("/showparams"):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
                     out += f"{k} = {v}\n"
-                send_telegram_sync(out)
+                send_telegram(out)
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
                     key = parts[1]
                     val = " ".join(parts[2:])
                     if key not in CONFIG:
-                        send_telegram_sync(f"Parameter {key} not found.")
+                        send_telegram(f"Parameter {key} not found.")
                     else:
                         old = CONFIG[key]
                         try:
@@ -1008,18 +1010,18 @@ def handle_update_sync(update, loop):
                                 CONFIG[key] = [x.strip().upper() for x in val.split(",")]
                             else:
                                 CONFIG[key] = val
-                            send_telegram_sync(f"Set {key} = {CONFIG[key]}")
+                            send_telegram(f"Set {key} = {CONFIG[key]}")
                         except Exception as e:
-                            send_telegram_sync(f"Failed to set {key}: {e}")
+                            send_telegram(f"Failed to set {key}: {e}")
                 else:
-                    send_telegram_sync("Usage: /setparam KEY VALUE")
+                    send_telegram("Usage: /setparam KEY VALUE")
             elif text.startswith("/validate"):
                 result = validate_and_sanity_check_sync(send_report=False)
-                send_telegram_sync("Validation result: " + ("OK" if result["ok"] else "ERROR"))
+                send_telegram("Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
-                    send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+                    send_telegram(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             else:
-                send_telegram_sync("Unknown command. Use /status to see the keyboard.")
+                send_telegram("Unknown command. Use /status to see the keyboard.")
     except Exception:
         log.exception("Error in handle_update_sync")
 
@@ -1031,21 +1033,19 @@ def telegram_polling_thread(loop):
     offset = None
     while not monitor_stop_event.is_set():
         try:
-            coro = telegram_bot.get_updates(offset=offset, timeout=20)
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
-            updates = future.result(timeout=30)
+            updates = telegram_bot.get_updates(offset=offset, timeout=20)
             for u in updates:
                 offset = u.update_id + 1
                 handle_update_sync(u, loop)
             time.sleep(0.2)
         except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
+            if "timed out" in str(e).lower():
                 log.debug("Telegram get_updates timed out, retrying...")
                 continue
             log.exception("Telegram polling thread error")
             try:
                 ip = get_public_ip()
-                send_telegram_sync(f"Telegram polling error: {e}")
+                send_telegram(f"Telegram polling error: {e}")
             except Exception:
                 pass
             time.sleep(5)
@@ -1065,7 +1065,7 @@ async def handle_critical_error_async(exc: Exception, context: str = None):
     tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else "No traceback"
     safe_tb = _shorten_for_telegram(tb)
     msg = f"CRITICAL ERROR: {context or ''}\nException: {str(exc)}\n\nTraceback:\n{safe_tb}\nServer IP: {ip}\nBot paused."
-    await send_telegram(msg)
+    await asyncio.to_thread(send_telegram, msg)
 
 @app.get("/")
 async def root():
@@ -1075,7 +1075,7 @@ def _signal_handler(sig, frame):
     log.info("Received signal %s, shutting down", sig)
     monitor_stop_event.set()
     try:
-        send_telegram_sync(f"Received signal {sig}. Shutting down.")
+        send_telegram(f"Received signal {sig}. Shutting down.")
     except Exception:
         pass
     sys.exit(0)
@@ -1109,7 +1109,7 @@ if __name__ == "__main__":
             log.info("Scanning loop scheduled.")
         else:
             log.warning("Binance client not initialized, scanning loop not started.")
-        loop.run_until_complete(send_telegram("KAMA strategy bot started (standalone). Running={}".format(running)))
+        loop.run_until_complete(asyncio.to_thread(send_telegram, "KAMA strategy bot started (standalone). Running={}".format(running)))
         loop.run_forever()
     except KeyboardInterrupt:
         log.info("Keyboard interrupt received. Shutting down.")
