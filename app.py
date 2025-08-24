@@ -71,6 +71,7 @@ CONFIG = {
     "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
 
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
+    "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "5")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
@@ -86,6 +87,14 @@ CONFIG = {
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
 
+    "VOLATILITY_ADJUST_ENABLED": os.getenv("VOLATILITY_ADJUST_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "TRENDING_ADX": float(os.getenv("TRENDING_ADX", "40.0")),
+    "TRENDING_CHOP": float(os.getenv("TRENDING_CHOP", "40.0")),
+    "TRENDING_RISK_MULT": float(os.getenv("TRENDING_RISK_MULT", "1.5")),
+    "CHOPPY_ADX": float(os.getenv("CHOPPY_ADX", "25.0")),
+    "CHOPPY_CHOP": float(os.getenv("CHOPPY_CHOP", "60.0")),
+    "CHOPPY_RISK_MULT": float(os.getenv("CHOPPY_RISK_MULT", "0.5")),
+
     "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
     "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "50.0")),
 
@@ -99,6 +108,7 @@ CONFIG = {
     "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "BE_AUTO_MOVE_ENABLED": os.getenv("BE_AUTO_MOVE_ENABLED", "true").lower() in ("true", "1", "yes"),
 
     "DYN_SLTP_ENABLED": os.getenv("DYN_SLTP_ENABLED", "true").lower() in ("true", "1", "yes"),
     "TP1_ATR_MULT": float(os.getenv("TP1_ATR_MULT", "1.0")),
@@ -138,6 +148,9 @@ class DualLock:
 
 managed_trades: Dict[str, Dict[str, Any]] = {}
 managed_trades_lock = DualLock()  # used by both async and sync code
+
+symbol_regimes: Dict[str, str] = {}
+symbol_regimes_lock = threading.Lock()
 
 last_trade_close_time: Dict[str, datetime] = {}
 
@@ -732,6 +745,29 @@ async def evaluate_and_enter(symbol: str):
         price = last['close']
         kama_now = last['kama']; kama_prev = prev['kama']
         atr_now = last['atr']; adx_now = last['adx']; chop_now = last['chop']; bbw_now = last['bbw']
+
+        # --- Volatility Regime Detection ---
+        risk_multiplier = 1.0
+        regime = "NORMAL"
+        if CONFIG["VOLATILITY_ADJUST_ENABLED"]:
+            if adx_now > CONFIG["TRENDING_ADX"] and chop_now < CONFIG["TRENDING_CHOP"]:
+                risk_multiplier = CONFIG["TRENDING_RISK_MULT"]
+                regime = "TRENDING"
+            elif adx_now < CONFIG["CHOPPY_ADX"] or chop_now > CONFIG["CHOPPY_CHOP"]:
+                risk_multiplier = CONFIG["CHOPPY_RISK_MULT"]
+                regime = "CHOPPY"
+        
+        notify_regime_change = False
+        with symbol_regimes_lock:
+            previous_regime = symbol_regimes.get(symbol, "NORMAL")
+            if regime != previous_regime:
+                symbol_regimes[symbol] = regime
+                notify_regime_change = True
+        
+        if notify_regime_change:
+            await asyncio.to_thread(send_telegram, f"📈 Risk regime for {symbol} changed to: {regime}. Risk multiplier: {risk_multiplier}x")
+        # --- End Volatility Regime ---
+
         trend_small = 'bull' if (kama_now - kama_prev) > 0 else 'bear'
         df_big = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["BIG_TIMEFRAME"], 200)
         df_big['kama'] = kama(df_big['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
@@ -789,6 +825,7 @@ async def evaluate_and_enter(symbol: str):
             take_price = price + sl_distance if side == 'BUY' else price - sl_distance
         balance = await asyncio.to_thread(get_account_balance_usdt)
         risk_usdt = calculate_risk_amount(balance)
+        risk_usdt *= risk_multiplier  # Apply volatility multiplier
         if risk_usdt <= 0:
             log.warning("Risk amount non-positive"); return
         price_distance = abs(price - stop_price)
@@ -846,6 +883,7 @@ async def evaluate_and_enter(symbol: str):
                 "dyn_sltp": CONFIG["DYN_SLTP_ENABLED"],
                 "tp1": tp1, "tp2": tp2, "tp3": tp3,
                 "trade_phase": 0,
+                "be_moved": False,
             }
             async with managed_trades_lock:
                 managed_trades[trade_id] = meta
@@ -958,6 +996,44 @@ def monitor_thread_func():
                     send_telegram(f"Trade closed {meta['id']} on {sym}\nPNL: {unreal:.6f} USDT\nCooldown: {CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles")
                     to_remove.append(tid)
                     continue
+
+                # --- Break-Even Auto-Move Logic ---
+                if CONFIG.get("BE_AUTO_MOVE_ENABLED", True) and not meta.get('be_moved') and meta.get('trade_phase', 0) == 0:
+                    df_be = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
+                    atr_now_be = atr(df_be, CONFIG["ATR_LENGTH"]).iloc[-1]
+                    current_price_be = df_be['close'].iloc[-1]
+
+                    entry_price = meta['entry_price']
+                    side = meta['side']
+                    
+                    profit_target_price = entry_price + atr_now_be if side == 'BUY' else entry_price - atr_now_be
+                    
+                    moved_to_be = False
+                    if side == 'BUY' and current_price_be >= profit_target_price:
+                        if entry_price > meta['sl']:
+                            cancel_close_orders_sync(sym)
+                            place_sl_tp_orders_sync(sym, side, entry_price, meta['tp'])
+                            moved_to_be = True
+                            
+                    elif side == 'SELL' and current_price_be <= profit_target_price:
+                        if entry_price < meta['sl']:
+                            cancel_close_orders_sync(sym)
+                            place_sl_tp_orders_sync(sym, side, entry_price, meta['tp'])
+                            moved_to_be = True
+
+                    if moved_to_be:
+                        log.info(f"Trade {tid} hit 1x ATR profit target. Moving SL to breakeven at {entry_price}.")
+                        
+                        managed_trades_lock.acquire()
+                        try:
+                            if tid in managed_trades:
+                                managed_trades[tid]['sl'] = entry_price
+                                managed_trades[tid]['be_moved'] = True
+                        finally:
+                            managed_trades_lock.release()
+                            
+                        send_telegram(f"🔒 SL moved to breakeven for Trade ID: {tid}")
+                        continue
 
                 # Dynamic SL/TP Logic
                 if meta.get('dyn_sltp'):
@@ -1076,19 +1152,27 @@ async def scanning_loop():
             if not running:
                 await asyncio.sleep(2)
                 continue
+
+            log.info("Starting concurrent symbol scan...")
             symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"]]
-            for s in symbols:
-                try:
-                    await evaluate_and_enter(s)
-                except Exception:
-                    log.exception("Error in evaluate loop for %s", s)
-                await asyncio.sleep(max(0.5, CONFIG["SCAN_INTERVAL"] / max(1, len(symbols))))
+            tasks = [evaluate_and_enter(s) for s in symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
+            
+            cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
+            log.info(f"Scan cycle complete. Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
+            await asyncio.sleep(cooldown_seconds)
+
         except asyncio.CancelledError:
             log.info("Scanning loop cancelled.")
             break
-        except Exception:
-            log.exception("Scanning loop error")
-        await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
+        except Exception as e:
+            log.exception("An unhandled error occurred in the main scanning loop: %s", e)
+            # To prevent rapid-fire errors, wait a bit before retrying.
+            await asyncio.sleep(60)
 
 async def get_managed_trades_snapshot():
     async with managed_trades_lock:
