@@ -495,8 +495,15 @@ def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int)
         log.warning("Failed to change leverage (non-fatal, may use previous leverage): %s", e)
 
     try:
-        log.info(f"Placing real market order: {side} {qty} {symbol}")
-        order = client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=qty)
+        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+        log.info(f"Placing real market order: {side} ({position_side}) {qty} {symbol}")
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type='MARKET',
+            quantity=qty,
+            positionSide=position_side
+        )
         return order
     except BinanceAPIException as e:
         log.exception("BinanceAPIException opening position: %s", e)
@@ -739,25 +746,12 @@ async def evaluate_and_enter(symbol: str):
             await asyncio.to_thread(send_telegram, f"{dry_run_prefix}Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
             log.info("%sOpened trade: %s", dry_run_prefix, meta)
         except Exception as e:
-            if isinstance(e, BinanceAPIException) and e.code == -4061:
-                # Gracefully handle the Hedge Mode error
-                log.warning("Could not place trade for %s due to position mode setting (Hedge Mode). Informing user.", symbol)
-                msg = (f"⚠️ **Trade Failed for {symbol}** ⚠️\n\n"
-                       f"A trade could not be opened due to a Binance account setting.\n\n"
-                       f"**Error**: `Order's position side does not match user's setting.` (Code: -4061)\n\n"
-                       f"**✅ How to Fix**:\n"
-                       f"1. Go to your **Futures** trading page on the Binance website or app.\n"
-                       f"2. Find the settings/preferences menu (often a `...` icon).\n"
-                       f"3. Select **'Position Mode'** and change it from 'One-way Mode' to **'Hedge Mode'**.\n\n"
-                       f"This allows the bot to open both LONG and SHORT positions as needed. The bot will continue running.")
-                await asyncio.to_thread(send_telegram, msg)
-            else:
-                # Handle all other exceptions as critical failures
-                log.exception("Failed to open trade for %s: %s", symbol, e)
-                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-                safe_tb = _shorten_for_telegram(tb)
-                await asyncio.to_thread(send_telegram, f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
-                running = False
+            # Handle all exceptions as critical failures
+            log.exception("Failed to open trade for %s: %s", symbol, e)
+            tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+            safe_tb = _shorten_for_telegram(tb)
+            await asyncio.to_thread(send_telegram, f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+            running = False
         return
     except Exception as e:
         log.exception("evaluate_and_enter error %s: %s", symbol, e)
