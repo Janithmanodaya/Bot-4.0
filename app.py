@@ -66,7 +66,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # CONFIG (edit values here)
 # -------------------------
 CONFIG = {
-    "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+    "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
     "TIMEFRAME": os.getenv("TIMEFRAME", "1h"),
     "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
 
@@ -100,9 +100,17 @@ CONFIG = {
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
 
+    "DYN_SLTP_ENABLED": os.getenv("DYN_SLTP_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "TP1_ATR_MULT": float(os.getenv("TP1_ATR_MULT", "1.0")),
+    "TP2_ATR_MULT": float(os.getenv("TP2_ATR_MULT", "2.0")),
+    "TP3_ATR_MULT": float(os.getenv("TP3_ATR_MULT", "3.0")),
+    "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")), # 50%
+    "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.25")), # 25%
+
     "DB_FILE": os.getenv("DB_FILE", "trades.db"),
     
     "DRY_RUN": os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes"),
+    "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
 }
 
 running = (CONFIG["START_MODE"] == "running")
@@ -553,6 +561,58 @@ def place_sl_tp_orders_sync(symbol: str, side: str, stop_price: float, take_pric
         log.exception("Failed to create take profit order: %s", e)
     return out
 
+def close_partial_market_position_sync(symbol: str, side: str, qty_to_close: float):
+    global client
+    if CONFIG["DRY_RUN"]:
+        log.info(f"[DRY RUN] Would close {qty_to_close} of {symbol} position.")
+        return {"status": "FILLED"}
+
+    if client is None:
+        raise RuntimeError("Binance client not initialized")
+
+    try:
+        close_side = 'SELL' if side == 'BUY' else 'BUY'
+        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+
+        log.info(f"Placing partial close market order: {close_side} ({position_side}) {qty_to_close} {symbol}")
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type='MARKET',
+            quantity=qty_to_close,
+            positionSide=position_side,
+            reduceOnly=True
+        )
+        return order
+    except BinanceAPIException as e:
+        log.exception("BinanceAPIException closing partial position: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception closing partial position: %s", e)
+        raise
+
+def place_sl_order_sync(symbol: str, side: str, stop_price: float):
+    global client
+    if CONFIG["DRY_RUN"]:
+        log.info(f"[DRY RUN] Would place SL at {stop_price:.4f} for {symbol}.")
+        return {"orderId": f"dryrun_sl_{int(time.time())}"}
+
+    if client is None:
+        raise RuntimeError("Binance client not initialized")
+    try:
+        sl_order = client.futures_create_order(
+            symbol=symbol,
+            side='SELL' if side == 'BUY' else 'BUY',
+            type='STOP_MARKET',
+            stopPrice=round(stop_price, 8),
+            closePosition=True,
+            reduceOnly=True
+        )
+        return sl_order
+    except Exception as e:
+        log.exception("Failed to create stop loss order: %s", e)
+        raise
+
 def cancel_close_orders_sync(symbol: str):
     global client
     if CONFIG["DRY_RUN"]:
@@ -710,7 +770,23 @@ async def evaluate_and_enter(symbol: str):
         if sl_distance <= 0 or math.isnan(sl_distance):
             return
         stop_price = price - sl_distance if side == 'BUY' else price + sl_distance
-        take_price = price + sl_distance if side == 'BUY' else price - sl_distance
+        
+        tp1, tp2, tp3 = None, None, None
+        if CONFIG["DYN_SLTP_ENABLED"]:
+            tp1_dist = CONFIG["TP1_ATR_MULT"] * atr_now
+            tp2_dist = CONFIG["TP2_ATR_MULT"] * atr_now
+            tp3_dist = CONFIG["TP3_ATR_MULT"] * atr_now
+            if side == 'BUY':
+                tp1 = price + tp1_dist
+                tp2 = price + tp2_dist
+                tp3 = price + tp3_dist
+            else: # SELL
+                tp1 = price - tp1_dist
+                tp2 = price - tp2_dist
+                tp3 = price - tp3_dist
+            take_price = tp3
+        else:
+            take_price = price + sl_distance if side == 'BUY' else price - sl_distance
         balance = await asyncio.to_thread(get_account_balance_usdt)
         risk_usdt = calculate_risk_amount(balance)
         if risk_usdt <= 0:
@@ -723,6 +799,35 @@ async def evaluate_and_enter(symbol: str):
         if qty <= 0:
             log.warning("Qty rounded to zero; skipping"); return
         notional = qty * price
+        
+        min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+        if notional < min_notional:
+            log.warning(f"{symbol} Notional is {notional:.4f} < {min_notional}. Boosting risk.")
+            
+            # Boost risk to meet min_notional
+            required_qty = min_notional / price
+            new_risk = required_qty * price_distance
+            
+            if new_risk > balance:
+                log.warning(f"Cannot boost risk for {symbol}, required risk {new_risk:.2f} > balance {balance:.2f}")
+                await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: Notional value too small and cannot boost risk.\nNotional: {notional:.4f} USDT\nRequired Risk: {new_risk:.2f} USDT\nBalance: {balance:.2f} USDT")
+                return
+
+            risk_usdt = new_risk
+            qty = required_qty
+            qty = await asyncio.to_thread(round_qty, symbol, qty)
+            if qty <= 0:
+                log.warning(" boosted qty rounded to zero; skipping"); return
+            
+            notional = qty * price
+            
+            await asyncio.to_thread(send_telegram, f"📈 Risk Boosted: {symbol}\nNew Risk: {risk_usdt:.2f} USDT\nNotional: {notional:.2f} USDT")
+
+        if notional < min_notional:
+            log.warning(f"Skipping {symbol} trade. Notional value {notional:.4f} is less than minimum {min_notional}")
+            await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: Notional value is too small.\nNotional: {notional:.4f} USDT")
+            return
+
         target_initial_margin = risk_usdt
         leverage = max(1, int(min(get_max_leverage(symbol), math.floor(notional / max(target_initial_margin, 1e-8)))))
         if notional <= target_initial_margin:
@@ -732,11 +837,15 @@ async def evaluate_and_enter(symbol: str):
             order_id = str(order.get('orderId', f"mkt_{int(time.time())}"))
             sltp = await asyncio.to_thread(place_sl_tp_orders_sync, symbol, side, stop_price, take_price)
             trade_id = f"{symbol}_{order_id}"
+            
             meta = {
                 "id": trade_id, "symbol": symbol, "side": side, "entry_price": price,
-                "qty": qty, "notional": notional, "leverage": leverage,
+                "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
                 "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
-                "sltp_orders": sltp, "trailing": CONFIG["TRAILING_ENABLED"]
+                "sltp_orders": sltp, "trailing": CONFIG["TRAILING_ENABLED"],
+                "dyn_sltp": CONFIG["DYN_SLTP_ENABLED"],
+                "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "trade_phase": 0,
             }
             async with managed_trades_lock:
                 managed_trades[trade_id] = meta
@@ -849,6 +958,61 @@ def monitor_thread_func():
                     send_telegram(f"Trade closed {meta['id']} on {sym}\nPNL: {unreal:.6f} USDT\nCooldown: {CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles")
                     to_remove.append(tid)
                     continue
+
+                # Dynamic SL/TP Logic
+                if meta.get('dyn_sltp'):
+                    df_monitor = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 2)
+                    current_price = df_monitor['close'].iloc[-1]
+                    
+                    # Check for TP1
+                    if meta.get('trade_phase') == 0 and meta.get('tp1') is not None:
+                        hit_tp1 = (meta['side'] == 'BUY' and current_price >= meta['tp1']) or \
+                                  (meta['side'] == 'SELL' and current_price <= meta['tp1'])
+                        if hit_tp1:
+                            log.info(f"Trade {tid} hit TP1 at {meta['tp1']}.")
+                            qty_to_close = meta['initial_qty'] * CONFIG['TP1_CLOSE_PCT']
+                            qty_to_close = round_qty(sym, qty_to_close)
+                            
+                            if qty_to_close > 0:
+                                close_partial_market_position_sync(sym, meta['side'], qty_to_close)
+                            
+                            new_qty = meta['qty'] - qty_to_close
+                            cancel_close_orders_sync(sym)
+                            new_sl = meta['entry_price']
+                            place_sl_tp_orders_sync(sym, meta['side'], new_sl, meta['tp3'])
+                            
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['trade_phase'] = 1
+                                    managed_trades[tid]['qty'] = new_qty
+                                    managed_trades[tid]['sl'] = new_sl
+                            send_telegram(f"✅ TP1 hit for {tid} ({sym}). Closed {CONFIG['TP1_CLOSE_PCT']*100}%. SL moved to breakeven.")
+                            continue
+
+                    # Check for TP2
+                    if meta.get('trade_phase') == 1 and meta.get('tp2') is not None:
+                        hit_tp2 = (meta['side'] == 'BUY' and current_price >= meta['tp2']) or \
+                                  (meta['side'] == 'SELL' and current_price <= meta['tp2'])
+                        if hit_tp2:
+                            log.info(f"Trade {tid} hit TP2 at {meta['tp2']}.")
+                            qty_to_close = meta['initial_qty'] * CONFIG['TP2_CLOSE_PCT']
+                            qty_to_close = round_qty(sym, qty_to_close)
+
+                            if qty_to_close > 0:
+                                close_partial_market_position_sync(sym, meta['side'], qty_to_close)
+                            
+                            new_qty = meta['qty'] - qty_to_close
+                            cancel_close_orders_sync(sym)
+                            new_sl = meta['tp1']
+                            place_sl_order_sync(sym, meta['side'], new_sl)
+
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['trade_phase'] = 2
+                                    managed_trades[tid]['qty'] = new_qty
+                                    managed_trades[tid]['sl'] = new_sl
+                            send_telegram(f"✅ TP2 hit for {tid} ({sym}). Closed {CONFIG['TP2_CLOSE_PCT']*100}%. SL moved to TP1. Trailing stop is active.")
+                            continue
 
                 # Trailing SL logic
                 if meta.get('trailing'):
