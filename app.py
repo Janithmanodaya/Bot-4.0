@@ -80,7 +80,7 @@ CONFIG = {
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
-    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
+    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "14")),
     "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
     "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
 
