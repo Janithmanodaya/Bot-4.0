@@ -38,7 +38,9 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 import telegram
-from telegram import ReplyKeyboardMarkup, KeyboardButton
+from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+
+import mplfinance as mpf
 
 from dotenv import load_dotenv
 
@@ -121,17 +123,21 @@ CONFIG = {
     "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.25")), # 25%
 
     "MAX_DAILY_LOSS": float(os.getenv("MAX_DAILY_LOSS", "-50.0")), # Negative value, e.g. -50.0 for $50 loss
+    "MAX_DAILY_PROFIT": float(os.getenv("MAX_DAILY_PROFIT", "100.0")), # 0 disables this
+    "AUTO_FREEZE_ON_PROFIT": os.getenv("AUTO_FREEZE_ON_PROFIT", "true").lower() in ("true", "1", "yes"),
     "DAILY_PNL_CHECK_INTERVAL": int(os.getenv("DAILY_PNL_CHECK_INTERVAL", "60")), # In seconds
 
     "DB_FILE": os.getenv("DB_FILE", "trades.db"),
     
     "DRY_RUN": os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes"),
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
+    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
 }
 
 running = (CONFIG["START_MODE"] == "running")
 frozen = False
 daily_loss_limit_hit = False
+daily_profit_limit_hit = False
 current_daily_pnl = 0.0
 
 # DualLock for cross-thread (thread + async) coordination
@@ -172,6 +178,67 @@ scan_task: Optional[asyncio.Task] = None
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
+async def reconcile_open_trades():
+    global managed_trades
+    log.info("--- Starting Trade Reconciliation ---")
+
+    db_trades = await asyncio.to_thread(load_managed_trades_from_db)
+    if not db_trades:
+        log.info("No trades in the database to reconcile. Starting fresh.")
+        return
+
+    log.info(f"Found {len(db_trades)} open trade(s) in the database.")
+
+    try:
+        if client is None:
+            log.warning("Binance client not initialized. Cannot fetch positions for reconciliation.")
+            return
+        
+        positions = await asyncio.to_thread(client.futures_position_information)
+        open_positions = {
+            pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0.0)) != 0.0
+        }
+        log.info(f"Found {len(open_positions)} open position(s) on Binance.")
+
+    except Exception as e:
+        log.exception("Failed to fetch Binance positions during reconciliation. Aborting reconciliation.")
+        await asyncio.to_thread(send_telegram, f"⚠️ **CRITICAL**: Failed to fetch positions from Binance during startup reconciliation: {e}. The bot may not manage existing trades correctly.")
+        managed_trades = {}
+        return
+
+    retained_trades = {}
+    
+    for trade_id, trade_meta in db_trades.items():
+        symbol = trade_meta['symbol']
+        if symbol in open_positions:
+            log.info(f"✅ Reconciled: Trade {trade_id} ({symbol}) is active on Binance. Restoring.")
+            retained_trades[trade_id] = trade_meta
+        else:
+            log.warning(f"⚠️ Reconciled: Trade {trade_id} ({symbol}) found in DB but is closed on Binance. Marking as closed.")
+            record_trade({
+                'id': trade_id, 'symbol': symbol, 'side': trade_meta['side'],
+                'entry_price': trade_meta['entry_price'], 'exit_price': None,
+                'qty': trade_meta['initial_qty'], 'notional': trade_meta['notional'], 
+                'pnl': 0.0, # PnL is unknown
+                'open_time': trade_meta['open_time'], 
+                'close_time': datetime.utcnow().isoformat(),
+                'risk_usdt': trade_meta.get('risk_usdt', 0.0)
+            })
+            await asyncio.to_thread(remove_managed_trade_from_db, trade_id)
+            await asyncio.to_thread(send_telegram, f"ℹ️ Trade {trade_id} ({symbol}) was closed while the bot was offline. It has been reconciled.")
+
+    db_symbols = {t['symbol'] for t in db_trades.values()}
+    for symbol, position in open_positions.items():
+        if symbol not in db_symbols:
+            log.warning(f"🚨 Rogue Position Detected: Position for {symbol} exists on Binance but not in the bot's database. Please manage it manually.")
+            await asyncio.to_thread(send_telegram, f"🚨 **WARNING**: A rogue position for {symbol} was detected on Binance that is not tracked by the bot. Please manage it manually via the exchange.")
+
+    async with managed_trades_lock:
+        managed_trades.clear()
+        managed_trades.update(retained_trades)
+    
+    log.info(f"--- Reconciliation Complete. {len(managed_trades)} trades loaded into memory. ---")
+
 # -------------------------
 # App Lifespan Manager
 # -------------------------
@@ -186,6 +253,10 @@ async def lifespan(app: FastAPI):
     main_loop = asyncio.get_running_loop()
 
     ok, err = await asyncio.to_thread(init_binance_client_sync)
+    
+    if ok:
+        await reconcile_open_trades()
+
     await asyncio.to_thread(validate_and_sanity_check_sync, True)
 
     if client is not None:
@@ -298,7 +369,7 @@ def send_telegram(msg: str, document_content: Optional[bytes] = None, document_n
 def init_db():
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cur = conn.cursor()
-    # Add risk_usdt column
+    # Historical trades table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
         id TEXT PRIMARY KEY,
@@ -320,6 +391,32 @@ def init_db():
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e):
             raise
+
+    # Persistent open trades table for crash recovery
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS managed_trades (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        initial_qty REAL NOT NULL,
+        qty REAL NOT NULL,
+        notional REAL NOT NULL,
+        leverage INTEGER NOT NULL,
+        sl REAL NOT NULL,
+        tp REAL NOT NULL,
+        open_time TEXT NOT NULL,
+        sltp_orders TEXT,
+        trailing INTEGER NOT NULL,
+        dyn_sltp INTEGER NOT NULL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL,
+        trade_phase INTEGER NOT NULL,
+        be_moved INTEGER NOT NULL,
+        risk_usdt REAL NOT NULL
+    )
+    """)
     conn.commit()
     conn.close()
 
@@ -334,6 +431,53 @@ def record_trade(rec: Dict[str, Any]):
           rec['open_time'], rec.get('close_time')))
     conn.commit()
     conn.close()
+
+def add_managed_trade_to_db(rec: Dict[str, Any]):
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    values = (
+        rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec['initial_qty'],
+        rec['qty'], rec['notional'], rec['leverage'], rec['sl'], rec['tp'],
+        rec['open_time'], json.dumps(rec.get('sltp_orders')),
+        int(rec.get('trailing', False)), int(rec.get('dyn_sltp', False)),
+        rec.get('tp1'), rec.get('tp2'), rec.get('tp3'),
+        rec.get('trade_phase', 0), int(rec.get('be_moved', False)),
+        rec.get('risk_usdt')
+    )
+    cur.execute("""
+    INSERT OR REPLACE INTO managed_trades (
+        id, symbol, side, entry_price, initial_qty, qty, notional,
+        leverage, sl, tp, open_time, sltp_orders, trailing, dyn_sltp,
+        tp1, tp2, tp3, trade_phase, be_moved, risk_usdt
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, values)
+    conn.commit()
+    conn.close()
+
+def remove_managed_trade_from_db(trade_id: str):
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    cur.execute("DELETE FROM managed_trades WHERE id = ?", (trade_id,))
+    conn.commit()
+    conn.close()
+
+def load_managed_trades_from_db() -> Dict[str, Dict[str, Any]]:
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM managed_trades")
+    rows = cur.fetchall()
+    conn.close()
+
+    trades = {}
+    for row in rows:
+        rec = dict(row)
+        rec['sltp_orders'] = json.loads(rec.get('sltp_orders', '{}') or '{}')
+        rec['trailing'] = bool(rec.get('trailing'))
+        rec['dyn_sltp'] = bool(rec.get('dyn_sltp'))
+        rec['be_moved'] = bool(rec.get('be_moved'))
+        trades[rec['id']] = rec
+    return trades
 
 # -------------------------
 # Indicators
@@ -816,9 +960,30 @@ async def evaluate_and_enter(symbol: str):
         if not side:
             return
         async with managed_trades_lock:
+            existing_trades_for_symbol = [t for t in managed_trades.values() if t['symbol'] == symbol]
+            
+            if existing_trades_for_symbol:
+                if not CONFIG["HEDGING_ENABLED"]:
+                    log.debug(f"Skipping {symbol} as a trade already exists and hedging is disabled.")
+                    return
+                
+                # Hedging is enabled, check if new signal is opposite
+                existing_side = existing_trades_for_symbol[0]['side']
+                if side == existing_side:
+                    log.debug(f"Skipping {symbol}, new signal is same side as existing trade.")
+                    return
+                
+                # Ensure we don't have more than one primary and one hedge
+                if len(existing_trades_for_symbol) > 1:
+                    log.debug(f"Skipping {symbol}, already have a hedge position.")
+                    return
+
+                log.info(f"Hedge opportunity detected for {symbol}. New signal is {side}, opposite to existing {existing_side}.")
+
             if len(managed_trades) >= CONFIG["MAX_CONCURRENT_TRADES"]:
                 log.debug("Max concurrent trades reached")
                 return
+
         async with managed_trades_lock:
             last_close = last_trade_close_time.get(symbol)
         if last_close:
@@ -915,6 +1080,7 @@ async def evaluate_and_enter(symbol: str):
             record_trade({'id': trade_id, 'symbol': symbol, 'side': side, 'entry_price': price,
                           'exit_price': None, 'qty': qty, 'notional': notional, 'pnl': None,
                           'open_time': meta['open_time'], 'close_time': None, 'risk_usdt': risk_usdt})
+            await asyncio.to_thread(add_managed_trade_to_db, meta)
             dry_run_prefix = "[DRY RUN] " if CONFIG["DRY_RUN"] else ""
             await asyncio.to_thread(send_telegram, f"{dry_run_prefix}Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
             log.info("%sOpened trade: %s", dry_run_prefix, meta)
@@ -958,9 +1124,28 @@ def monitor_thread_func():
             try:
                 positions = client.futures_position_information()
             except BinanceAPIException as e:
-                log.error("Caught BinanceAPIException in monitor thread. Pausing bot and notifying.")
+                log.error("Caught BinanceAPIException in monitor thread: %s", e)
+                
+                if e.code == -2015:
+                    # This is a fatal auth/IP error. Freeze the bot and retry periodically.
+                    ip = get_public_ip()
+                    error_msg = (
+                        f"🚨 **CRITICAL AUTH ERROR** 🚨\n\n"
+                        f"Binance API keys are invalid, have incorrect permissions, or the server's IP address is not whitelisted.\n\n"
+                        f"**Error Code:** `{e.code}`\n"
+                        f"**Server IP:** `{ip}`\n\n"
+                        f"Please add this IP to your Binance API key's whitelist. "
+                        f"The bot is now **FROZEN** and will retry every 2 minutes."
+                    )
+                    send_telegram(error_msg)
+                    running = False
+                    frozen = True
+                    log.info("Bot frozen due to auth error. Waiting 2 minutes before next attempt...")
+                    time.sleep(120)
+                    continue
+
+                # Handle other, potentially transient, API errors
                 html_content = None
-                # Safely access the error message which might contain HTML
                 if len(e.args) >= 3:
                     html_content = e.args[2]
 
@@ -968,14 +1153,13 @@ def monitor_thread_func():
                     error_msg = f"Binance API returned an HTML error page. This could be an IP ban or server issue.\nServer IP: {get_public_ip()}"
                     send_telegram(error_msg, document_content=html_content.encode('utf-8'), document_name="binance_error.html")
                 else:
-                    # Handle other Binance API errors
                     tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
                     safe_tb = _shorten_for_telegram(tb)
                     error_msg = f"Binance API Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}"
                     send_telegram(error_msg)
                 
                 running = False
-                log.info("Bot paused. Waiting 2 minutes before next attempt...")
+                log.info("Bot paused due to API error. Waiting 2 minutes before next attempt...")
                 time.sleep(120)
                 continue
             
@@ -1014,6 +1198,7 @@ def monitor_thread_func():
                         'open_time': meta['open_time'], 'close_time': meta['close_time'],
                         'risk_usdt': meta.get('risk_usdt', 0.0) # Add risk, with a default for old trades
                     })
+                    remove_managed_trade_from_db(tid)
                     managed_trades_lock.acquire()
                     try:
                         last_trade_close_time[sym] = close_time
@@ -1088,6 +1273,8 @@ def monitor_thread_func():
                                     managed_trades[tid]['trade_phase'] = 1
                                     managed_trades[tid]['qty'] = new_qty
                                     managed_trades[tid]['sl'] = new_sl
+                                    # Update the persistent record
+                                    add_managed_trade_to_db(managed_trades[tid])
                             send_telegram(f"✅ TP1 hit for {tid} ({sym}). Closed {CONFIG['TP1_CLOSE_PCT']*100}%. SL moved to breakeven.")
                             continue
 
@@ -1113,6 +1300,8 @@ def monitor_thread_func():
                                     managed_trades[tid]['trade_phase'] = 2
                                     managed_trades[tid]['qty'] = new_qty
                                     managed_trades[tid]['sl'] = new_sl
+                                    # Update the persistent record
+                                    add_managed_trade_to_db(managed_trades[tid])
                             send_telegram(f"✅ TP2 hit for {tid} ({sym}). Closed {CONFIG['TP2_CLOSE_PCT']*100}%. SL moved to TP1. Trailing stop is active.")
                             continue
 
@@ -1173,7 +1362,7 @@ def monitor_thread_func():
     log.info("Monitor thread exiting.")
 
 def daily_pnl_monitor_thread_func():
-    global running, daily_loss_limit_hit, current_daily_pnl, last_trade_close_time
+    global running, daily_loss_limit_hit, daily_profit_limit_hit, current_daily_pnl, last_trade_close_time, frozen
     log.info("Daily PnL monitor thread started.")
 
     last_check_date = datetime.now(timezone.utc).date()
@@ -1183,41 +1372,53 @@ def daily_pnl_monitor_thread_func():
             # Daily Reset Logic
             current_date = datetime.now(timezone.utc).date()
             if current_date != last_check_date:
-                log.info(f"New day detected. Resetting daily loss limit flag from {daily_loss_limit_hit} to False.")
+                log.info(f"New day detected. Resetting daily PnL limits.")
                 if daily_loss_limit_hit:
-                    # Only send reset message if it was previously hit
                     send_telegram("☀️ New day, daily loss limit has been reset.")
+                if daily_profit_limit_hit:
+                    send_telegram("☀️ New day, daily profit limit has been reset.")
                 
                 daily_loss_limit_hit = False
+                daily_profit_limit_hit = False
                 current_daily_pnl = 0.0
                 last_check_date = current_date
                 
-                # Also reset the last trade close time to allow trading on new day
                 with managed_trades_lock:
                     last_trade_close_time.clear()
                     log.info("Cleared last_trade_close_time for all symbols.")
 
             # PnL Check Logic
-            if not daily_loss_limit_hit: # Only check if the limit has not been hit for the day
-                conn = sqlite3.connect(CONFIG["DB_FILE"])
-                cur = conn.cursor()
-                
-                today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                
-                cur.execute("SELECT SUM(pnl) FROM trades WHERE DATE(close_time) = ?", (today_str,))
-                result = cur.fetchone()[0]
-                conn.close()
+            conn = sqlite3.connect(CONFIG["DB_FILE"])
+            cur = conn.cursor()
+            today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            cur.execute("SELECT SUM(pnl) FROM trades WHERE DATE(close_time) = ?", (today_str,))
+            result = cur.fetchone()[0]
+            conn.close()
+            daily_pnl = result if result is not None else 0.0
+            current_daily_pnl = daily_pnl
 
-                daily_pnl = result if result is not None else 0.0
-                current_daily_pnl = daily_pnl
+            # Loss Limit Check
+            if not daily_loss_limit_hit and CONFIG["MAX_DAILY_LOSS"] != 0:
+                log.info(f"Daily PnL check: {daily_pnl:.2f} USDT vs Loss Limit {CONFIG['MAX_DAILY_LOSS']:.2f}")
+                if daily_pnl <= CONFIG["MAX_DAILY_LOSS"]:
+                    log.warning(f"MAX DAILY LOSS LIMIT HIT! PnL: {daily_pnl:.2f}, Limit: {CONFIG['MAX_DAILY_LOSS']:.2f}")
+                    running = False
+                    daily_loss_limit_hit = True
+                    send_telegram(f"🚨 MAX DAILY LOSS LIMIT HIT! 🚨\nToday's PnL: {daily_pnl:.2f} USDT\nLimit: {CONFIG['MAX_DAILY_LOSS']:.2f} USDT\nBot is now PAUSED until the next UTC day.")
+            
+            # Profit Limit Check
+            if not daily_profit_limit_hit and CONFIG["MAX_DAILY_PROFIT"] > 0:
+                log.info(f"Daily PnL check: {daily_pnl:.2f} USDT vs Profit Target {CONFIG['MAX_DAILY_PROFIT']:.2f}")
+                if daily_pnl >= CONFIG["MAX_DAILY_PROFIT"]:
+                    log.warning(f"MAX DAILY PROFIT TARGET HIT! PnL: {daily_pnl:.2f}, Target: {CONFIG['MAX_DAILY_PROFIT']:.2f}")
+                    daily_profit_limit_hit = True
+                    
+                    freeze_msg = ""
+                    if CONFIG["AUTO_FREEZE_ON_PROFIT"]:
+                        frozen = True
+                        freeze_msg = "\nBot is now FROZEN (no new entries)."
 
-                if CONFIG["MAX_DAILY_LOSS"] != 0: # 0 means disabled
-                    log.info(f"Daily PnL check: {daily_pnl:.2f} USDT vs Limit {CONFIG['MAX_DAILY_LOSS']:.2f}")
-                    if daily_pnl <= CONFIG["MAX_DAILY_LOSS"]:
-                        log.warning(f"MAX DAILY LOSS LIMIT HIT! PnL: {daily_pnl:.2f}, Limit: {CONFIG['MAX_DAILY_LOSS']:.2f}")
-                        running = False
-                        daily_loss_limit_hit = True
-                        send_telegram(f"🚨 MAX DAILY LOSS LIMIT HIT! 🚨\nToday's PnL: {daily_pnl:.2f} USDT\nLimit: {CONFIG['MAX_DAILY_LOSS']:.2f} USDT\nBot is now PAUSED until the next UTC day.")
+                    send_telegram(f"🎉 MAX DAILY PROFIT TARGET HIT! 🎉\nToday's PnL: {daily_pnl:.2f} USDT\nTarget: {CONFIG['MAX_DAILY_PROFIT']:.2f} USDT{freeze_msg}")
 
             # Sleep for the configured interval
             time.sleep(CONFIG["DAILY_PNL_CHECK_INTERVAL"])
@@ -1261,6 +1462,7 @@ async def generate_and_send_report():
     """
     Fetches trade data, calculates analytics, generates a PnL chart,
     and sends the report via Telegram.
+    This function handles the core logic for the /report command.
     """
     def _generate_report_sync():
         conn = sqlite3.connect(CONFIG["DB_FILE"])
@@ -1342,6 +1544,66 @@ async def generate_and_send_report():
         log.exception("Error generating report")
         await asyncio.to_thread(send_telegram, f"An error occurred while generating the report: {e}")
 
+def generate_adv_chart_sync(symbol: str):
+    try:
+        df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], limit=200)
+        if df.empty:
+            return "Could not fetch k-line data for " + symbol, None
+
+        df['kama'] = kama(df['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
+
+        conn = sqlite3.connect(CONFIG["DB_FILE"])
+        trades_df = pd.read_sql_query(f"SELECT * FROM trades WHERE symbol = '{symbol}' AND close_time IS NOT NULL", conn)
+        conn.close()
+
+        addplots = []
+        if not trades_df.empty:
+            trades_df['open_time'] = pd.to_datetime(trades_df['open_time'])
+            trades_df['close_time'] = pd.to_datetime(trades_df['close_time'])
+            
+            buy_entries = trades_df[trades_df['side'] == 'BUY']['open_time']
+            sell_entries = trades_df[trades_df['side'] == 'SELL']['open_time']
+            exits = trades_df['close_time']
+
+            # Create a dataframe with the same index as the main df for plotting
+            plot_buy_entries = pd.Series(np.nan, index=df.index)
+            plot_sell_entries = pd.Series(np.nan, index=df.index)
+            plot_exits = pd.Series(np.nan, index=df.index)
+
+            plot_buy_entries.loc[buy_entries] = df['low'].loc[buy_entries] * 0.98
+            plot_sell_entries.loc[sell_entries] = df['high'].loc[sell_entries] * 1.02
+            plot_exits.loc[exits] = df['close'].loc[exits]
+
+            addplots.append(mpf.make_addplot(plot_buy_entries, type='scatter', marker='^', color='g', markersize=100))
+            addplots.append(mpf.make_addplot(plot_sell_entries, type='scatter', marker='v', color='r', markersize=100))
+            addplots.append(mpf.make_addplot(plot_exits, type='scatter', marker='x', color='blue', markersize=100))
+
+        kama_plot = mpf.make_addplot(df['kama'], color='purple', width=0.7)
+        addplots.insert(0, kama_plot)
+        
+        fig, axes = mpf.plot(
+            df,
+            type='candle',
+            style='yahoo',
+            title=f'{symbol} Chart with KAMA and Trades',
+            ylabel='Price (USDT)',
+            addplot=addplots,
+            returnfig=True,
+            figsize=(15, 8),
+            volume=True,
+            panel_ratios=(3, 1)
+        )
+        
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        
+        return f"Chart for {symbol}", buf.getvalue()
+
+    except Exception as e:
+        log.exception(f"Failed to generate advanced chart for {symbol}")
+        return f"Error generating chart for {symbol}: {e}", None
+
 async def get_managed_trades_snapshot():
     async with managed_trades_lock:
         return dict(managed_trades)
@@ -1355,9 +1617,64 @@ def build_control_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+def handle_callback_query_sync(update, loop):
+    query = update.callback_query
+    try:
+        query.answer()
+        data = query.data
+        log.info(f"Received callback query: {data}")
+
+        parts = data.split('_')
+        action, percent_str, trade_id = parts[0], parts[1], "_".join(parts[2:])
+        
+        percent = int(percent_str)
+
+        async def _task():
+            trades = await get_managed_trades_snapshot()
+            if trade_id not in trades:
+                await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found or already closed.")
+                return
+
+            trade = trades[trade_id]
+            symbol = trade['symbol']
+            side = trade['side']
+            initial_qty = trade['initial_qty']
+            
+            qty_to_close = initial_qty * (percent / 100.0)
+            qty_to_close = await asyncio.to_thread(round_qty, symbol, qty_to_close)
+
+            if qty_to_close <= 0:
+                await asyncio.to_thread(send_telegram, f"Calculated quantity to close for {trade_id} is zero. No action taken.")
+                return
+
+            try:
+                if percent == 100:
+                    # Closing 100% is a full close, let the monitor thread handle it by cancelling orders and closing position
+                    await asyncio.to_thread(cancel_close_orders_sync, symbol)
+                    pos = client.futures_position_information(symbol=symbol)[0]
+                    qty_to_close = float(pos['positionAmt'])
+                    await asyncio.to_thread(close_partial_market_position_sync, symbol, side, abs(qty_to_close))
+                    msg = f"✅ Closing 100% of {trade_id} ({symbol})."
+                else:
+                    await asyncio.to_thread(close_partial_market_position_sync, symbol, side, qty_to_close)
+                    msg = f"✅ Closing {percent}% of {trade_id} ({symbol})."
+                
+                await asyncio.to_thread(query.edit_message_text, text=f"{query.message.text}\n\nAction: {msg}")
+            except Exception as e:
+                log.exception(f"Failed to execute action for callback {data}")
+                await asyncio.to_thread(send_telegram, f"❌ Error processing action for {trade_id}: {e}")
+
+        asyncio.run_coroutine_threadsafe(_task(), loop)
+
+    except Exception as e:
+        log.exception("Error in handle_callback_query_sync")
+
 def handle_update_sync(update, loop):
     try:
         if update is None:
+            return
+        if update.callback_query:
+            handle_callback_query_sync(update, loop)
             return
         if getattr(update, 'message', None):
             msg = update.message
@@ -1413,17 +1730,40 @@ def handle_update_sync(update, loop):
             elif text.startswith("/listorders"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
-                try: trades = fut.result(timeout=5)
-                except Exception: pass
+                try:
+                    trades = fut.result(timeout=5)
+                except Exception:
+                    pass
                 if not trades:
                     send_telegram("No managed trades.")
                 else:
-                    out = "Open trades:\n"
-                    for k, v in trades.items():
+                    send_telegram("Open Trades:")
+                    for trade_id, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
-                        out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    send_telegram(out)
+                        
+                        text = (f"*{v['symbol']}* | {v['side']}\n"
+                                f"Qty: {v['qty']} | Entry: {v['entry_price']:.4f}\n"
+                                f"SL: {v['sl']:.4f} | TP: {v['tp']:.4f}\n"
+                                f"Unrealized PnL: {unreal_str} USDT\n"
+                                f"`{trade_id}`")
+                        
+                        keyboard = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("Close 50%", callback_data=f"close_50_{trade_id}"),
+                                InlineKeyboardButton("Close 100%", callback_data=f"close_100_{trade_id}")
+                            ]
+                        ])
+                        
+                        try:
+                            telegram_bot.send_message(
+                                chat_id=int(TELEGRAM_CHAT_ID),
+                                text=text,
+                                reply_markup=keyboard,
+                                parse_mode='Markdown'
+                            )
+                        except Exception as e:
+                            log.error(f"Failed to send /listorders message for {trade_id}: {e}")
             elif text.startswith("/showparams"):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
@@ -1460,6 +1800,7 @@ def handle_update_sync(update, loop):
                 for c in result["checks"]:
                     send_telegram(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             elif text.startswith("/report"):
+                # Handler for the /report command to generate and send the PnL report
                 send_telegram("Generating performance report, please wait...")
                 fut = asyncio.run_coroutine_threadsafe(generate_and_send_report(), loop)
                 try:
@@ -1467,6 +1808,73 @@ def handle_update_sync(update, loop):
                 except Exception as e:
                     log.error("Failed to execute /report action: %s", e)
                     send_telegram(f"Failed to generate report: {e}")
+            elif text.startswith("/chart"):
+                parts = text.split()
+                if len(parts) < 2:
+                    send_telegram("Usage: /chart <SYMBOL>")
+                else:
+                    symbol = parts[1].upper()
+                    send_telegram(f"Generating chart for {symbol}, please wait...")
+                    
+                    async def _task():
+                        title, chart_bytes = await asyncio.to_thread(generate_adv_chart_sync, symbol)
+                        await asyncio.to_thread(
+                            send_telegram,
+                            msg=title,
+                            document_content=chart_bytes,
+                            document_name=f"{symbol}_chart.png"
+                        )
+                    
+                    fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                    try:
+                        fut.result(timeout=60)
+                    except Exception as e:
+                        log.error(f"Failed to execute /chart action for {symbol}: {e}")
+                        send_telegram(f"Failed to generate chart for {symbol}: {e}")
+            elif text.startswith("/scalein"):
+                parts = text.split()
+                if len(parts) < 3:
+                    send_telegram("Usage: /scalein <trade_id> <risk_usd_to_add>")
+                else:
+                    trade_id, risk_to_add_str = parts[1], parts[2]
+                    try:
+                        risk_to_add = float(risk_to_add_str)
+                        
+                        async def _task():
+                            trades = await get_managed_trades_snapshot()
+                            if trade_id not in trades:
+                                await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found.")
+                                return
+                            
+                            trade = trades[trade_id]
+                            price_distance = abs(trade['entry_price'] - trade['sl'])
+                            if price_distance <= 0:
+                                await asyncio.to_thread(send_telegram, f"Cannot scale in, price distance is zero.")
+                                return
+
+                            qty_to_add = risk_to_add / price_distance
+                            qty_to_add = await asyncio.to_thread(round_qty, trade['symbol'], qty_to_add)
+
+                            if qty_to_add > 0:
+                                await asyncio.to_thread(open_market_position_sync, trade['symbol'], trade['side'], qty_to_add, trade['leverage'])
+                                
+                                async with managed_trades_lock:
+                                    trade['qty'] += qty_to_add
+                                    trade['notional'] += qty_to_add * trade['entry_price'] # Approximate
+                                    trade['risk_usdt'] += risk_to_add
+                                    await asyncio.to_thread(add_managed_trade_to_db, trade)
+
+                                await asyncio.to_thread(send_telegram, f"✅ Scaled in {trade_id} by {qty_to_add} {trade['symbol']}.")
+                            else:
+                                await asyncio.to_thread(send_telegram, "Calculated quantity to add is zero.")
+
+                        fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                        fut.result(timeout=30)
+                    except ValueError:
+                        send_telegram("Invalid risk amount.")
+                    except Exception as e:
+                        log.exception(f"Failed to scale in {trade_id}")
+                        send_telegram(f"❌ Error scaling in {trade_id}: {e}")
             else:
                 send_telegram("Unknown command. Use /status to see the keyboard.")
     except Exception:
