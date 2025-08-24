@@ -34,7 +34,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 import telegram
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import ReplyKeyboardMarkup, KeyboardButton
 
 from dotenv import load_dotenv
 
@@ -877,11 +877,12 @@ async def get_managed_trades_snapshot():
 
 def build_control_keyboard():
     buttons = [
-        [InlineKeyboardButton("Start", callback_data="start") , InlineKeyboardButton("Stop", callback_data="stop")],
-        [InlineKeyboardButton("Freeze", callback_data="freeze"), InlineKeyboardButton("Unfreeze", callback_data="unfreeze")],
-        [InlineKeyboardButton("List Orders", callback_data="listorders"), InlineKeyboardButton("Params", callback_data="showparams")]
+        [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
+        [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
+        [KeyboardButton("/listorders"), KeyboardButton("/showparams")],
+        [KeyboardButton("/status")]
     ]
-    return InlineKeyboardMarkup(buttons)
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def handle_update_sync(update, loop):
     try:
@@ -975,54 +976,7 @@ def handle_update_sync(update, loop):
                 for c in result["checks"]:
                     send_telegram_sync(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             else:
-                send_telegram_sync("Unknown command. Use /status or buttons.")
-        elif getattr(update, 'callback_query', None):
-            cq = update.callback_query
-            data = cq.data
-            try:
-                coro = telegram_bot.answer_callback_query(callback_query_id=cq.id, text=f"Action: {data}")
-                asyncio.run_coroutine_threadsafe(coro, loop)
-            except Exception:
-                log.exception("Failed to schedule answer_callback_query")
-            if data == "start":
-                fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute 'start' callback action: %s", e)
-                send_telegram_sync("Bot state -> RUNNING")
-            elif data == "stop":
-                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute 'stop' callback action: %s", e)
-                send_telegram_sync("Bot state -> STOPPED")
-            elif data == "freeze":
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute 'freeze' callback action: %s", e)
-                send_telegram_sync("Bot -> FROZEN")
-            elif data == "unfreeze":
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute 'unfreeze' callback action: %s", e)
-                send_telegram_sync("Bot -> UNFROZEN")
-            elif data == "listorders":
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
-                trades = {}
-                try: trades = fut.result(timeout=5)
-                except Exception as e: log.error("Failed to get managed trades for 'listorders' callback: %s", e)
-                if not trades:
-                    send_telegram_sync("No managed trades.")
-                else:
-                    out = "Open trades:\n"
-                    for k, v in trades.items():
-                        unreal = v.get('unreal')
-                        unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
-                        out += f"{k} {v['symbol']} {v['side']} entry={v['entry_price']:.4f} qty={v['qty']} sl={v['sl']:.4f} tp={v['tp']:.4f} unreal={unreal_str}\n"
-                    send_telegram_sync(out)
-            elif data == "showparams":
-                out = "Current runtime params:\n"
-                for k,v in CONFIG.items():
-                    out += f"{k} = {v}\n"
-                send_telegram_sync(out)
+                send_telegram_sync("Unknown command. Use /status to see the keyboard.")
     except Exception:
         log.exception("Error in handle_update_sync")
 
