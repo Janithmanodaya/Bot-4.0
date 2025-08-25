@@ -103,10 +103,10 @@ CONFIG = {
     "CHOPPY_RISK_MULT": float(os.getenv("CHOPPY_RISK_MULT", "0.5")),
 
     "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
-    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "25.0")),
+    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "30.0")),
 
     "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
-    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "65.0")),
+    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "60.0")),
 
     "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
     "BB_STD": float(os.getenv("BB_STD", "2.0")),
@@ -721,7 +721,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
 
     try:
         log.info(f"Placing batch order for {symbol}: {order_batch}")
-        batch_response = client.futures_create_batch_order(batchOrders=order_batch)
+        batch_response = client.futures_place_batch_order(batchOrders=order_batch)
 
         errors = [resp for resp in batch_response if 'code' in resp]
         successful_orders = [resp for resp in batch_response if 'orderId' in resp]
@@ -807,7 +807,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
 
     try:
         log.info(f"Placing batch SL/TP order for {symbol}: {order_batch}")
-        return client.futures_create_batch_order(batchOrders=order_batch)
+        return client.futures_place_batch_order(batchOrders=order_batch)
     except BinanceAPIException as e:
         log.exception("BinanceAPIException placing batch SL/TP: %s", e)
         raise
