@@ -183,6 +183,8 @@ pnl_monitor_thread_obj: Optional[threading.Thread] = None
 monitor_stop_event = threading.Event()
 
 scan_task: Optional[asyncio.Task] = None
+rogue_check_task: Optional[asyncio.Task] = None
+notified_rogue_symbols: set[str] = set()
 
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
@@ -296,6 +298,126 @@ async def reconcile_open_trades():
     
     log.info(f"--- Reconciliation Complete. {len(managed_trades)} trades are now being managed. ---")
 
+
+async def check_and_import_rogue_trades():
+    """
+    Periodically checks for and imports "rogue" positions that exist on the
+    exchange but are not managed by the bot.
+    """
+    global managed_trades, notified_rogue_symbols
+    log.info("Checking for rogue positions...")
+
+    try:
+        if client is None:
+            log.warning("Binance client not initialized. Cannot check for rogue trades.")
+            return
+
+        # Get all open positions from the exchange
+        positions = await asyncio.to_thread(client.futures_position_information)
+        open_positions = {
+            pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0.0)) != 0.0
+        }
+
+        # Get symbols of trades currently managed by the bot
+        async with managed_trades_lock:
+            managed_symbols = {t['symbol'] for t in managed_trades.values()}
+        
+        # Determine which open positions are "rogue"
+        rogue_symbols = set(open_positions.keys()) - managed_symbols
+
+        if not rogue_symbols:
+            log.info("No rogue positions found.")
+            return
+
+        for symbol in rogue_symbols:
+            if symbol in notified_rogue_symbols:
+                log.debug(f"Ignoring already notified rogue symbol: {symbol}")
+                continue
+
+            log.info(f"❗️ New rogue position for {symbol} detected. Attempting to import...")
+            # Mark as notified BEFORE attempting import to prevent spam on repeated failures.
+            notified_rogue_symbols.add(symbol)
+            position = open_positions[symbol]
+
+            try:
+                # This is the same import logic from reconcile_open_trades
+                entry_price = float(position['entryPrice'])
+                qty = abs(float(position['positionAmt']))
+                side = 'BUY' if float(position['positionAmt']) > 0 else 'SELL'
+                leverage = int(position.get('leverage', CONFIG.get("MAX_BOT_LEVERAGE", 20)))
+                notional = qty * entry_price
+
+                df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
+                atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
+                sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
+                
+                stop_price = entry_price - sl_distance if side == 'BUY' else entry_price + sl_distance
+                take_price = entry_price + sl_distance if side == 'BUY' else entry_price - sl_distance
+
+                trade_id = f"{symbol}_imported_{int(time.time())}"
+                meta = {
+                    "id": trade_id, "symbol": symbol, "side": side, "entry_price": entry_price,
+                    "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
+                    "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
+                    "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
+                    "dyn_sltp": CONFIG["DYN_SLTP_ENABLED"], "tp1": None, "tp2": None, "tp3": None,
+                    "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0
+                }
+
+                # Cancel any existing SL/TP orders for this symbol before placing new ones
+                await asyncio.to_thread(cancel_close_orders_sync, symbol)
+                
+                # Place the new SL/TP orders
+                await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=take_price, qty=qty)
+                
+                # Add to managed trades and save to DB
+                async with managed_trades_lock:
+                    managed_trades[trade_id] = meta
+                await asyncio.to_thread(add_managed_trade_to_db, meta)
+
+                msg = (f"ℹ️ **Position Auto-Imported**\n\n"
+                       f"Found and imported a rogue position for **{symbol}**.\n\n"
+                       f"**Side:** {side}\n"
+                       f"**Entry Price:** {entry_price}\n"
+                       f"**Quantity:** {qty}\n\n"
+                       f"A default SL/TP has been calculated and placed:\n"
+                       f"**SL:** `{round_price(symbol, stop_price)}`\n"
+                       f"**TP:** `{round_price(symbol, take_price)}`\n\n"
+                       f"The bot will now manage this trade.")
+                await asyncio.to_thread(send_telegram, msg)
+
+            except Exception as e:
+                await asyncio.to_thread(log_and_send_error, f"Failed to import rogue position for {symbol}. Please manage it manually.", e)
+    
+    except Exception as e:
+        log.exception("An unhandled exception occurred in check_and_import_rogue_trades.")
+
+
+async def periodic_rogue_check_loop():
+    """
+    A background task that runs periodically to check for and import rogue trades.
+    """
+    log.info("Starting periodic rogue position checker loop.")
+    while True:
+        try:
+            # Wait for 1 hour before the next check
+            await asyncio.sleep(3600)
+
+            if not running:
+                log.debug("Bot is not running, skipping hourly rogue position check.")
+                continue
+            
+            await check_and_import_rogue_trades()
+
+        except asyncio.CancelledError:
+            log.info("Periodic rogue position checker loop cancelled.")
+            break
+        except Exception as e:
+            log.exception("An unhandled error occurred in the periodic rogue check loop.")
+            # Wait a bit before retrying to avoid spamming errors
+            await asyncio.sleep(60)
+
+
 # -------------------------
 # App Lifespan Manager
 # -------------------------
@@ -351,6 +473,13 @@ async def lifespan(app: FastAPI):
             await scan_task
         except asyncio.CancelledError:
             log.info("Scanning loop task cancelled successfully.")
+
+    if rogue_check_task:
+        rogue_check_task.cancel()
+        try:
+            await rogue_check_task
+        except asyncio.CancelledError:
+            log.info("Rogue position checker task cancelled successfully.")
 
     monitor_stop_event.set()
     if monitor_thread_obj and monitor_thread_obj.is_alive():
@@ -2099,11 +2228,45 @@ def handle_update_sync(update, loop):
                     try: fut.result(timeout=5)
                     except Exception as e: log.error("Failed to execute /startbot action: %s", e)
                     send_telegram("Bot state -> RUNNING")
+                    
+                    # Start the periodic rogue position checker
+                    async def start_rogue_checker():
+                        global rogue_check_task
+                        if rogue_check_task and not rogue_check_task.done():
+                            log.info("Rogue position checker task is already running.")
+                            send_telegram("Rogue position checker is already active.")
+                            return
+                        
+                        log.info("Performing initial check for rogue positions...")
+                        send_telegram("Performing initial check for rogue positions...")
+                        await check_and_import_rogue_trades()
+                        
+                        log.info("Starting hourly rogue position checker...")
+                        rogue_check_task = asyncio.create_task(periodic_rogue_check_loop())
+                        send_telegram("Hourly rogue position checker started.")
+
+                    asyncio.run_coroutine_threadsafe(start_rogue_checker(), loop)
             elif text.startswith("/stopbot"):
                 fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /stopbot action: %s", e)
                 send_telegram("Bot state -> STOPPED")
+
+                # Stop the periodic rogue position checker
+                async def stop_rogue_checker():
+                    global rogue_check_task
+                    if rogue_check_task and not rogue_check_task.done():
+                        rogue_check_task.cancel()
+                        try:
+                            await rogue_check_task
+                        except asyncio.CancelledError:
+                            log.info("Rogue position checker task cancelled successfully.")
+                        rogue_check_task = None
+                        send_telegram("Hourly rogue position checker stopped.")
+                    else:
+                        send_telegram("Hourly rogue position checker was not running.")
+
+                asyncio.run_coroutine_threadsafe(stop_rogue_checker(), loop)
             elif text.startswith("/freeze"):
                 fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
                 try: fut.result(timeout=5)
