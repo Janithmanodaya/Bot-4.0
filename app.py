@@ -923,31 +923,41 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
     close_side = 'SELL' if side == 'BUY' else 'BUY'
 
-    order_batch = [
-        {
-            'symbol': symbol,
-            'side': side,
-            'type': 'MARKET',
-            'quantity': str(qty),
-            'positionSide': position_side
-        },
-        {
-            'symbol': symbol,
-            'side': close_side,
-            'type': 'STOP_MARKET',
-            'stopPrice': round_price(symbol, stop_price),
-            'quantity': str(qty),
-            'positionSide': position_side,
-        },
-        {
-            'symbol': symbol,
-            'side': close_side,
-            'type': 'TAKE_PROFIT_MARKET',
-            'stopPrice': round_price(symbol, take_price),
-            'quantity': str(qty),
-            'positionSide': position_side,
-        }
-    ]
+    market_order_params = {
+        'symbol': symbol,
+        'side': side,
+        'type': 'MARKET',
+        'quantity': str(qty),
+    }
+    close_order_params = {
+        'symbol': symbol,
+        'side': close_side,
+        'quantity': str(qty),
+    }
+
+    if CONFIG["HEDGING_ENABLED"]:
+        market_order_params['positionSide'] = position_side
+        close_order_params['positionSide'] = position_side
+    else:
+        # In one-way mode, closing orders must be reduceOnly. Entry order must not.
+        close_order_params['reduceOnly'] = 'true'
+
+    # Build the full order batch
+    order_batch = [market_order_params]
+    
+    sl_order = close_order_params.copy()
+    sl_order.update({
+        'type': 'STOP_MARKET',
+        'stopPrice': round_price(symbol, stop_price),
+    })
+    order_batch.append(sl_order)
+    
+    tp_order = close_order_params.copy()
+    tp_order.update({
+        'type': 'TAKE_PROFIT_MARKET',
+        'stopPrice': round_price(symbol, take_price),
+    })
+    order_batch.append(tp_order)
 
     try:
         log.info(f"Placing batch order for {symbol}: {order_batch}")
@@ -1030,19 +1040,32 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
     
+    base_close_order = {
+        'symbol': symbol,
+        'side': close_side,
+        'quantity': str(current_qty),
+    }
+
+    if CONFIG["HEDGING_ENABLED"]:
+        base_close_order['positionSide'] = position_side
+    else:
+        base_close_order['reduceOnly'] = 'true'
+
     if sl_price:
-        order_batch.append({
-            'symbol': symbol, 'side': close_side, 'type': 'STOP_MARKET',
+        sl_order = base_close_order.copy()
+        sl_order.update({
+            'type': 'STOP_MARKET',
             'stopPrice': round_price(symbol, sl_price),
-            'quantity': str(current_qty), 'reduceOnly': 'true', 'positionSide': position_side,
         })
+        order_batch.append(sl_order)
     
     if tp_price:
-        order_batch.append({
-            'symbol': symbol, 'side': close_side, 'type': 'TAKE_PROFIT_MARKET',
+        tp_order = base_close_order.copy()
+        tp_order.update({
+            'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': round_price(symbol, tp_price),
-            'quantity': str(current_qty), 'reduceOnly': 'true', 'positionSide': position_side,
         })
+        order_batch.append(tp_order)
 
     if not order_batch:
         # This is a critical logic error if this function is called without any action to take.
@@ -1081,14 +1104,20 @@ def close_partial_market_position_sync(symbol: str, side: str, qty_to_close: flo
         position_side = 'LONG' if side == 'BUY' else 'SHORT'
 
         log.info(f"Placing partial close market order: {close_side} ({position_side}) {qty_to_close} {symbol}")
-        order = client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type='MARKET',
-            quantity=qty_to_close,
-            positionSide=position_side,
-            reduceOnly=True
-        )
+        
+        order_params = {
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'MARKET',
+            'quantity': qty_to_close,
+        }
+
+        if CONFIG["HEDGING_ENABLED"]:
+            order_params['positionSide'] = position_side
+        else:
+            order_params['reduceOnly'] = True
+
+        order = client.futures_create_order(**order_params)
         return order
     except BinanceAPIException as e:
         log.exception("BinanceAPIException closing partial position: %s", e)
