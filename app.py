@@ -142,6 +142,10 @@ daily_loss_limit_hit = False
 daily_profit_limit_hit = False
 current_daily_pnl = 0.0
 
+# Session freeze state
+session_freeze_active = False
+notified_frozen_session: Optional[str] = None
+
 # DualLock for cross-thread (thread + async) coordination
 class DualLock:
     def __init__(self):
@@ -375,6 +379,31 @@ def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
         return text
     return text[: max_len - 200] + "\n\n[...] (truncated)\n\n" + text[-200:]
 
+
+def format_timedelta(td) -> str:
+    """Formats a timedelta object into a human-readable string."""
+    from datetime import timedelta
+    if not isinstance(td, timedelta) or td.total_seconds() < 0:
+        return "N/A"
+
+    seconds = int(td.total_seconds())
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days} day" + ("s" if days != 1 else ""))
+    if hours > 0:
+        parts.append(f"{hours} hour" + ("s" if hours != 1 else ""))
+    if minutes > 0:
+        parts.append(f"{minutes} minute" + ("s" if minutes != 1 else ""))
+    if seconds > 0 or not parts:
+        parts.append(f"{seconds} second" + ("s" if seconds != 1 else ""))
+
+    return ", ".join(parts)
+
+
 def get_public_ip() -> str:
     try:
         return requests.get("https://api.ipify.org", timeout=5).text
@@ -446,6 +475,101 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     
     # Send the message, using Markdown for formatting
     send_telegram(telegram_msg, parse_mode='Markdown')
+
+
+SESSION_FREEZE_WINDOWS = {
+    "London": (7, 9),
+    "New York": (12, 14),
+    "Asia (Sydney)": (21, 23),
+    "Tokyo": (23, 1)  # Crosses midnight
+}
+
+
+def get_merged_freeze_intervals() -> list[tuple[datetime, datetime, str]]:
+    """
+    Calculates and merges all freeze windows for the current and next day.
+    This handles overlaps and contiguous sessions, returning a clean list of
+    absolute (start_datetime, end_datetime, session_name) intervals.
+    """
+    from datetime import timedelta
+
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
+    tomorrow = today + timedelta(days=1)
+    day_after = today + timedelta(days=2)
+
+    intervals = []
+    # Get all intervals for today and tomorrow
+    for name, (start_hour, end_hour) in SESSION_FREEZE_WINDOWS.items():
+        if start_hour < end_hour:  # Same day window
+            # Today's window
+            intervals.append((
+                datetime(today.year, today.month, today.day, start_hour, 0, tzinfo=timezone.utc),
+                datetime(today.year, today.month, today.day, end_hour, 0, tzinfo=timezone.utc),
+                name
+            ))
+            # Tomorrow's window
+            intervals.append((
+                datetime(tomorrow.year, tomorrow.month, tomorrow.day, start_hour, 0, tzinfo=timezone.utc),
+                datetime(tomorrow.year, tomorrow.month, tomorrow.day, end_hour, 0, tzinfo=timezone.utc),
+                name
+            ))
+        else:  # Overnight window
+            # Today into Tomorrow
+            intervals.append((
+                datetime(today.year, today.month, today.day, start_hour, 0, tzinfo=timezone.utc),
+                datetime(tomorrow.year, tomorrow.month, tomorrow.day, end_hour, 0, tzinfo=timezone.utc),
+                name
+            ))
+            # Tomorrow into Day After
+            intervals.append((
+                datetime(tomorrow.year, tomorrow.month, tomorrow.day, start_hour, 0, tzinfo=timezone.utc),
+                datetime(day_after.year, day_after.month, day_after.day, end_hour, 0, tzinfo=timezone.utc),
+                name
+            ))
+
+    # Sort intervals by start time
+    intervals.sort(key=lambda x: x[0])
+
+    if not intervals:
+        return []
+
+    # Merge overlapping intervals
+    merged = []
+    current_start, current_end, current_names = intervals[0]
+    current_names = {current_names}
+
+    for next_start, next_end, next_name in intervals[1:]:
+        if next_start <= current_end:
+            # Overlap or contiguous, merge them
+            current_end = max(current_end, next_end)
+            current_names.add(next_name)
+        else:
+            # No overlap, finish the current merged interval
+            merged.append((current_start, current_end, " & ".join(sorted(list(current_names)))))
+            # Start a new one
+            current_start, current_end, current_names = next_start, next_end, {next_name}
+
+    # Add the last merged interval
+    merged.append((current_start, current_end, " & ".join(sorted(list(current_names)))))
+    
+    # Filter out intervals that have already completely passed
+    final_intervals = [m for m in merged if now_utc < m[1]]
+
+    return final_intervals
+
+
+def get_session_freeze_status(now: datetime) -> (bool, Optional[str]):
+    """
+    Checks if the current time is within a session freeze window using the merged intervals.
+    Returns a tuple of (is_frozen, session_name).
+    """
+    merged_intervals = get_merged_freeze_intervals()
+    for start, end, name in merged_intervals:
+        if start <= now < end:
+            return True, name
+    return False, None
+
 
 # (The rest of the file from DB Helpers to the end remains the same, except for removing the old startup/shutdown events)
 # ... I will paste the full code below ...
@@ -1634,11 +1758,44 @@ def daily_pnl_monitor_thread_func():
     log.info("Daily PnL monitor thread exiting.")
 
 
+async def manage_session_freeze_state():
+    """
+    Checks session freeze status and sends notifications on state changes.
+    Returns True if the bot should be frozen, False otherwise.
+    """
+    global session_freeze_active, notified_frozen_session
+
+    now_utc = datetime.now(timezone.utc)
+    is_frozen, session_name = get_session_freeze_status(now_utc)
+
+    if is_frozen:
+        if not session_freeze_active or notified_frozen_session != session_name:
+            log.info(f"Entering freeze period for {session_name} session. Bot will not open new trades.")
+            await asyncio.to_thread(send_telegram, f"⚠️ Session Change: {session_name}\\nThe bot is now frozen for 2 hours and will not open new trades. Existing trades are still monitored.")
+            session_freeze_active = True
+            notified_frozen_session = session_name
+        return True # Is frozen
+    else:
+        if session_freeze_active:
+            log.info("Exiting session freeze period. Bot is now active for new trades.")
+            await asyncio.to_thread(send_telegram, f"✅ Session freeze for {notified_frozen_session} has ended. The bot is now active again.")
+            session_freeze_active = False
+            notified_frozen_session = None
+        return False # Is not frozen
+
+
 async def scanning_loop():
     while True:
         try:
             if not running:
                 await asyncio.sleep(2)
+                continue
+
+            # Check for session freeze
+            if await manage_session_freeze_state():
+                log.info("Scan cycle skipped due to session freeze.")
+                cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
+                await asyncio.sleep(cooldown_seconds)
                 continue
 
             log.info("Starting concurrent symbol scan...")
@@ -1816,8 +1973,8 @@ def build_control_keyboard():
     buttons = [
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
         [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
-        [KeyboardButton("/listorders"), KeyboardButton("/showparams")],
-        [KeyboardButton("/status")]
+        [KeyboardButton("/listorders"), KeyboardButton("/sessions")],
+        [KeyboardButton("/status"), KeyboardButton("/showparams")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -1968,6 +2125,28 @@ def handle_update_sync(update, loop):
                             )
                         except Exception as e:
                             log.error(f"Failed to send /listorders message for {trade_id}: {e}")
+
+            elif text.startswith("/sessions"):
+                send_telegram("Checking session status...")
+                now_utc = datetime.now(timezone.utc)
+                merged_intervals = get_merged_freeze_intervals()
+                
+                in_freeze = False
+                for start, end, name in merged_intervals:
+                    if start <= now_utc < end:
+                        time_left = end - now_utc
+                        send_telegram(f"❄️ Bot is FROZEN for {name}.\n\nTime until unfreeze: {format_timedelta(time_left)}")
+                        in_freeze = True
+                        break
+                
+                if not in_freeze:
+                    if merged_intervals:
+                        next_start, _, next_name = merged_intervals[0]
+                        time_to_next = next_start - now_utc
+                        send_telegram(f"✅ Bot is ACTIVE.\n\nNext freeze for {next_name} in: {format_timedelta(time_to_next)}")
+                    else:
+                        send_telegram("✅ Bot is ACTIVE.\n\nNo session freezes are scheduled in the next 48 hours.")
+            
             elif text.startswith("/showparams"):
                 out = "Current runtime params:\n"
                 for k,v in CONFIG.items():
