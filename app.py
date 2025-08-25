@@ -1161,16 +1161,24 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
         log.exception("Exception placing batch order: %s", e)
         raise
 
-def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = None, tp_price: Optional[float] = None, qty: Optional[float] = None):
+def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = None, tp_price: Optional[float] = None, qty: Optional[float] = None) -> Dict[str, Any]:
     """
     Places SL and/or TP orders in a single batch request.
     If qty is not provided, it will be fetched from the current position.
+    Returns a dictionary with the structured order responses.
     """
     global client, IS_HEDGE_MODE
     if CONFIG["DRY_RUN"]:
         if sl_price: log.info(f"[DRY RUN] Would place SL at {sl_price:.4f} for {symbol}.")
         if tp_price: log.info(f"[DRY RUN] Would place TP at {tp_price:.4f} for {symbol}.")
-        return [{"status": "NEW"}]
+        
+        dry_run_id = int(time.time())
+        processed_orders = {}
+        if sl_price:
+            processed_orders['stop_order'] = {"orderId": f"dryrun_sl_{dry_run_id}", "status": "NEW", "type": "STOP_MARKET"}
+        if tp_price:
+            processed_orders['tp_order'] = {"orderId": f"dryrun_tp_{dry_run_id}", "status": "NEW", "type": "TAKE_PROFIT_MARKET"}
+        return processed_orders
 
     if client is None:
         raise RuntimeError("Binance client not initialized")
@@ -1248,7 +1256,16 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             raise RuntimeError(f"Batch SL/TP order placement failed for {symbol}. Errors: {errors}")
             
         log.info(f"Batch SL/TP order successful for {symbol}. Response: {batch_response}")
-        return batch_response
+        
+        # Process the successful response into a structured dictionary
+        processed_orders = {}
+        for order_resp in batch_response:
+            if order_resp.get('type') == 'STOP_MARKET':
+                processed_orders['stop_order'] = order_resp
+            elif order_resp.get('type') == 'TAKE_PROFIT_MARKET':
+                processed_orders['tp_order'] = order_resp
+        
+        return processed_orders
     except BinanceAPIException as e:
         log.exception("BinanceAPIException placing batch SL/TP: %s", e)
         raise
@@ -1291,6 +1308,68 @@ def close_partial_market_position_sync(symbol: str, side: str, qty_to_close: flo
     except Exception as e:
         log.exception("Exception closing partial position: %s", e)
         raise
+
+def cancel_trade_sltp_orders_sync(trade_meta: Dict[str, Any]):
+    """
+    Cancels the specific SL/TP orders associated with a single trade by using stored order IDs.
+    """
+    global client
+    if CONFIG["DRY_RUN"]:
+        log.info(f"[DRY RUN] Would cancel SL/TP orders for trade {trade_meta.get('id')}.")
+        return
+
+    if client is None:
+        log.warning("Cannot cancel orders, Binance client not initialized.")
+        return
+
+    symbol = trade_meta.get('symbol')
+    if not symbol:
+        log.error(f"Cannot cancel orders for trade {trade_meta.get('id')}, symbol is missing.")
+        return
+
+    order_ids_to_cancel = []
+    sltp_orders = trade_meta.get('sltp_orders', {})
+
+    orders_to_parse = []
+    if isinstance(sltp_orders, list):
+        orders_to_parse.extend(sltp_orders)
+    elif isinstance(sltp_orders, dict):
+        # Handle the nested structure from initial trade opening, which may contain order details
+        if 'stop_order' in sltp_orders: orders_to_parse.append(sltp_orders['stop_order'])
+        if 'tp_order' in sltp_orders: orders_to_parse.append(sltp_orders['tp_order'])
+    
+    for order in orders_to_parse:
+        if isinstance(order, dict):
+            order_id = order.get('orderId')
+            # It's safest to only try to cancel orders that are in a pending state
+            if order_id and order.get('status') in ['NEW', 'PARTIALLY_FILLED']:
+                order_ids_to_cancel.append(order_id)
+
+    # Remove duplicates
+    order_ids_to_cancel = list(set(order_ids_to_cancel))
+
+    if not order_ids_to_cancel:
+        log.info(f"No valid, pending SL/TP order IDs found for trade {trade_meta.get('id')}. Attempting broad cancel for symbol as a fallback.")
+        # Fallback to general cancel for safety during transition
+        cancel_close_orders_sync(symbol)
+        return
+
+    try:
+        log.info(f"Cancelling {len(order_ids_to_cancel)} specific orders for trade {trade_meta.get('id')} on {symbol}.")
+        str_order_ids = [str(oid) for oid in order_ids_to_cancel]
+        client.futures_cancel_batch_order(symbol=symbol, orderIdList=str_order_ids)
+        
+        time.sleep(0.5)
+        log.info(f"Cancellation request sent for trade {trade_meta.get('id')}.")
+
+    except BinanceAPIException as e:
+        if e.code == -2011:
+            log.warning(f"Some orders for trade {trade_meta.get('id')} could not be cancelled (may already be filled/cancelled): {e}")
+        else:
+            log.exception(f"Error batch canceling orders for trade {trade_meta.get('id')}: {e}")
+    except Exception as e:
+        log.exception(f"Generic error batch canceling orders for trade {trade_meta.get('id')}: {e}")
+
 
 def cancel_close_orders_sync(symbol: str):
     global client
@@ -1754,8 +1833,8 @@ def monitor_thread_func():
                         if (side == 'BUY' and current_price_be >= profit_target_price and entry_price > meta['sl']) or \
                            (side == 'SELL' and current_price_be <= profit_target_price and entry_price < meta['sl']):
                             
-                            cancel_close_orders_sync(sym)
-                            place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
+                            cancel_trade_sltp_orders_sync(meta)
+                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
                             moved_to_be = True
 
                         if moved_to_be:
@@ -1765,6 +1844,7 @@ def monitor_thread_func():
                                 if tid in managed_trades:
                                     managed_trades[tid]['sl'] = entry_price
                                     managed_trades[tid]['be_moved'] = True
+                                    managed_trades[tid]['sltp_orders'] = new_orders
                                     add_managed_trade_to_db(managed_trades[tid])
                                 
                             send_telegram(f"🔒 SL moved to breakeven for Trade ID: {tid}")
@@ -1791,15 +1871,16 @@ def monitor_thread_func():
                                     close_partial_market_position_sync(sym, meta['side'], qty_to_close)
                                 
                                 new_qty = meta['qty'] - qty_to_close
-                                cancel_close_orders_sync(sym)
+                                cancel_trade_sltp_orders_sync(meta)
                                 new_sl = meta['entry_price']
-                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp3'])
+                                new_orders = place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp3'])
                                 
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid]['trade_phase'] = 1
                                         managed_trades[tid]['qty'] = new_qty
                                         managed_trades[tid]['sl'] = new_sl
+                                        managed_trades[tid]['sltp_orders'] = new_orders
                                         add_managed_trade_to_db(managed_trades[tid])
                                 send_telegram(f"✅ TP1 hit for {tid} ({sym}). Closed {CONFIG['TP1_CLOSE_PCT']*100}%. SL moved to breakeven.")
                                 continue
@@ -1817,15 +1898,16 @@ def monitor_thread_func():
                                     close_partial_market_position_sync(sym, meta['side'], qty_to_close)
                                 
                                 new_qty = meta['qty'] - qty_to_close
-                                cancel_close_orders_sync(sym)
+                                cancel_trade_sltp_orders_sync(meta)
                                 new_sl = meta['tp1']
-                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl)
+                                new_orders = place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl)
 
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid]['trade_phase'] = 2
                                         managed_trades[tid]['qty'] = new_qty
                                         managed_trades[tid]['sl'] = new_sl
+                                        managed_trades[tid]['sltp_orders'] = new_orders
                                         add_managed_trade_to_db(managed_trades[tid])
                                 send_telegram(f"✅ TP2 hit for {tid} ({sym}). Closed {CONFIG['TP2_CLOSE_PCT']*100}%. SL moved to TP1. Trailing stop is active.")
                                 continue
@@ -1833,25 +1915,26 @@ def monitor_thread_func():
                         log_and_send_error(f"Failed to process Dynamic SL/TP logic for {tid}", e)
 
                 # Trailing SL logic
-                if meta.get('trailing'):
+                if meta.get('trailing') and not meta.get('be_moved'):
                     try:
                         df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
                         atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
                         current_price = df['close'].iloc[-1]
                         moved = False
                         new_sl = None
+                        new_orders = None
 
                         if meta['side'] == 'BUY' and current_price > meta['entry_price'] + 1.0 * atr_now:
                             new_sl = meta['entry_price'] + 0.5 * atr_now
                             if new_sl > meta['sl'] and new_sl < current_price:
-                                cancel_close_orders_sync(sym)
-                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
+                                cancel_trade_sltp_orders_sync(meta)
+                                new_orders = place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
                                 moved = True
                         elif meta['side'] == 'SELL' and current_price < meta['entry_price'] - 1.0 * atr_now:
                             new_sl = meta['entry_price'] - 0.5 * atr_now
                             if new_sl < meta['sl'] and new_sl > current_price:
-                                cancel_close_orders_sync(sym)
-                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
+                                cancel_trade_sltp_orders_sync(meta)
+                                new_orders = place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
                                 moved = True
                         
                         if moved and new_sl is not None:
@@ -1859,6 +1942,8 @@ def monitor_thread_func():
                                 if tid in managed_trades:
                                     managed_trades[tid]['sl'] = new_sl
                                     managed_trades[tid]['sltp_last_updated'] = datetime.utcnow().isoformat()
+                                    if new_orders:
+                                        managed_trades[tid]['sltp_orders'] = new_orders
                                     add_managed_trade_to_db(managed_trades[tid])
                             meta['sl'] = new_sl
                             send_telegram(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
