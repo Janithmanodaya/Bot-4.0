@@ -569,7 +569,9 @@ def init_binance_client_sync():
         return False, "Missing BINANCE_API_KEY or BINANCE_API_SECRET"
 
     try:
-        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+        # Set a longer timeout for all requests to Binance
+        requests_params = {"timeout": 30}
+        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=requests_params)
         log.info("Binance client in MAINNET mode (forced).")
         try:
             client.ping()
