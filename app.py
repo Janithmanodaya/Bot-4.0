@@ -266,7 +266,7 @@ async def reconcile_open_trades():
                 await asyncio.to_thread(cancel_close_orders_sync, symbol)
                 
                 # Place the new SL/TP orders
-                await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, stop_price, take_price)
+                await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=take_price, qty=qty)
                 
                 msg = (f"ℹ️ **Position Imported**\n\n"
                        f"Found and imported a position for **{symbol}**.\n\n"
@@ -836,56 +836,51 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
         log.exception("Exception placing batch order: %s", e)
         raise
 
-def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = None, tp_price: Optional[float] = None):
+def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = None, tp_price: Optional[float] = None, qty: Optional[float] = None):
     """
     Places SL and/or TP orders in a single batch request.
+    If qty is not provided, it will be fetched from the current position.
     """
     global client
     if CONFIG["DRY_RUN"]:
         if sl_price: log.info(f"[DRY RUN] Would place SL at {sl_price:.4f} for {symbol}.")
         if tp_price: log.info(f"[DRY RUN] Would place TP at {tp_price:.4f} for {symbol}.")
-        return [{"status": "NEW"}] # Mock response
+        return [{"status": "NEW"}]
 
     if client is None:
         raise RuntimeError("Binance client not initialized")
 
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
     
-    # Fetch current position quantity
-    try:
-        positions = client.futures_position_information(symbol=symbol)
-        pos = next((p for p in positions if p.get('positionSide') == position_side), None)
-        if not pos or abs(float(pos.get('positionAmt', 0.0))) == 0.0:
-            log.warning(f"No open position found for {symbol} {position_side} when trying to place SL/TP.")
-            return []
-        qty = abs(float(pos.get('positionAmt')))
-    except Exception as e:
-        log.exception(f"Failed to fetch position info for {symbol} in place_batch_sl_tp_sync: {e}")
-        raise
+    if qty is None:
+        try:
+            positions = client.futures_position_information(symbol=symbol)
+            pos = next((p for p in positions if p.get('positionSide') == position_side), None)
+            if not pos or abs(float(pos.get('positionAmt', 0.0))) == 0.0:
+                # This is a critical failure, as the caller expects orders to be placed.
+                raise RuntimeError(f"No open position found for {symbol} {position_side} when trying to place SL/TP.")
+            current_qty = abs(float(pos.get('positionAmt')))
+        except Exception as e:
+            log.exception(f"Failed to fetch position info for {symbol} in place_batch_sl_tp_sync")
+            raise
+    else:
+        current_qty = qty
 
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
     
     if sl_price:
         order_batch.append({
-            'symbol': symbol,
-            'side': close_side,
-            'type': 'STOP_MARKET',
+            'symbol': symbol, 'side': close_side, 'type': 'STOP_MARKET',
             'stopPrice': round_price(symbol, sl_price),
-            'quantity': str(qty),
-            'reduceOnly': 'true',
-            'positionSide': position_side,
+            'quantity': str(current_qty), 'reduceOnly': 'true', 'positionSide': position_side,
         })
     
     if tp_price:
         order_batch.append({
-            'symbol': symbol,
-            'side': close_side,
-            'type': 'TAKE_PROFIT_MARKET',
+            'symbol': symbol, 'side': close_side, 'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': round_price(symbol, tp_price),
-            'quantity': str(qty),
-            'reduceOnly': 'true',
-            'positionSide': position_side,
+            'quantity': str(current_qty), 'reduceOnly': 'true', 'positionSide': position_side,
         })
 
     if not order_batch:
