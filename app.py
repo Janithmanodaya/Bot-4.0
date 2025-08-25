@@ -709,7 +709,6 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             'type': 'STOP_MARKET',
             'stopPrice': str(round(stop_price, 8)),
             'quantity': str(qty),
-            'reduceOnly': 'true',
             'positionSide': position_side,
         },
         {
@@ -718,7 +717,6 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': str(round(take_price, 8)),
             'quantity': str(qty),
-            'reduceOnly': 'true',
             'positionSide': position_side,
         }
     ]
@@ -760,7 +758,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
                 except Exception as cancel_e:
                     log.exception(f"CRITICAL: Failed to cancel pending SL/TP orders for {symbol}. Manual intervention required. Error: {cancel_e}")
 
-            raise RuntimeError(f"Batch order failed with errors: {errors}")
+            raise BinanceAPIException(response=None, status_code=-1, text=json.dumps(errors))
 
         log.info(f"Batch order successful for {symbol}. Response: {batch_response}")
         return batch_response
@@ -784,20 +782,6 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     if client is None:
         raise RuntimeError("Binance client not initialized")
 
-    position_side = 'LONG' if side == 'BUY' else 'SHORT'
-    
-    # Fetch current position quantity
-    try:
-        positions = client.futures_position_information(symbol=symbol)
-        pos = next((p for p in positions if p.get('positionSide') == position_side), None)
-        if not pos or abs(float(pos.get('positionAmt', 0.0))) == 0.0:
-            log.warning(f"No open position found for {symbol} {position_side} when trying to place SL/TP.")
-            return []
-        qty = abs(float(pos.get('positionAmt')))
-    except Exception as e:
-        log.exception(f"Failed to fetch position info for {symbol} in place_batch_sl_tp_sync: {e}")
-        raise
-
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
     
@@ -807,9 +791,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             'side': close_side,
             'type': 'STOP_MARKET',
             'stopPrice': str(round(sl_price, 8)),
-            'quantity': str(qty),
-            'reduceOnly': 'true',
-            'positionSide': position_side,
+            'closePosition': True,
         })
     
     if tp_price:
@@ -818,9 +800,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             'side': close_side,
             'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': str(round(tp_price, 8)),
-            'quantity': str(qty),
-            'reduceOnly': 'true',
-            'positionSide': position_side,
+            'closePosition': True,
         })
 
     if not order_batch:
