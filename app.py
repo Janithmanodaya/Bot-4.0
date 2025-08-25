@@ -236,7 +236,7 @@ async def reconcile_open_trades():
                 entry_price = float(position['entryPrice'])
                 qty = abs(float(position['positionAmt']))
                 side = 'BUY' if float(position['positionAmt']) > 0 else 'SELL'
-                leverage = int(position['leverage'])
+                leverage = int(position.get('leverage', CONFIG.get("MAX_BOT_LEVERAGE", 20)))
                 notional = qty * entry_price
 
                 # Calculate a default SL/TP based on current ATR
