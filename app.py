@@ -1,6 +1,6 @@
 # app.py
 """
-KAMA trend-following ot — complete version with fixes:
+KAMA trend-following bot — complete version with fixes:
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
  - Monitor thread persists unrealized PnL and SL updates back to managed_trades
@@ -1159,7 +1159,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     Places SL and/or TP orders in a single batch request.
     If qty is not provided, it will be fetched from the current position.
     """
-    global client
+    global client, IS_HEDGE_MODE
     if CONFIG["DRY_RUN"]:
         if sl_price: log.info(f"[DRY RUN] Would place SL at {sl_price:.4f} for {symbol}.")
         if tp_price: log.info(f"[DRY RUN] Would place TP at {tp_price:.4f} for {symbol}.")
@@ -1167,6 +1167,18 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
 
     if client is None:
         raise RuntimeError("Binance client not initialized")
+
+    # --- Defensive Re-check of Position Mode ---
+    try:
+        position_mode = client.futures_get_position_mode()
+        current_hedge_mode = position_mode.get('dualSidePosition', False)
+        if current_hedge_mode != IS_HEDGE_MODE:
+            log.warning(f"STALE HEDGE MODE DETECTED! Global was {IS_HEDGE_MODE}, but current is {current_hedge_mode}. Updating global state.")
+            send_telegram(f"⚠️ Stale hedge mode detected, correcting. Was: {IS_HEDGE_MODE}, Now: {current_hedge_mode}")
+            IS_HEDGE_MODE = current_hedge_mode
+    except Exception as e:
+        log.error("Defensive re-check of position mode failed: %s. Proceeding with cached value.", e)
+    # --- End Defensive Re-check ---
 
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
     
