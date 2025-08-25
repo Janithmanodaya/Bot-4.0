@@ -266,6 +266,7 @@ async def reconcile_open_trades():
                 await asyncio.to_thread(cancel_close_orders_sync, symbol)
                 
                 # Place the new SL/TP orders
+                log.info(f"Attempting to place SL/TP for imported trade {symbol}. SL={stop_price}, TP={take_price}, Qty={qty}")
                 await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=take_price, qty=qty)
                 
                 msg = (f"ℹ️ **Position Imported**\n\n"
@@ -884,8 +885,8 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
         })
 
     if not order_batch:
-        log.warning(f"place_batch_sl_tp_sync called for {symbol} without sl_price or tp_price.")
-        return []
+        # This is a critical logic error if this function is called without any action to take.
+        raise RuntimeError(f"place_batch_sl_tp_sync called for {symbol} without sl_price or tp_price. This should not happen.")
 
     try:
         log.info(f"Placing batch SL/TP order for {symbol}: {order_batch}")
