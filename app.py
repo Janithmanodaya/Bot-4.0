@@ -758,7 +758,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
                 except Exception as cancel_e:
                     log.exception(f"CRITICAL: Failed to cancel pending SL/TP orders for {symbol}. Manual intervention required. Error: {cancel_e}")
 
-            raise BinanceAPIException(response=None, status_code=-1, text=json.dumps(errors))
+            raise RuntimeError(f"Batch order failed with errors: {errors}")
 
         log.info(f"Batch order successful for {symbol}. Response: {batch_response}")
         return batch_response
