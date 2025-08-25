@@ -709,6 +709,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             'type': 'STOP_MARKET',
             'stopPrice': str(round(stop_price, 8)),
             'closePosition': True,
+            'positionSide': position_side,
         },
         {
             'symbol': symbol,
@@ -716,6 +717,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': str(round(take_price, 8)),
             'closePosition': True,
+            'positionSide': position_side,
         }
     ]
 
@@ -781,6 +783,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
         raise RuntimeError("Binance client not initialized")
 
     close_side = 'SELL' if side == 'BUY' else 'BUY'
+    position_side = 'LONG' if side == 'BUY' else 'SHORT'
     order_batch = []
     
     if sl_price:
@@ -790,6 +793,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             'type': 'STOP_MARKET',
             'stopPrice': str(round(sl_price, 8)),
             'closePosition': True,
+            'positionSide': position_side,
         })
     
     if tp_price:
@@ -799,6 +803,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': str(round(tp_price, 8)),
             'closePosition': True,
+            'positionSide': position_side,
         })
 
     if not order_batch:
