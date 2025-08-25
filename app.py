@@ -1165,6 +1165,10 @@ def cancel_close_orders_sync(symbol: str):
 
         log.info(f"Cancelling batch of {len(order_ids_to_cancel)} orders for {symbol}.")
         client.futures_cancel_batch_order(symbol=symbol, orderIdList=order_ids_to_cancel)
+        
+        # Add a short delay to allow the exchange to process the cancellation
+        time.sleep(1)
+        log.info(f"Waited 1s for order cancellation to process for {symbol}.")
 
     except BinanceAPIException as e:
         # If the error is "Order does not exist", it's ok, it might have been filled or already cancelled.
