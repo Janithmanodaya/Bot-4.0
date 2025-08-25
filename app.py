@@ -662,6 +662,25 @@ def round_qty(symbol: str, qty: float) -> float:
         log.exception("round_qty failed; falling back to float")
     return float(qty)
 
+def round_price(symbol: str, price: float) -> str:
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict):
+            return f"{price:.8f}" # Fallback
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return f"{price:.8f}" # Fallback
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'PRICE_FILTER':
+                tick_size = Decimal(str(f.get('tickSize', '0.00000001')))
+                getcontext().prec = 28
+                p = Decimal(str(price))
+                rounded_price = p.quantize(tick_size, rounding=ROUND_DOWN)
+                return f"{rounded_price}"
+    except Exception:
+        log.exception("round_price failed; falling back to basic formatting")
+    return f"{price:.8f}"
+
 def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, leverage: int, stop_price: float, take_price: float):
     """
     Places a market order and associated SL/TP orders in a single batch request.
@@ -707,7 +726,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             'symbol': symbol,
             'side': close_side,
             'type': 'STOP_MARKET',
-            'stopPrice': str(round(stop_price, 8)),
+            'stopPrice': round_price(symbol, stop_price),
             'quantity': str(qty),
             'positionSide': position_side,
         },
@@ -715,7 +734,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
             'symbol': symbol,
             'side': close_side,
             'type': 'TAKE_PROFIT_MARKET',
-            'stopPrice': str(round(take_price, 8)),
+            'stopPrice': round_price(symbol, take_price),
             'quantity': str(qty),
             'positionSide': position_side,
         }
@@ -782,6 +801,20 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     if client is None:
         raise RuntimeError("Binance client not initialized")
 
+    position_side = 'LONG' if side == 'BUY' else 'SHORT'
+    
+    # Fetch current position quantity
+    try:
+        positions = client.futures_position_information(symbol=symbol)
+        pos = next((p for p in positions if p.get('positionSide') == position_side), None)
+        if not pos or abs(float(pos.get('positionAmt', 0.0))) == 0.0:
+            log.warning(f"No open position found for {symbol} {position_side} when trying to place SL/TP.")
+            return []
+        qty = abs(float(pos.get('positionAmt')))
+    except Exception as e:
+        log.exception(f"Failed to fetch position info for {symbol} in place_batch_sl_tp_sync: {e}")
+        raise
+
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
     
@@ -790,8 +823,10 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             'symbol': symbol,
             'side': close_side,
             'type': 'STOP_MARKET',
-            'stopPrice': str(round(sl_price, 8)),
-            'closePosition': True,
+            'stopPrice': round_price(symbol, sl_price),
+            'quantity': str(qty),
+            'reduceOnly': 'true',
+            'positionSide': position_side,
         })
     
     if tp_price:
@@ -799,8 +834,10 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             'symbol': symbol,
             'side': close_side,
             'type': 'TAKE_PROFIT_MARKET',
-            'stopPrice': str(round(tp_price, 8)),
-            'closePosition': True,
+            'stopPrice': round_price(symbol, tp_price),
+            'quantity': str(qty),
+            'reduceOnly': 'true',
+            'positionSide': position_side,
         })
 
     if not order_batch:
