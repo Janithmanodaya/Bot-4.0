@@ -185,11 +185,7 @@ async def reconcile_open_trades():
     log.info("--- Starting Trade Reconciliation ---")
 
     db_trades = await asyncio.to_thread(load_managed_trades_from_db)
-    if not db_trades:
-        log.info("No trades in the database to reconcile. Starting fresh.")
-        return
-
-    log.info(f"Found {len(db_trades)} open trade(s) in the database.")
+    log.info(f"Found {len(db_trades)} managed trade(s) in the database.")
 
     try:
         if client is None:
@@ -203,43 +199,95 @@ async def reconcile_open_trades():
         log.info(f"Found {len(open_positions)} open position(s) on Binance.")
 
     except Exception as e:
-        log.exception("Failed to fetch Binance positions during reconciliation. Aborting reconciliation.")
+        log.exception("Failed to fetch Binance positions during reconciliation.")
         await asyncio.to_thread(send_telegram, f"⚠️ **CRITICAL**: Failed to fetch positions from Binance during startup reconciliation: {e}. The bot may not manage existing trades correctly.")
         managed_trades = {}
         return
 
     retained_trades = {}
     
+    # 1. Reconcile trades that are already in the database
     for trade_id, trade_meta in db_trades.items():
         symbol = trade_meta['symbol']
         if symbol in open_positions:
-            log.info(f"✅ Reconciled: Trade {trade_id} ({symbol}) is active on Binance. Restoring.")
+            log.info(f"✅ Reconciled DB trade: {trade_id} ({symbol}) is active. Restoring.")
             retained_trades[trade_id] = trade_meta
         else:
-            log.warning(f"⚠️ Reconciled: Trade {trade_id} ({symbol}) found in DB but is closed on Binance. Marking as closed.")
+            log.warning(f"ℹ️ Reconciled DB trade: {trade_id} ({symbol}) is closed on Binance. Archiving.")
+            # This part could be enhanced to fetch last trade details for accurate PnL
             record_trade({
                 'id': trade_id, 'symbol': symbol, 'side': trade_meta['side'],
-                'entry_price': trade_meta['entry_price'], 'exit_price': None,
+                'entry_price': trade_meta['entry_price'], 'exit_price': None, # Exit price is unknown
                 'qty': trade_meta['initial_qty'], 'notional': trade_meta['notional'], 
-                'pnl': 0.0, # PnL is unknown
-                'open_time': trade_meta['open_time'], 
+                'pnl': 0.0, 'open_time': trade_meta['open_time'], 
                 'close_time': datetime.utcnow().isoformat(),
                 'risk_usdt': trade_meta.get('risk_usdt', 0.0)
             })
             await asyncio.to_thread(remove_managed_trade_from_db, trade_id)
-            await asyncio.to_thread(send_telegram, f"ℹ️ Trade {trade_id} ({symbol}) was closed while the bot was offline. It has been reconciled.")
 
-    db_symbols = {t['symbol'] for t in db_trades.values()}
+    # 2. Import "rogue" positions that are on the exchange but not in the DB
+    managed_symbols = {t['symbol'] for t in retained_trades.values()}
     for symbol, position in open_positions.items():
-        if symbol not in db_symbols:
-            log.warning(f"🚨 Rogue Position Detected: Position for {symbol} exists on Binance but not in the bot's database. Please manage it manually.")
-            await asyncio.to_thread(send_telegram, f"🚨 **WARNING**: A rogue position for {symbol} was detected on Binance that is not tracked by the bot. Please manage it manually via the exchange.")
+        if symbol not in managed_symbols:
+            log.info(f"❗️ Rogue position for {symbol} detected. Importing for management...")
+            
+            try:
+                # Get position details from Binance
+                entry_price = float(position['entryPrice'])
+                qty = abs(float(position['positionAmt']))
+                side = 'BUY' if float(position['positionAmt']) > 0 else 'SELL'
+                leverage = int(position['leverage'])
+                notional = qty * entry_price
+
+                # Calculate a default SL/TP based on current ATR
+                df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
+                atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
+                sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
+                
+                stop_price = entry_price - sl_distance if side == 'BUY' else entry_price + sl_distance
+                take_price = entry_price + sl_distance if side == 'BUY' else entry_price - sl_distance
+
+                # Create a new trade record
+                trade_id = f"{symbol}_imported_{int(time.time())}"
+                meta = {
+                    "id": trade_id, "symbol": symbol, "side": side, "entry_price": entry_price,
+                    "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
+                    "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
+                    "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
+                    "dyn_sltp": CONFIG["DYN_SLTP_ENABLED"], "tp1": None, "tp2": None, "tp3": None,
+                    "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0 # Risk is unknown for imported trades
+                }
+
+                # Add to managed trades and save to DB
+                retained_trades[trade_id] = meta
+                await asyncio.to_thread(add_managed_trade_to_db, meta)
+
+                # Cancel any existing SL/TP orders for this symbol before placing new ones
+                await asyncio.to_thread(cancel_close_orders_sync, symbol)
+                
+                # Place the new SL/TP orders
+                await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, stop_price, take_price)
+                
+                msg = (f"ℹ️ **Position Imported**\n\n"
+                       f"Found and imported a position for **{symbol}**.\n\n"
+                       f"**Side:** {side}\n"
+                       f"**Entry Price:** {entry_price}\n"
+                       f"**Quantity:** {qty}\n\n"
+                       f"A default SL/TP has been calculated and placed based on current market volatility:\n"
+                       f"**SL:** `{round_price(symbol, stop_price)}`\n"
+                       f"**TP:** `{round_price(symbol, take_price)}`\n\n"
+                       f"The bot will now manage this trade.")
+                await asyncio.to_thread(send_telegram, msg)
+
+            except Exception as e:
+                log.exception(f"Failed to import rogue position for {symbol}")
+                await asyncio.to_thread(send_telegram, f"🚨 **ERROR**: Failed to import rogue position for {symbol}. Please manage it manually. Reason: {e}")
 
     async with managed_trades_lock:
         managed_trades.clear()
         managed_trades.update(retained_trades)
     
-    log.info(f"--- Reconciliation Complete. {len(managed_trades)} trades loaded into memory. ---")
+    log.info(f"--- Reconciliation Complete. {len(managed_trades)} trades are now being managed. ---")
 
 # -------------------------
 # App Lifespan Manager
