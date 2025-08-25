@@ -926,7 +926,16 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
 
     try:
         log.info(f"Placing batch SL/TP order for {symbol}: {order_batch}")
-        return client.futures_place_batch_order(batchOrders=order_batch)
+        batch_response = client.futures_place_batch_order(batchOrders=order_batch)
+        
+        # Check for errors within the batch response
+        errors = [resp for resp in batch_response if 'code' in resp]
+        if errors:
+            # Raise an exception if any order in the batch failed
+            raise RuntimeError(f"Batch SL/TP order placement failed for {symbol}. Errors: {errors}")
+            
+        log.info(f"Batch SL/TP order successful for {symbol}. Response: {batch_response}")
+        return batch_response
     except BinanceAPIException as e:
         log.exception("BinanceAPIException placing batch SL/TP: %s", e)
         raise
