@@ -146,6 +146,9 @@ current_daily_pnl = 0.0
 session_freeze_active = False
 notified_frozen_session: Optional[str] = None
 
+# Account state
+IS_HEDGE_MODE: Optional[bool] = None
+
 # DualLock for cross-thread (thread + async) coordination
 class DualLock:
     def __init__(self):
@@ -771,7 +774,7 @@ def init_binance_client_sync():
     Initialize Binance client only when API key + secret are provided.
     Returns (ok: bool, error_message: str)
     """
-    global client, BINANCE_API_KEY, BINANCE_API_SECRET
+    global client, BINANCE_API_KEY, BINANCE_API_SECRET, IS_HEDGE_MODE
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         log.warning("Binance API key/secret not set; Binance client will not be initialized.")
         client = None
@@ -787,6 +790,21 @@ def init_binance_client_sync():
             log.info("Connected to Binance API (ping ok).")
         except Exception:
             log.warning("Binance ping failed (connection may still succeed for calls).")
+
+        # Fetch and store the actual position mode from the exchange
+        try:
+            position_mode = client.futures_get_position_mode()
+            IS_HEDGE_MODE = position_mode.get('dualSidePosition', False)
+            mode_str = "Hedge Mode" if IS_HEDGE_MODE else "One-way Mode"
+            log.info(f"Successfully fetched account position mode: {mode_str}")
+            # Optional: Compare with local config and warn if different
+            if IS_HEDGE_MODE != CONFIG["HEDGING_ENABLED"]:
+                log.warning(f"Configuration mismatch! Local HEDGING_ENABLED is {CONFIG['HEDGING_ENABLED']} but account is in {mode_str}.")
+                send_telegram(f"⚠️ **Configuration Mismatch**\nYour bot's `HEDGING_ENABLED` setting is `{CONFIG['HEDGING_ENABLED']}`, but your Binance account is in **{mode_str}**. The bot will use the live account setting to place orders, but please update your config to match.")
+        except Exception as e:
+            log.error("Failed to fetch account position mode. Defaulting to One-way Mode logic. Error: %s", e)
+            IS_HEDGE_MODE = False # Default to false on error
+            send_telegram("⚠️ Could not determine account position mode (Hedge vs One-way). Defaulting to One-way. Please ensure this is correct.")
         
         EXCHANGE_INFO_CACHE['data'] = None
         EXCHANGE_INFO_CACHE['ts'] = 0.0
@@ -935,7 +953,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
         'quantity': str(qty),
     }
 
-    if CONFIG["HEDGING_ENABLED"]:
+    if IS_HEDGE_MODE:
         market_order_params['positionSide'] = position_side
         close_order_params['positionSide'] = position_side
     else:
@@ -1046,7 +1064,7 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
         'quantity': str(current_qty),
     }
 
-    if CONFIG["HEDGING_ENABLED"]:
+    if IS_HEDGE_MODE:
         base_close_order['positionSide'] = position_side
     else:
         base_close_order['reduceOnly'] = 'true'
@@ -1112,7 +1130,7 @@ def close_partial_market_position_sync(symbol: str, side: str, qty_to_close: flo
             'quantity': qty_to_close,
         }
 
-        if CONFIG["HEDGING_ENABLED"]:
+        if IS_HEDGE_MODE:
             order_params['positionSide'] = position_side
         else:
             order_params['reduceOnly'] = True
