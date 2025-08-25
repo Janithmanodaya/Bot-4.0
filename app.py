@@ -162,6 +162,13 @@ class DualLock:
     def release(self) -> None:
         self._lock.release()
 
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._lock.release()
+
     async def __aenter__(self):
         await asyncio.to_thread(self._lock.acquire)
         return self
