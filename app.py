@@ -281,8 +281,7 @@ async def reconcile_open_trades():
                 await asyncio.to_thread(send_telegram, msg)
 
             except Exception as e:
-                log.exception(f"Failed to import rogue position for {symbol}")
-                await asyncio.to_thread(send_telegram, f"🚨 **ERROR**: Failed to import rogue position for {symbol}. Please manage it manually. Reason: {e}")
+                await asyncio.to_thread(log_and_send_error, f"Failed to import rogue position for {symbol}. Please manage it manually.", e)
 
     async with managed_trades_lock:
         managed_trades.clear()
@@ -382,7 +381,7 @@ def get_public_ip() -> str:
     except Exception:
         return "unable-to-fetch-ip"
 
-def send_telegram(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html"):
+def send_telegram(msg: str, document_content: Optional[bytes] = None, document_name: str = "error.html", parse_mode: Optional[str] = None):
     """
     Synchronously sends a message to Telegram. Can optionally attach a document.
     This is a blocking call.
@@ -400,16 +399,53 @@ def send_telegram(msg: str, document_content: Optional[bytes] = None, document_n
                 chat_id=int(TELEGRAM_CHAT_ID),
                 document=doc_stream,
                 caption=safe_msg,
-                timeout=30  # Add a timeout
+                timeout=30,
+                parse_mode=parse_mode
             )
         else:
             telegram_bot.send_message(
                 chat_id=int(TELEGRAM_CHAT_ID), 
                 text=safe_msg,
-                timeout=30  # Add a timeout
+                timeout=30,
+                parse_mode=parse_mode
             )
     except Exception:
         log.exception("Failed to send telegram message")
+
+
+def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
+    """
+    Logs an exception and sends a formatted error message to Telegram.
+    This is a synchronous, blocking call.
+    """
+    # Log the full traceback to the console/log file
+    if exc:
+        log.exception(f"Error during '{context_msg}': {exc}")
+    else:
+        log.error(f"Error during '{context_msg}' (no exception details).")
+
+    # For Binance API exceptions, extract more details
+    if exc and isinstance(exc, BinanceAPIException):
+        error_details = f"Code: `{exc.code}`, Message: `{exc.message}`"
+    elif exc:
+        error_details = str(exc)
+    else:
+        error_details = "N/A"
+
+    # Sanitize the error details for Telegram's Markdown
+    error_details = error_details.replace('`', "'")
+
+    # Format a user-friendly message
+    telegram_msg = (
+        f"🚨 **Bot Error** 🚨\n\n"
+        f"**Context:** {context_msg}\n"
+        f"**Error Type:** `{type(exc).__name__ if exc else 'N/A'}`\n"
+        f"**Details:** {error_details}\n\n"
+        f"Check the logs for the full traceback if available."
+    )
+    
+    # Send the message, using Markdown for formatting
+    send_telegram(telegram_msg, parse_mode='Markdown')
 
 # (The rest of the file from DB Helpers to the end remains the same, except for removing the old startup/shutdown events)
 # ... I will paste the full code below ...
@@ -1254,18 +1290,11 @@ async def evaluate_and_enter(symbol: str):
             await asyncio.to_thread(send_telegram, f"{dry_run_prefix}Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
             log.info("%sOpened trade: %s", dry_run_prefix, meta)
         except Exception as e:
-            # Handle all exceptions as critical failures
-            log.exception("Failed to open trade for %s: %s", symbol, e)
-            tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-            safe_tb = _shorten_for_telegram(tb)
-            await asyncio.to_thread(send_telegram, f"ERROR opening {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
-            running = False
+            # Use the new centralized error handler
+            await asyncio.to_thread(log_and_send_error, f"Failed to open trade for {symbol}", e)
         return
     except Exception as e:
-        log.exception("evaluate_and_enter error %s: %s", symbol, e)
-        tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-        safe_tb = _shorten_for_telegram(tb)
-        await asyncio.to_thread(send_telegram, f"Scan error for {symbol}: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}")
+        await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
 def get_account_balance_usdt():
     global client
@@ -1379,133 +1408,130 @@ def monitor_thread_func():
 
                 # --- Break-Even Auto-Move Logic ---
                 if CONFIG.get("BE_AUTO_MOVE_ENABLED", True) and not meta.get('be_moved') and meta.get('trade_phase', 0) == 0:
-                    df_be = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
-                    atr_now_be = atr(df_be, CONFIG["ATR_LENGTH"]).iloc[-1]
-                    current_price_be = df_be['close'].iloc[-1]
+                    try:
+                        df_be = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
+                        atr_now_be = atr(df_be, CONFIG["ATR_LENGTH"]).iloc[-1]
+                        current_price_be = df_be['close'].iloc[-1]
 
-                    entry_price = meta['entry_price']
-                    side = meta['side']
-                    
-                    profit_target_price = entry_price + atr_now_be if side == 'BUY' else entry_price - atr_now_be
-                    
-                    moved_to_be = False
-                    if side == 'BUY' and current_price_be >= profit_target_price:
-                        if entry_price > meta['sl']:
-                            cancel_close_orders_sync(sym)
-                            place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
-                            moved_to_be = True
-                            
-                    elif side == 'SELL' and current_price_be <= profit_target_price:
-                        if entry_price < meta['sl']:
-                            cancel_close_orders_sync(sym)
-                            place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
-                            moved_to_be = True
-
-                    if moved_to_be:
-                        log.info(f"Trade {tid} hit 1x ATR profit target. Moving SL to breakeven at {entry_price}.")
+                        entry_price = meta['entry_price']
+                        side = meta['side']
                         
-                        managed_trades_lock.acquire()
-                        try:
-                            if tid in managed_trades:
-                                managed_trades[tid]['sl'] = entry_price
-                                managed_trades[tid]['be_moved'] = True
-                        finally:
-                            managed_trades_lock.release()
+                        profit_target_price = entry_price + atr_now_be if side == 'BUY' else entry_price - atr_now_be
+                        
+                        moved_to_be = False
+                        if (side == 'BUY' and current_price_be >= profit_target_price and entry_price > meta['sl']) or \
+                           (side == 'SELL' and current_price_be <= profit_target_price and entry_price < meta['sl']):
                             
-                        send_telegram(f"🔒 SL moved to breakeven for Trade ID: {tid}")
-                        continue
+                            cancel_close_orders_sync(sym)
+                            place_batch_sl_tp_sync(sym, side, sl_price=entry_price, tp_price=meta['tp'])
+                            moved_to_be = True
+
+                        if moved_to_be:
+                            log.info(f"Trade {tid} hit 1x ATR profit target. Moving SL to breakeven at {entry_price}.")
+                            
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['sl'] = entry_price
+                                    managed_trades[tid]['be_moved'] = True
+                                    add_managed_trade_to_db(managed_trades[tid])
+                                
+                            send_telegram(f"🔒 SL moved to breakeven for Trade ID: {tid}")
+                            continue
+                    except Exception as e:
+                        log_and_send_error(f"Failed to process Break-Even logic for {tid}", e)
 
                 # Dynamic SL/TP Logic
                 if meta.get('dyn_sltp'):
-                    df_monitor = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 2)
-                    current_price = df_monitor['close'].iloc[-1]
-                    
-                    # Check for TP1
-                    if meta.get('trade_phase') == 0 and meta.get('tp1') is not None:
-                        hit_tp1 = (meta['side'] == 'BUY' and current_price >= meta['tp1']) or \
-                                  (meta['side'] == 'SELL' and current_price <= meta['tp1'])
-                        if hit_tp1:
-                            log.info(f"Trade {tid} hit TP1 at {meta['tp1']}.")
-                            qty_to_close = meta['initial_qty'] * CONFIG['TP1_CLOSE_PCT']
-                            qty_to_close = round_qty(sym, qty_to_close)
-                            
-                            if qty_to_close > 0:
-                                close_partial_market_position_sync(sym, meta['side'], qty_to_close)
-                            
-                            new_qty = meta['qty'] - qty_to_close
-                            cancel_close_orders_sync(sym)
-                            new_sl = meta['entry_price']
-                            place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp3'])
-                            
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid]['trade_phase'] = 1
-                                    managed_trades[tid]['qty'] = new_qty
-                                    managed_trades[tid]['sl'] = new_sl
-                                    # Update the persistent record
-                                    add_managed_trade_to_db(managed_trades[tid])
-                            send_telegram(f"✅ TP1 hit for {tid} ({sym}). Closed {CONFIG['TP1_CLOSE_PCT']*100}%. SL moved to breakeven.")
-                            continue
+                    try:
+                        df_monitor = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 2)
+                        current_price = df_monitor['close'].iloc[-1]
+                        
+                        # Check for TP1
+                        if meta.get('trade_phase') == 0 and meta.get('tp1') is not None:
+                            hit_tp1 = (meta['side'] == 'BUY' and current_price >= meta['tp1']) or \
+                                      (meta['side'] == 'SELL' and current_price <= meta['tp1'])
+                            if hit_tp1:
+                                log.info(f"Trade {tid} hit TP1 at {meta['tp1']}.")
+                                qty_to_close = meta['initial_qty'] * CONFIG['TP1_CLOSE_PCT']
+                                qty_to_close = round_qty(sym, qty_to_close)
+                                
+                                if qty_to_close > 0:
+                                    close_partial_market_position_sync(sym, meta['side'], qty_to_close)
+                                
+                                new_qty = meta['qty'] - qty_to_close
+                                cancel_close_orders_sync(sym)
+                                new_sl = meta['entry_price']
+                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp3'])
+                                
+                                with managed_trades_lock:
+                                    if tid in managed_trades:
+                                        managed_trades[tid]['trade_phase'] = 1
+                                        managed_trades[tid]['qty'] = new_qty
+                                        managed_trades[tid]['sl'] = new_sl
+                                        add_managed_trade_to_db(managed_trades[tid])
+                                send_telegram(f"✅ TP1 hit for {tid} ({sym}). Closed {CONFIG['TP1_CLOSE_PCT']*100}%. SL moved to breakeven.")
+                                continue
 
-                    # Check for TP2
-                    if meta.get('trade_phase') == 1 and meta.get('tp2') is not None:
-                        hit_tp2 = (meta['side'] == 'BUY' and current_price >= meta['tp2']) or \
-                                  (meta['side'] == 'SELL' and current_price <= meta['tp2'])
-                        if hit_tp2:
-                            log.info(f"Trade {tid} hit TP2 at {meta['tp2']}.")
-                            qty_to_close = meta['initial_qty'] * CONFIG['TP2_CLOSE_PCT']
-                            qty_to_close = round_qty(sym, qty_to_close)
+                        # Check for TP2
+                        if meta.get('trade_phase') == 1 and meta.get('tp2') is not None:
+                            hit_tp2 = (meta['side'] == 'BUY' and current_price >= meta['tp2']) or \
+                                      (meta['side'] == 'SELL' and current_price <= meta['tp2'])
+                            if hit_tp2:
+                                log.info(f"Trade {tid} hit TP2 at {meta['tp2']}.")
+                                qty_to_close = meta['initial_qty'] * CONFIG['TP2_CLOSE_PCT']
+                                qty_to_close = round_qty(sym, qty_to_close)
 
-                            if qty_to_close > 0:
-                                close_partial_market_position_sync(sym, meta['side'], qty_to_close)
-                            
-                            new_qty = meta['qty'] - qty_to_close
-                            cancel_close_orders_sync(sym)
-                            new_sl = meta['tp1']
-                            place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl)
+                                if qty_to_close > 0:
+                                    close_partial_market_position_sync(sym, meta['side'], qty_to_close)
+                                
+                                new_qty = meta['qty'] - qty_to_close
+                                cancel_close_orders_sync(sym)
+                                new_sl = meta['tp1']
+                                place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl)
 
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid]['trade_phase'] = 2
-                                    managed_trades[tid]['qty'] = new_qty
-                                    managed_trades[tid]['sl'] = new_sl
-                                    # Update the persistent record
-                                    add_managed_trade_to_db(managed_trades[tid])
-                            send_telegram(f"✅ TP2 hit for {tid} ({sym}). Closed {CONFIG['TP2_CLOSE_PCT']*100}%. SL moved to TP1. Trailing stop is active.")
-                            continue
+                                with managed_trades_lock:
+                                    if tid in managed_trades:
+                                        managed_trades[tid]['trade_phase'] = 2
+                                        managed_trades[tid]['qty'] = new_qty
+                                        managed_trades[tid]['sl'] = new_sl
+                                        add_managed_trade_to_db(managed_trades[tid])
+                                send_telegram(f"✅ TP2 hit for {tid} ({sym}). Closed {CONFIG['TP2_CLOSE_PCT']*100}%. SL moved to TP1. Trailing stop is active.")
+                                continue
+                    except Exception as e:
+                        log_and_send_error(f"Failed to process Dynamic SL/TP logic for {tid}", e)
 
                 # Trailing SL logic
                 if meta.get('trailing'):
-                    df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
-                    atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                    current_price = df['close'].iloc[-1]
-                    moved = False
-                    new_sl = None
-                    if meta['side'] == 'BUY':
-                        if current_price > meta['entry_price'] + 1.0 * atr_now:
+                    try:
+                        df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
+                        atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
+                        current_price = df['close'].iloc[-1]
+                        moved = False
+                        new_sl = None
+
+                        if meta['side'] == 'BUY' and current_price > meta['entry_price'] + 1.0 * atr_now:
                             new_sl = meta['entry_price'] + 0.5 * atr_now
                             if new_sl > meta['sl'] and new_sl < current_price:
                                 cancel_close_orders_sync(sym)
                                 place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
                                 moved = True
-                    else: # SELL
-                        if current_price < meta['entry_price'] - 1.0 * atr_now:
+                        elif meta['side'] == 'SELL' and current_price < meta['entry_price'] - 1.0 * atr_now:
                             new_sl = meta['entry_price'] - 0.5 * atr_now
                             if new_sl < meta['sl'] and new_sl > current_price:
                                 cancel_close_orders_sync(sym)
                                 place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
                                 moved = True
-                    
-                    if moved and new_sl is not None:
-                        managed_trades_lock.acquire()
-                        try:
-                            if tid in managed_trades:
-                                managed_trades[tid]['sl'] = new_sl
-                                managed_trades[tid]['sltp_last_updated'] = datetime.utcnow().isoformat()
-                        finally:
-                            managed_trades_lock.release()
-                        meta['sl'] = new_sl
-                        send_telegram(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
+                        
+                        if moved and new_sl is not None:
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['sl'] = new_sl
+                                    managed_trades[tid]['sltp_last_updated'] = datetime.utcnow().isoformat()
+                                    add_managed_trade_to_db(managed_trades[tid])
+                            meta['sl'] = new_sl
+                            send_telegram(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
+                    except Exception as e:
+                        log_and_send_error(f"Failed to process Trailing SL for {tid}", e)
 
             if to_remove:
                 managed_trades_lock.acquire()
