@@ -1,6 +1,6 @@
 # app.py
 """
-KAMA trend-following bot — complete version with fixes:
+KAMA trend-following ot — complete version with fixes:
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
  - Monitor thread persists unrealized PnL and SL updates back to managed_trades
