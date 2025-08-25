@@ -103,14 +103,14 @@ CONFIG = {
     "CHOPPY_RISK_MULT": float(os.getenv("CHOPPY_RISK_MULT", "0.5")),
 
     "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
-    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "50.0")),
+    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "25.0")),
 
     "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
-    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "50.0")),
+    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "65.0")),
 
     "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
     "BB_STD": float(os.getenv("BB_STD", "2.0")),
-    "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "7.0")),
+    "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "12.0")),
 
     "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
 
