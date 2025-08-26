@@ -2878,7 +2878,13 @@ def handle_update_sync(update, loop):
                     "- `/validate`: Performs a sanity check on the configuration.\n"
                     "- `/help`: Displays this help message."
                 )
-                await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
+                async def _task():
+                    await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try:
+                    fut.result(timeout=10)
+                except Exception as e:
+                    log.error("Failed to execute /help action: %s", e)
             elif text.startswith("/usage"):
                 cpu_usage = psutil.cpu_percent(interval=1)
                 memory_info = psutil.virtual_memory()
