@@ -20,6 +20,7 @@ import json
 import signal
 import sqlite3
 import io
+import re
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -1731,7 +1732,19 @@ def monitor_thread_func():
 
             positions = []
             try:
-                positions = client.futures_position_information()
+                max_retries = 3
+                retry_delay = 10  # seconds
+                for attempt in range(max_retries):
+                    try:
+                        positions = client.futures_position_information()
+                        break  # Success
+                    except BinanceAPIException as e:
+                        if e.code == -1007 and attempt < max_retries - 1:
+                            log.warning(f"Timeout fetching positions (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay}s...")
+                            send_telegram(f"⚠️ Binance API timeout, retrying... ({attempt + 1}/{max_retries})")
+                            time.sleep(retry_delay)
+                            continue
+                        raise  # Re-raise the exception if it's not a retryable timeout or the last attempt
             except BinanceAPIException as e:
                 log.error("Caught BinanceAPIException in monitor thread: %s", e)
                 
@@ -2324,6 +2337,36 @@ def handle_update_sync(update, loop):
         if getattr(update, 'message', None):
             msg = update.message
             text = (msg.text or "").strip()
+
+            # --- Automatic Parameter Editing ---
+            param_match = re.match(r'^\s*([A-Z_]+)\s*=\s*(.+)$', text, re.IGNORECASE)
+            if param_match:
+                key, val_str = param_match.groups()
+                key = key.upper()
+                
+                if key in CONFIG:
+                    old_val = CONFIG[key]
+                    try:
+                        new_val = None
+                        if isinstance(old_val, bool):
+                            new_val = val_str.lower() in ("1", "true", "yes", "on")
+                        elif isinstance(old_val, int):
+                            new_val = int(val_str)
+                        elif isinstance(old_val, float):
+                            new_val = float(val_str)
+                        elif isinstance(old_val, list):
+                            new_val = [x.strip().upper() for x in val_str.split(",")]
+                        else: # Assumes string
+                            new_val = val_str
+                        
+                        CONFIG[key] = new_val
+                        send_telegram(f"✅ Parameter updated: {key} = {CONFIG[key]}")
+                        return # Stop further processing
+                    except (ValueError, TypeError) as e:
+                        send_telegram(f"❌ Error setting {key}: Invalid value '{val_str}'. Please provide a valid value. Error: {e}")
+                        return
+            # --- End Automatic Parameter Editing ---
+
             if text.startswith("/startbot"):
                 if daily_loss_limit_hit:
                     send_telegram(f"❌ Cannot start bot: Daily loss limit of {CONFIG['MAX_DAILY_LOSS']:.2f} USDT has been reached. Bot will remain paused until the next UTC day.")
@@ -2387,16 +2430,21 @@ def handle_update_sync(update, loop):
                 try: trades = fut.result(timeout=5)
                 except Exception as e: log.error("Failed to get managed trades for /status: %s", e)
                 
-                pnl_info = f"Today's PnL: {current_daily_pnl:.2f} USDT"
+                unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
+                
+                pnl_info = (
+                    f"Today's Realized PnL: {current_daily_pnl:.2f} USDT\n"
+                    f"Current Unrealized PnL: {unrealized_pnl:.2f} USDT"
+                )
                 if daily_loss_limit_hit:
-                    pnl_info += f" (LIMIT REACHED: {CONFIG['MAX_DAILY_LOSS']:.2f})"
+                    pnl_info += f"\n(LIMIT REACHED: {CONFIG['MAX_DAILY_LOSS']:.2f})"
 
                 txt = (
                     f"Status:\n"
                     f"▶️ Running: {running}\n"
                     f"❄️ Frozen: {frozen}\n"
                     f"📈 Managed Trades: {len(trades)}\n"
-                    f"💸 {pnl_info}"
+                    f"💸\n{pnl_info}"
                 )
                 send_telegram(txt)
                 try:
