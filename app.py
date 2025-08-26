@@ -83,7 +83,7 @@ CONFIG = {
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
-    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "14")),
+    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
     "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
     "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
 
@@ -106,10 +106,10 @@ CONFIG = {
     "CHOPPY_RISK_MULT": float(os.getenv("CHOPPY_RISK_MULT", "0.5")),
 
     "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
-    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "30.0")),
+    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "35.0")),
 
     "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
-    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "60.0")),
+    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "55.0")),
 
     "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
     "BB_STD": float(os.getenv("BB_STD", "2.0")),
