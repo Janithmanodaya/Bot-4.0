@@ -1772,7 +1772,7 @@ def get_account_balance_usdt():
     return 0.0
 
 def monitor_thread_func():
-    global managed_trades, last_trade_close_time, running
+    global managed_trades, last_trade_close_time, running, overload_notified
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
         loop_start_time = time.time()
