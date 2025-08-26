@@ -630,7 +630,6 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
 SESSION_FREEZE_WINDOWS = {
     "London": (7, 9),
     "New York": (12, 14),
-    "Asia (Sydney)": (21, 23),
     "Tokyo": (23, 1)  # Crosses midnight
 }
 
