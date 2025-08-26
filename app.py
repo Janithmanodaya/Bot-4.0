@@ -26,6 +26,7 @@ import psutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
+from collections import deque
 from decimal import Decimal, ROUND_DOWN, getcontext
 
 import requests
@@ -148,7 +149,10 @@ current_daily_pnl = 0.0
 
 # Session freeze state
 session_freeze_active = False
+session_freeze_override = False
 notified_frozen_session: Optional[str] = None
+
+rejected_trades = deque(maxlen=5)
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
@@ -625,6 +629,22 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     
     # Send the message, using Markdown for formatting
     send_telegram(telegram_msg, parse_mode='Markdown')
+
+
+def _record_rejection(symbol: str, reason: str, details: dict):
+    """Adds a rejected trade event to the deque."""
+    global rejected_trades
+    # Format floats in details to a reasonable precision for display
+    formatted_details = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in details.items()}
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "reason": reason,
+        "details": formatted_details
+    }
+    rejected_trades.append(record)
+    # Use debug level for rejection logs to avoid spamming the main log
+    log.debug(f"Rejected trade for {symbol}. Reason: {reason}")
 
 
 SESSION_FREEZE_WINDOWS = {
@@ -1531,6 +1551,8 @@ async def evaluate_and_enter(symbol: str):
     log.info("Evaluating symbol: %s", symbol)
     global managed_trades, running, frozen
     if frozen or not running:
+        reason = "Bot is frozen or not running"
+        _record_rejection(symbol, reason, {"running": running, "frozen": frozen})
         return
     try:
         df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 500)
@@ -1543,6 +1565,8 @@ async def evaluate_and_enter(symbol: str):
         price = last['close']
         kama_now = last['kama']; kama_prev = prev['kama']
         atr_now = last['atr']; adx_now = last['adx']; chop_now = last['chop']; bbw_now = last['bbw']
+
+        details = {'price': price, 'adx': adx_now, 'chop': chop_now, 'bbw': bbw_now * 100}
 
         # --- Volatility Regime Detection ---
         risk_multiplier = 1.0
@@ -1570,48 +1594,61 @@ async def evaluate_and_enter(symbol: str):
         df_big = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["BIG_TIMEFRAME"], 200)
         df_big['kama'] = kama(df_big['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
         trend_big = 'bull' if (df_big['kama'].iloc[-1] - df_big['kama'].iloc[-2]) > 0 else 'bear'
+        
+        details.update({'trend_small': trend_small, 'trend_big': trend_big})
+
         if adx_now < CONFIG["ADX_THRESHOLD"]:
-            log.debug("%s skip: ADX %.2f < %.2f", symbol, adx_now, CONFIG["ADX_THRESHOLD"]); return
+            _record_rejection(symbol, f"ADX too low", details)
+            return
         if chop_now >= CONFIG["CHOP_THRESHOLD"]:
-            log.debug("%s skip: CHOP %.2f >= %.2f", symbol, chop_now, CONFIG["CHOP_THRESHOLD"]); return
+            _record_rejection(symbol, f"CHOP too high", details)
+            return
         if (bbw_now * 100.0) >= CONFIG["BBWIDTH_THRESHOLD"]:
-            log.debug("%s skip: BBwidth*100 %.4f >= %.2f", symbol, (bbw_now * 100.0), CONFIG["BBWIDTH_THRESHOLD"]); return
+            _record_rejection(symbol, f"BBW too high", details)
+            return
         if trend_small != trend_big:
-            log.debug("%s skip: trend mismatch small=%s big=%s", symbol, trend_small, trend_big); return
+            _record_rejection(symbol, f"Trend mismatch", details)
+            return
+        
         crossed_above = (prev['close'] <= prev['kama']) and (last['close'] > kama_now)
         crossed_below = (prev['close'] >= prev['kama']) and (last['close'] < kama_now)
         if not (crossed_above or crossed_below):
+            _record_rejection(symbol, "No KAMA cross", details)
             return
+            
         side = None
         if crossed_above and trend_small == 'bull':
             side = 'BUY'
         elif crossed_below and trend_small == 'bear':
             side = 'SELL'
+        
         if not side:
+            _record_rejection(symbol, "No valid side for entry", details)
             return
+
+        details['side'] = side
+
         async with managed_trades_lock:
             existing_trades_for_symbol = [t for t in managed_trades.values() if t['symbol'] == symbol]
             
             if existing_trades_for_symbol:
                 if not CONFIG["HEDGING_ENABLED"]:
-                    log.debug(f"Skipping {symbol} as a trade already exists and hedging is disabled.")
+                    _record_rejection(symbol, "Trade exists and hedging is disabled", details)
                     return
                 
-                # Hedging is enabled, check if new signal is opposite
                 existing_side = existing_trades_for_symbol[0]['side']
                 if side == existing_side:
-                    log.debug(f"Skipping {symbol}, new signal is same side as existing trade.")
+                    _record_rejection(symbol, f"Signal is same side ({side}) as existing trade", details)
                     return
                 
-                # Ensure we don't have more than one primary and one hedge
                 if len(existing_trades_for_symbol) > 1:
-                    log.debug(f"Skipping {symbol}, already have a hedge position.")
+                    _record_rejection(symbol, "Already have a hedge position", details)
                     return
 
                 log.info(f"Hedge opportunity detected for {symbol}. New signal is {side}, opposite to existing {existing_side}.")
 
             if len(managed_trades) >= CONFIG["MAX_CONCURRENT_TRADES"]:
-                log.debug("Max concurrent trades reached")
+                _record_rejection(symbol, "Max concurrent trades reached", {'open_trades': len(managed_trades)})
                 return
 
         async with managed_trades_lock:
@@ -1619,11 +1656,14 @@ async def evaluate_and_enter(symbol: str):
         if last_close:
             n_since = candles_since_close(df, last_close)
             if n_since < CONFIG["MIN_CANDLES_AFTER_CLOSE"]:
-                log.info("%s skip due to cooldown: %d/%d", symbol, n_since, CONFIG["MIN_CANDLES_AFTER_CLOSE"])
+                _record_rejection(symbol, f"In cooldown period ({n_since}/{CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles)", details)
                 return
+        
         sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
         if sl_distance <= 0 or math.isnan(sl_distance):
+            _record_rejection(symbol, f"Invalid SL distance ({sl_distance})", details)
             return
+        
         stop_price = price - sl_distance if side == 'BUY' else price + sl_distance
         
         tp1, tp2, tp3 = None, None, None
@@ -1644,44 +1684,48 @@ async def evaluate_and_enter(symbol: str):
             take_price = price + sl_distance if side == 'BUY' else price - sl_distance
         balance = await asyncio.to_thread(get_account_balance_usdt)
         risk_usdt = calculate_risk_amount(balance)
-        risk_usdt *= risk_multiplier  # Apply volatility multiplier
+        risk_usdt *= risk_multiplier
         if risk_usdt <= 0:
-            log.warning("Risk amount non-positive"); return
+            _record_rejection(symbol, "Risk amount non-positive", {'risk_usdt': risk_usdt})
+            return
         price_distance = abs(price - stop_price)
         if price_distance <= 0:
+            _record_rejection(symbol, "Price distance for SL is zero", {'price': price, 'sl': stop_price})
             return
         qty = risk_usdt / price_distance
         qty = await asyncio.to_thread(round_qty, symbol, qty)
         if qty <= 0:
-            log.warning("Qty rounded to zero; skipping"); return
+            _record_rejection(symbol, "Quantity rounded to zero", {'risk_usdt': risk_usdt, 'price_dist': price_distance})
+            return
         notional = qty * price
         
         min_notional = CONFIG["MIN_NOTIONAL_USDT"]
         if notional < min_notional:
-            log.warning(f"{symbol} Notional is {notional:.4f} < {min_notional}. Boosting risk.")
             
-            # Boost risk to meet min_notional
             required_qty = min_notional / price
             new_risk = required_qty * price_distance
             
             if new_risk > balance:
-                log.warning(f"Cannot boost risk for {symbol}, required risk {new_risk:.2f} > balance {balance:.2f}")
-                await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: Notional value too small and cannot boost risk.\nNotional: {notional:.4f} USDT\nRequired Risk: {new_risk:.2f} USDT\nBalance: {balance:.2f} USDT")
+                reason = "Notional value too small and cannot boost risk"
+                _record_rejection(symbol, reason, {'notional': notional, 'required_risk': new_risk, 'balance': balance})
+                await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: {reason}\nNotional: {notional:.4f} USDT\nRequired Risk: {new_risk:.2f} USDT\nBalance: {balance:.2f} USDT")
                 return
 
             risk_usdt = new_risk
             qty = required_qty
             qty = await asyncio.to_thread(round_qty, symbol, qty)
             if qty <= 0:
-                log.warning(" boosted qty rounded to zero; skipping"); return
+                _record_rejection(symbol, "Boosted quantity rounded to zero", {'new_risk': new_risk})
+                return
             
             notional = qty * price
             
             await asyncio.to_thread(send_telegram, f"📈 Risk Boosted: {symbol}\nNew Risk: {risk_usdt:.2f} USDT\nNotional: {notional:.2f} USDT")
 
         if notional < min_notional:
-            log.warning(f"Skipping {symbol} trade. Notional value {notional:.4f} is less than minimum {min_notional}")
-            await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: Notional value is too small.\nNotional: {notional:.4f} USDT")
+            reason = "Notional value is less than minimum"
+            _record_rejection(symbol, reason, {'notional': notional, 'min_notional': min_notional})
+            await asyncio.to_thread(send_telegram, f"⚠️ Trade Skipped: {symbol}\nReason: {reason}\nNotional: {notional:.4f} USDT")
             return
 
         # --- Leverage Calculation ---
@@ -2207,20 +2251,34 @@ async def manage_session_freeze_state():
     """
     Checks session freeze status and sends notifications on state changes.
     Returns True if the bot should be frozen, False otherwise.
+    Manual override is possible via `session_freeze_override` global.
     """
-    global session_freeze_active, notified_frozen_session
+    global session_freeze_active, notified_frozen_session, session_freeze_override
+
+    # Check for manual override first
+    if session_freeze_override:
+        # If a session freeze was active, ensure it's cleared so it doesn't pop up again
+        if session_freeze_active:
+            session_freeze_active = False
+            notified_frozen_session = None # Clear this to prevent the "ended" message
+            log.info("Session freeze is currently overridden by user command.")
+        return False # Report "not frozen" because of the override
 
     now_utc = datetime.now(timezone.utc)
     is_frozen, session_name = get_session_freeze_status(now_utc)
 
     if is_frozen:
+        # If we are entering a NEW freeze window
         if not session_freeze_active or notified_frozen_session != session_name:
             log.info(f"Entering freeze period for {session_name} session. Bot will not open new trades.")
+            # When a new natural freeze starts, any previous override is reset.
+            session_freeze_override = False
             await asyncio.to_thread(send_telegram, f"⚠️ Session Change: {session_name}\\nThe bot is now frozen for 2 hours and will not open new trades. Existing trades are still monitored.")
             session_freeze_active = True
             notified_frozen_session = session_name
         return True # Is frozen
     else:
+        # If we are exiting a freeze window
         if session_freeze_active:
             log.info("Exiting session freeze period. Bot is now active for new trades.")
             await asyncio.to_thread(send_telegram, f"✅ Session freeze for {notified_frozen_session} has ended. The bot is now active again.")
@@ -2451,7 +2509,8 @@ def build_control_keyboard():
         [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
         [KeyboardButton("/listorders"), KeyboardButton("/sessions")],
         [KeyboardButton("/status"), KeyboardButton("/showparams")],
-        [KeyboardButton("/usage"), KeyboardButton("/report")]
+        [KeyboardButton("/usage"), KeyboardButton("/report")],
+        [KeyboardButton("/rejects"), KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -2595,15 +2654,15 @@ def handle_update_sync(update, loop):
 
                 asyncio.run_coroutine_threadsafe(stop_rogue_checker(), loop)
             elif text.startswith("/freeze"):
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
+                fut = asyncio.run_coroutine_threadsafe(_freeze_command(), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /freeze action: %s", e)
                 send_telegram("❄️ Bot is now **FROZEN**. It will not open new trades.", parse_mode='Markdown')
             elif text.startswith("/unfreeze"):
-                fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
+                fut = asyncio.run_coroutine_threadsafe(_unfreeze_command(), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
-                send_telegram("✅ Bot is now **UNFROZEN**. It will resume opening new trades.", parse_mode='Markdown')
+                send_telegram("✅ Bot is now **UNFROZEN**. Active session freeze has been overridden.", parse_mode='Markdown')
             elif text.startswith("/status"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -2612,6 +2671,7 @@ def handle_update_sync(update, loop):
                 
                 unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
                 
+                # PnL Info section
                 pnl_info = (
                     f"Today's Realized PnL: {current_daily_pnl:.2f} USDT\n"
                     f"Current Unrealized PnL: {unrealized_pnl:.2f} USDT"
@@ -2619,11 +2679,21 @@ def handle_update_sync(update, loop):
                 if daily_loss_limit_hit:
                     pnl_info += f"\n(LIMIT REACHED: {CONFIG['MAX_DAILY_LOSS']:.2f})"
 
+                # Bot Status section
+                status_lines = [f"▶️ Running: *{running}*"]
+                status_lines.append(f"✋ Manual Freeze: *{frozen}*")
+                session_status_text = f"⏰ Session Freeze: *{session_freeze_active}*"
+                if session_freeze_active:
+                    session_status_text += f" ({notified_frozen_session})"
+                if session_freeze_override:
+                    session_status_text += " (Overridden)"
+                status_lines.append(session_status_text)
+                status_lines.append(f"📈 Managed Trades: *{len(trades)}*")
+
+                # Combine sections
                 txt = (
                     f"📊 *Bot Status*\n\n"
-                    f"▶️ Running: *{running}*\n"
-                    f"❄️ Frozen: *{frozen}*\n"
-                    f"📈 Managed Trades: *{len(trades)}*\n\n"
+                    f"{'\\n'.join(status_lines)}\n\n"
                     f"💰 *PnL Info*\n{pnl_info}"
                 )
                 send_telegram(txt, parse_mode='Markdown')
@@ -2760,6 +2830,55 @@ def handle_update_sync(update, loop):
                     except Exception as e:
                         log.error(f"Failed to execute /chart action for {symbol}: {e}")
                         send_telegram(f"Failed to generate chart for {symbol}: {e}")
+            elif text.startswith("/rejects"):
+                async def _task():
+                    if not rejected_trades:
+                        await asyncio.to_thread(send_telegram, "No rejected trades have been recorded yet.")
+                        return
+
+                    report_lines = ["*Last 5 Rejected Trades*"]
+                    # Using list() to create a copy for safe iteration
+                    for reject in reversed(list(rejected_trades)):
+                        ts = datetime.fromisoformat(reject['timestamp']).strftime('%Y-%m-%d %H:%M:%S UTC')
+                        details_str = ", ".join([f"{k}: {v}" for k, v in reject['details'].items()])
+                        
+                        line = (
+                            f"\n*Symbol:* {reject['symbol']} at {ts}\n"
+                            f"  - *Reason:* {reject['reason']}\n"
+                            f"  - *Details:* `{details_str}`"
+                        )
+                        report_lines.append(line)
+                    
+                    await asyncio.to_thread(send_telegram, "\n".join(report_lines), parse_mode='Markdown')
+
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try: fut.result(timeout=10)
+                except Exception as e: log.error("Failed to execute /rejects action: %s", e)
+            elif text.startswith("/help"):
+                help_text = (
+                    "*KAMA Bot Commands*\n\n"
+                    "*Trading Control*\n"
+                    "- `/startbot`: Starts the bot (resumes scanning for trades).\n"
+                    "- `/stopbot`: Stops the bot (pauses scanning for trades).\n"
+                    "- `/freeze`: Manually freezes the bot, preventing all new trades.\n"
+                    "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n\n"
+                    "*Information & Reports*\n"
+                    "- `/status`: Shows a detailed status of the bot.\n"
+                    "- `/listorders`: Lists all currently open trades with details.\n"
+                    "- `/sessions`: Reports the current session freeze status.\n"
+                    "- `/rejects`: Shows a report of the last 5 rejected trade opportunities.\n"
+                    "- `/report`: Generates an overall performance report.\n"
+                    "- `/chart <SYMBOL>`: Generates a detailed chart for a symbol.\n\n"
+                    "*Configuration*\n"
+                    "- `/showparams`: Displays all configurable bot parameters.\n"
+                    "- `<KEY> = <VALUE>`: Sets a parameter (e.g., `MAX_CONCURRENT_TRADES = 4`).\n\n"
+                    "*Utilities*\n"
+                    "- `/ip`: Shows the bot's public server IP address.\n"
+                    "- `/usage`: Displays the current CPU and memory usage.\n"
+                    "- `/validate`: Performs a sanity check on the configuration.\n"
+                    "- `/help`: Displays this help message."
+                )
+                await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
             elif text.startswith("/usage"):
                 cpu_usage = psutil.cpu_percent(interval=1)
                 memory_info = psutil.virtual_memory()
@@ -2851,9 +2970,17 @@ async def _set_running(val: bool):
     global running
     running = val
 
-async def _set_frozen(val: bool):
-    global frozen
-    frozen = val
+async def _freeze_command():
+    global frozen, session_freeze_override
+    frozen = True
+    session_freeze_override = False # A manual freeze clears any override
+    log.info("Manual freeze issued.")
+
+async def _unfreeze_command():
+    global frozen, session_freeze_override
+    frozen = False
+    session_freeze_override = True
+    log.info("Manual unfreeze issued. Overriding current session freeze if active.")
 
 async def handle_critical_error_async(exc: Exception, context: str = None):
     global running
