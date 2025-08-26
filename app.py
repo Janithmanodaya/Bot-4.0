@@ -2680,11 +2680,8 @@ def handle_update_sync(update, loop):
                     pnl_info += f"\n(LIMIT REACHED: {CONFIG['MAX_DAILY_LOSS']:.2f})"
 
                 # Bot Status section
-                                status_lines = [
-                    f"▶️ Running: *{running}*",
-                    f"✋ Manual Freeze: *{frozen}*"
-                ]
-                
+                status_lines = [f"▶️ Running: *{running}*"]
+                status_lines.append(f"✋ Manual Freeze: *{frozen}*")
                 session_status_text = f"⏰ Session Freeze: *{session_freeze_active}*"
                 if session_freeze_active:
                     session_status_text += f" ({notified_frozen_session})"
@@ -2692,13 +2689,12 @@ def handle_update_sync(update, loop):
                     session_status_text += " (Overridden)"
                 status_lines.append(session_status_text)
                 status_lines.append(f"📈 Managed Trades: *{len(trades)}*")
-                
-                # Create the full message string
+
+                # Combine sections
                 txt = (
-                    f"📊 *Bot Status*\n"
-                    f"{'\\n'.join(status_lines)}\n\n"
-                    f"💰 *PnL Info*\n"
-                    f"{pnl_info}"
+                    f"📊 *Bot Status*\n\n"
+                    f"{'\n'.join(status_lines)}\n\n"
+                    f"💰 *PnL Info*\n{pnl_info}"
                 )
                 send_telegram(txt, parse_mode='Markdown')
                 try:
