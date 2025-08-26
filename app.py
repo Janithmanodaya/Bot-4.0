@@ -22,8 +22,9 @@ import sqlite3
 import io
 import re
 import traceback
+import psutil
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 from decimal import Decimal, ROUND_DOWN, getcontext
 
@@ -135,9 +136,11 @@ CONFIG = {
     "DRY_RUN": os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes"),
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
     "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "10")),
 }
 
 running = (CONFIG["START_MODE"] == "running")
+overload_notified = False
 frozen = False
 daily_loss_limit_hit = False
 daily_profit_limit_hit = False
@@ -188,7 +191,10 @@ last_trade_close_time: Dict[str, datetime] = {}
 telegram_thread: Optional[threading.Thread] = None
 monitor_thread_obj: Optional[threading.Thread] = None
 pnl_monitor_thread_obj: Optional[threading.Thread] = None
+maintenance_thread_obj: Optional[threading.Thread] = None
 monitor_stop_event = threading.Event()
+
+last_maintenance_month = "" # YYYY-MM format
 
 scan_task: Optional[asyncio.Task] = None
 rogue_check_task: Optional[asyncio.Task] = None
@@ -456,6 +462,10 @@ async def lifespan(app: FastAPI):
         pnl_monitor_thread_obj = threading.Thread(target=daily_pnl_monitor_thread_func, daemon=True)
         pnl_monitor_thread_obj.start()
         log.info("Started daily PnL monitor thread.")
+
+        maintenance_thread_obj = threading.Thread(target=monthly_maintenance_thread_func, daemon=True)
+        maintenance_thread_obj.start()
+        log.info("Started monthly maintenance thread.")
     else:
         log.warning("Binance client not initialized -> scanning and monitor threads not started.")
 
@@ -811,6 +821,33 @@ def remove_managed_trade_from_db(trade_id: str):
     cur.execute("DELETE FROM managed_trades WHERE id = ?", (trade_id,))
     conn.commit()
     conn.close()
+
+def prune_trades_db(year: int, month: int):
+    """Deletes all trades from the database for a specific month."""
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    
+    start_date = f"{year}-{month:02d}-01"
+    next_month_val = month + 1
+    next_year_val = year
+    if next_month_val > 12:
+        next_month_val = 1
+        next_year_val += 1
+    end_date = f"{next_year_val}-{next_month_val:02d}-01"
+
+    log.info(f"Pruning trades in DB from {start_date} up to {end_date}")
+    try:
+        cur.execute("DELETE FROM trades WHERE close_time >= ? AND close_time < ?", (start_date, end_date))
+        conn.commit()
+        count = cur.rowcount
+        log.info(f"Successfully pruned {count} trades from the database.")
+        if count > 0:
+            send_telegram(f"🧹 Database Maintenance: Pruned {count} old trade records from {year}-{month:02d}.")
+    except Exception as e:
+        log.exception(f"Failed to prune trades from DB for {year}-{month:02d}")
+        send_telegram(f"⚠️ Failed to prune old database records for {year}-{month:02d}. Please check logs.")
+    finally:
+        conn.close()
 
 def load_managed_trades_from_db() -> Dict[str, Dict[str, Any]]:
     conn = sqlite3.connect(CONFIG["DB_FILE"])
@@ -1527,7 +1564,7 @@ async def evaluate_and_enter(symbol: str):
                 notify_regime_change = True
         
         if notify_regime_change:
-            await asyncio.to_thread(send_telegram, f"📈 Risk regime for {symbol} changed to: {regime}. Risk multiplier: {risk_multiplier}x")
+            log.info(f"Risk regime for {symbol} changed to: {regime}. Risk multiplier: {risk_multiplier}x")
         # --- End Volatility Regime ---
 
         trend_small = 'bull' if (kama_now - kama_prev) > 0 else 'bear'
@@ -1699,7 +1736,20 @@ async def evaluate_and_enter(symbol: str):
                           'open_time': meta['open_time'], 'close_time': None, 'risk_usdt': risk_usdt})
             await asyncio.to_thread(add_managed_trade_to_db, meta)
             dry_run_prefix = "[DRY RUN] " if CONFIG["DRY_RUN"] else ""
-            await asyncio.to_thread(send_telegram, f"{dry_run_prefix}Opened {side} on {symbol}\nEntry: {price:.4f}\nQty: {qty}\nLeverage: {leverage}\nRisk: {risk_usdt:.4f} USDT\nSL: {stop_price:.4f}\nTP: {take_price:.4f}\nTrade ID: {trade_id}")
+            
+            open_msg = (
+                f"✅ *New Trade Opened* {dry_run_prefix}\n\n"
+                f"**Symbol:** {symbol}\n"
+                f"**Side:** {side}\n"
+                f"**Entry:** `{price:.4f}`\n"
+                f"**Qty:** `{qty}`\n"
+                f"**Leverage:** {leverage}x\n"
+                f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+                f"**SL:** `{stop_price:.4f}`\n"
+                f"**TP:** `{take_price:.4f}`\n\n"
+                f"**ID:** `{trade_id}`"
+            )
+            await asyncio.to_thread(send_telegram, open_msg, parse_mode='Markdown')
             log.info("%sOpened trade: %s", dry_run_prefix, meta)
         except Exception as e:
             # Use the new centralized error handler
@@ -1725,6 +1775,7 @@ def monitor_thread_func():
     global managed_trades, last_trade_close_time, running
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
+        loop_start_time = time.time()
         try:
             if client is None:
                 time.sleep(5)
@@ -1792,6 +1843,17 @@ def monitor_thread_func():
             finally:
                 managed_trades_lock.release()
             
+            # --- Pre-fetch kline data for all active symbols to reduce API calls ---
+            active_symbols = {meta['symbol'] for meta in trades_snapshot.values()}
+            kline_data_cache = {}
+            for sym_key in active_symbols:
+                try:
+                    # Reduced limit from 200 to 100 to conserve memory
+                    kline_data_cache[sym_key] = fetch_klines_sync(sym_key, CONFIG["TIMEFRAME"], 100)
+                except Exception as e:
+                    log.error(f"Failed to pre-fetch klines for {sym_key} in monitor loop: {e}")
+                    kline_data_cache[sym_key] = None # Mark as failed
+
             to_remove = []
             for tid, meta in trades_snapshot.items():
                 sym = meta['symbol']
@@ -1826,16 +1888,28 @@ def monitor_thread_func():
                         last_trade_close_time[sym] = close_time
                     finally:
                         managed_trades_lock.release()
-                    send_telegram(f"Trade closed {meta['id']} on {sym}\nPNL: {unreal:.6f} USDT\nCooldown: {CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles")
+                    # Re-enabled trade close notification per user request, with improved formatting
+                    close_msg = (
+                        f"✅ *Trade Closed*\n\n"
+                        f"**ID:** `{meta['id']}`\n"
+                        f"**Symbol:** {sym}\n"
+                        f"**PnL:** `{unreal:.4f} USDT`"
+                    )
+                    send_telegram(close_msg, parse_mode='Markdown')
                     to_remove.append(tid)
+                    continue
+                
+                # Get the pre-fetched kline data for this trade's symbol
+                df_monitor = kline_data_cache.get(sym)
+                if df_monitor is None or df_monitor.empty:
+                    log.warning(f"Skipping monitoring cycle for {tid} due to missing kline data.")
                     continue
 
                 # --- Break-Even Auto-Move Logic ---
                 if CONFIG.get("BE_AUTO_MOVE_ENABLED", True) and not meta.get('be_moved') and meta.get('trade_phase', 0) == 0:
                     try:
-                        df_be = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
-                        atr_now_be = atr(df_be, CONFIG["ATR_LENGTH"]).iloc[-1]
-                        current_price_be = df_be['close'].iloc[-1]
+                        atr_now_be = atr(df_monitor, CONFIG["ATR_LENGTH"]).iloc[-1]
+                        current_price_be = df_monitor['close'].iloc[-1]
 
                         entry_price = meta['entry_price']
                         side = meta['side']
@@ -1868,7 +1942,6 @@ def monitor_thread_func():
                 # Dynamic SL/TP Logic
                 if meta.get('dyn_sltp'):
                     try:
-                        df_monitor = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 2)
                         current_price = df_monitor['close'].iloc[-1]
                         
                         # Check for TP1
@@ -1930,9 +2003,8 @@ def monitor_thread_func():
                 # Trailing SL logic
                 if meta.get('trailing') and not meta.get('be_moved'):
                     try:
-                        df = fetch_klines_sync(sym, CONFIG["TIMEFRAME"], 200)
-                        atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                        current_price = df['close'].iloc[-1]
+                        atr_now = atr(df_monitor, CONFIG["ATR_LENGTH"]).iloc[-1]
+                        current_price = df_monitor['close'].iloc[-1]
                         moved = False
                         new_sl = None
                         new_orders = None
@@ -1959,7 +2031,12 @@ def monitor_thread_func():
                                         managed_trades[tid]['sltp_orders'] = new_orders
                                     add_managed_trade_to_db(managed_trades[tid])
                             meta['sl'] = new_sl
-                            send_telegram(f"Adjusted SL for {meta['id']} ({sym}) -> {new_sl:.6f}")
+                            sl_update_msg = (
+                                f"📈 *Trailing Stop Update*\n\n"
+                                f"**ID:** `{meta['id']}` ({sym})\n"
+                                f"**New SL:** `{new_sl:.6f}`"
+                            )
+                            send_telegram(sl_update_msg, parse_mode='Markdown')
                     except Exception as e:
                         log_and_send_error(f"Failed to process Trailing SL for {tid}", e)
 
@@ -1970,8 +2047,24 @@ def monitor_thread_func():
                         managed_trades.pop(tid, None)
                 finally:
                     managed_trades_lock.release()
+
+            # --- Overload Monitoring ---
+            loop_end_time = time.time()
+            duration = loop_end_time - loop_start_time
+            if duration > CONFIG["MONITOR_LOOP_THRESHOLD_SEC"]:
+                if not overload_notified:
+                    log.warning(f"Monitor loop took {duration:.2f}s to complete, exceeding threshold of {CONFIG['MONITOR_LOOP_THRESHOLD_SEC']}s.")
+                    send_telegram(f"⚠️ Bot Alert: The main monitoring loop is running slow ({duration:.2f}s), which may indicate server overload and could affect performance.")
+                    overload_notified = True
+            elif overload_notified:
+                # Reset notification flag if performance is back to normal
+                log.info("Monitor loop performance is back to normal.")
+                overload_notified = False
             
-            time.sleep(5)
+            # The loop should sleep for at least a little bit, but subtract processing time
+            # to keep the cycle time relatively constant.
+            sleep_duration = max(0.1, 5 - duration)
+            time.sleep(sleep_duration)
 
         except Exception as e:
             log.exception("An unhandled exception occurred in monitor thread. Bot will be paused.")
@@ -2055,6 +2148,62 @@ def daily_pnl_monitor_thread_func():
     log.info("Daily PnL monitor thread exiting.")
 
 
+def monthly_maintenance_thread_func():
+    global last_maintenance_month
+    log.info("Monthly maintenance thread started.")
+    
+    # Load the last run month from a state file to persist across restarts
+    try:
+        with open("maintenance_state.json", "r") as f:
+            state = json.load(f)
+            last_maintenance_month = state.get("last_maintenance_month", "")
+    except FileNotFoundError:
+        last_maintenance_month = ""
+        log.info("maintenance_state.json not found, starting fresh.")
+
+    while not monitor_stop_event.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            current_month_str = now.strftime('%Y-%m')
+
+            # Run on the 2nd day of the month to ensure all data from the 1st is settled
+            if now.day == 2 and current_month_str != last_maintenance_month:
+                log.info(f"Running monthly maintenance for previous month...")
+
+                first_day_of_current_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                last_day_of_previous_month = first_day_of_current_month - timedelta(days=1)
+                year = last_day_of_previous_month.year
+                month = last_day_of_previous_month.month
+
+                log.info(f"Generating report for {year}-{month:02d}...")
+                asyncio.run_coroutine_threadsafe(generate_and_send_monthly_report(year, month), main_loop)
+                
+                # Add a small delay to ensure the report sends before we prune the data
+                time.sleep(15)
+
+                log.info(f"Pruning database records for {year}-{month:02d}...")
+                prune_trades_db(year, month)
+                
+                last_maintenance_month = current_month_str
+                # Persist state
+                try:
+                    with open("maintenance_state.json", "w") as f:
+                        json.dump({"last_maintenance_month": last_maintenance_month}, f)
+                except IOError as e:
+                    log.error(f"Could not write maintenance state file: {e}")
+                
+                log.info(f"Monthly maintenance for {year}-{month:02d} complete. Next check in 1 hour.")
+
+            # Sleep for an hour before checking again
+            time.sleep(3600)
+
+        except Exception as e:
+            log.exception("An error occurred in the monthly maintenance thread.")
+            time.sleep(3600) # Wait an hour before retrying on error
+
+    log.info("Monthly maintenance thread exiting.")
+
+
 async def manage_session_freeze_state():
     """
     Checks session freeze status and sends notifications on state changes.
@@ -2116,87 +2265,118 @@ async def scanning_loop():
             # To prevent rapid-fire errors, wait a bit before retrying.
             await asyncio.sleep(60)
 
+def _generate_pnl_report_sync(query: str, params: tuple, title: str) -> (str, Optional[bytes]):
+    """A helper function to generate a PnL report from a given SQL query."""
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    try:
+        df = pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
+
+    if df.empty:
+        return (f"No trades found for the report period: {title}", None)
+
+    # --- Calculate Metrics ---
+    total_trades = len(df)
+    winning_trades = len(df[df['pnl'] > 0])
+    losing_trades = total_trades - winning_trades
+    win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0.0
+    
+    total_pnl = df['pnl'].sum()
+
+    # R:R Calculation
+    rr_df = df[df['risk_usdt'] > 0].copy()
+    if not rr_df.empty:
+        rr_df['rr'] = rr_df['pnl'] / rr_df['risk_usdt']
+        average_rr = rr_df['rr'].mean()
+    else:
+        average_rr = 0.0
+
+    # Max Drawdown Calculation
+    df['cumulative_pnl'] = df['pnl'].cumsum()
+    df['running_max'] = df['cumulative_pnl'].cummax()
+    df['drawdown'] = df['running_max'] - df['cumulative_pnl']
+    max_drawdown = df['drawdown'].max()
+    
+    # --- Format Text Report ---
+    summary_text = (
+        f"*Summary*\n"
+        f"  - Total Trades: {total_trades}\n"
+        f"  - Winning Trades: {winning_trades}\n"
+        f"  - Losing Trades: {losing_trades}\n"
+        f"  - Win Rate: {win_rate:.2f}%\n\n"
+        f"*PnL & Risk*\n"
+        f"  - Total PnL: {total_pnl:.2f} USDT\n"
+        f"  - Max Drawdown: -{max_drawdown:.2f} USDT\n"
+        f"  - Avg R:R: {average_rr:.2f}R\n"
+    )
+    report_text = f"{title}\n\n{summary_text}"
+
+    # --- Generate PnL Chart ---
+    df['close_time'] = pd.to_datetime(df['close_time'])
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(df['close_time'], df['cumulative_pnl'], marker='o', linestyle='-')
+    
+    ax.set_title(f'Cumulative PnL: {title.splitlines()[0]}')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Cumulative PnL (USDT)')
+    ax.grid(True)
+    fig.autofmt_xdate()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    
+    return (report_text, buf.getvalue())
+
+
+async def generate_and_send_monthly_report(year: int, month: int):
+    """Generates and sends a performance report for a specific month."""
+    title = f"🗓️ *Monthly Performance Report for {year}-{month:02d}*"
+    start_date = f"{year}-{month:02d}-01"
+    next_month_val = month + 1
+    next_year_val = year
+    if next_month_val > 12:
+        next_month_val = 1
+        next_year_val += 1
+    end_date = f"{next_year_val}-{next_month_val:02d}-01"
+    
+    query = "SELECT close_time, pnl, risk_usdt FROM trades WHERE close_time >= ? AND close_time < ? AND pnl IS NOT NULL ORDER BY close_time ASC"
+    params = (start_date, end_date)
+    
+    try:
+        report_text, chart_bytes = await asyncio.to_thread(_generate_pnl_report_sync, query, params, title)
+        await asyncio.to_thread(
+            send_telegram,
+            msg=report_text,
+            document_content=chart_bytes,
+            document_name=f"pnl_report_{year}-{month:02d}.png",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        log.exception(f"Error generating monthly report for {year}-{month:02d}")
+        await asyncio.to_thread(send_telegram, f"An error occurred while generating the monthly report: {e}")
+
+
 async def generate_and_send_report():
     """
-    Fetches trade data, calculates analytics, generates a PnL chart,
+    Fetches all trade data, calculates analytics, generates a PnL chart,
     and sends the report via Telegram.
-    This function handles the core logic for the /report command.
     """
-    def _generate_report_sync():
-        conn = sqlite3.connect(CONFIG["DB_FILE"])
-        try:
-            df = pd.read_sql_query(
-                "SELECT close_time, pnl, risk_usdt FROM trades WHERE close_time IS NOT NULL AND pnl IS NOT NULL ORDER BY close_time ASC",
-                conn
-            )
-        finally:
-            conn.close()
-
-        if df.empty:
-            return ("No trades found to generate a report.", None)
-
-        # --- Calculate Metrics ---
-        total_trades = len(df)
-        winning_trades = len(df[df['pnl'] > 0])
-        losing_trades = total_trades - winning_trades
-        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0.0
-        
-        total_pnl = df['pnl'].sum()
-
-        # R:R Calculation
-        rr_df = df[df['risk_usdt'] > 0].copy()
-        if not rr_df.empty:
-            rr_df['rr'] = rr_df['pnl'] / rr_df['risk_usdt']
-            average_rr = rr_df['rr'].mean()
-        else:
-            average_rr = 0.0
-
-        # Max Drawdown Calculation
-        df['cumulative_pnl'] = df['pnl'].cumsum()
-        df['running_max'] = df['cumulative_pnl'].cummax()
-        df['drawdown'] = df['running_max'] - df['cumulative_pnl']
-        max_drawdown = df['drawdown'].max()
-        
-        # --- Format Text Report ---
-        report_text = (
-            f"📊 *Performance Report*\n\n"
-            f"*Summary*\n"
-            f"  - Total Trades: {total_trades}\n"
-            f"  - Winning Trades: {winning_trades}\n"
-            f"  - Losing Trades: {losing_trades}\n"
-            f"  - Win Rate: {win_rate:.2f}%\n\n"
-            f"*PnL & Risk*\n"
-            f"  - Total PnL: {total_pnl:.2f} USDT\n"
-            f"  - Max Drawdown: -{max_drawdown:.2f} USDT\n"
-            f"  - Avg R:R: {average_rr:.2f}R\n"
-        )
-
-        # --- Generate PnL Chart ---
-        df['close_time'] = pd.to_datetime(df['close_time'])
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(df['close_time'], df['cumulative_pnl'], marker='o', linestyle='-')
-        
-        ax.set_title('Cumulative PnL Over Time')
-        ax.set_xlabel('Date')
-        ax.set_ylabel('Cumulative PnL (USDT)')
-        ax.grid(True)
-        fig.autofmt_xdate()
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight')
-        plt.close(fig)
-        buf.seek(0)
-        
-        return (report_text, buf.getvalue())
-
+    title = "📊 *Overall Performance Report*"
+    query = "SELECT close_time, pnl, risk_usdt FROM trades WHERE close_time IS NOT NULL AND pnl IS NOT NULL ORDER BY close_time ASC"
+    params = ()
+    
     try:
-        report_text, chart_bytes = await asyncio.to_thread(_generate_report_sync)
+        report_text, chart_bytes = await asyncio.to_thread(_generate_pnl_report_sync, query, params, title)
         
         await asyncio.to_thread(
             send_telegram,
             msg=report_text,
             document_content=chart_bytes,
-            document_name="pnl_report.png"
+            document_name="pnl_report_overall.png",
+            parse_mode='Markdown'
         )
     except Exception as e:
         log.exception("Error generating report")
@@ -2271,7 +2451,8 @@ def build_control_keyboard():
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
         [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
         [KeyboardButton("/listorders"), KeyboardButton("/sessions")],
-        [KeyboardButton("/status"), KeyboardButton("/showparams")]
+        [KeyboardButton("/status"), KeyboardButton("/showparams")],
+        [KeyboardButton("/usage"), KeyboardButton("/report")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -2374,7 +2555,7 @@ def handle_update_sync(update, loop):
                     fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
                     try: fut.result(timeout=5)
                     except Exception as e: log.error("Failed to execute /startbot action: %s", e)
-                    send_telegram("Bot state -> RUNNING")
+                    send_telegram("✅ Bot is now **RUNNING**.", parse_mode='Markdown')
                     
                     # Start the periodic rogue position checker
                     async def start_rogue_checker():
@@ -2397,7 +2578,7 @@ def handle_update_sync(update, loop):
                 fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /stopbot action: %s", e)
-                send_telegram("Bot state -> STOPPED")
+                send_telegram("🛑 Bot is now **STOPPED**.", parse_mode='Markdown')
 
                 # Stop the periodic rogue position checker
                 async def stop_rogue_checker():
@@ -2418,12 +2599,12 @@ def handle_update_sync(update, loop):
                 fut = asyncio.run_coroutine_threadsafe(_set_frozen(True), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /freeze action: %s", e)
-                send_telegram("Bot -> FROZEN (no new entries)")
+                send_telegram("❄️ Bot is now **FROZEN**. It will not open new trades.", parse_mode='Markdown')
             elif text.startswith("/unfreeze"):
                 fut = asyncio.run_coroutine_threadsafe(_set_frozen(False), loop)
                 try: fut.result(timeout=5)
                 except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
-                send_telegram("Bot -> UNFROZEN")
+                send_telegram("✅ Bot is now **UNFROZEN**. It will resume opening new trades.", parse_mode='Markdown')
             elif text.startswith("/status"):
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
@@ -2440,13 +2621,13 @@ def handle_update_sync(update, loop):
                     pnl_info += f"\n(LIMIT REACHED: {CONFIG['MAX_DAILY_LOSS']:.2f})"
 
                 txt = (
-                    f"Status:\n"
-                    f"▶️ Running: {running}\n"
-                    f"❄️ Frozen: {frozen}\n"
-                    f"📈 Managed Trades: {len(trades)}\n"
-                    f"💸\n{pnl_info}"
+                    f"📊 *Bot Status*\n\n"
+                    f"▶️ Running: *{running}*\n"
+                    f"❄️ Frozen: *{frozen}*\n"
+                    f"📈 Managed Trades: *{len(trades)}*\n\n"
+                    f"💰 *PnL Info*\n{pnl_info}"
                 )
-                send_telegram(txt)
+                send_telegram(txt, parse_mode='Markdown')
                 try:
                     telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
@@ -2469,12 +2650,13 @@ def handle_update_sync(update, loop):
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         
-                        text = (f"*{v['symbol']}* | {v['side']}\n"
-                                f"Qty: {v['qty']} | Entry: {v['entry_price']:.4f}\n"
-                                f"SL: {v['sl']:.4f} | TP: {v['tp']:.4f}\n"
-                                f"Unrealized PnL: {unreal_str} USDT\n"
-                                f"`{trade_id}`")
-                        
+                        text = (f"📈 *{v['symbol']}* `{v['side']}`\n"
+                                f"   - **Qty:** `{v['qty']}`\n"
+                                f"   - **Entry:** `{v['entry_price']:.4f}`\n"
+                                f"   - **SL/TP:** `{v['sl']:.4f}` / `{v['tp']:.4f}`\n"
+                                f"   - **PnL:** `{unreal_str} USDT`\n"
+                                f"   - **ID:** `{trade_id}`")
+
                         keyboard = InlineKeyboardMarkup([
                             [
                                 InlineKeyboardButton("Close 50%", callback_data=f"close_50_{trade_id}"),
@@ -2514,10 +2696,9 @@ def handle_update_sync(update, loop):
                         send_telegram("✅ Bot is ACTIVE.\n\nNo session freezes are scheduled in the next 48 hours.")
             
             elif text.startswith("/showparams"):
-                out = "Current runtime params:\n"
-                for k,v in CONFIG.items():
-                    out += f"{k} = {v}\n"
-                send_telegram(out)
+                param_list = [f" - `{k}` = `{v}`" for k, v in CONFIG.items()]
+                out = "⚙️ *Current Bot Parameters*\n\n" + "\n".join(param_list)
+                send_telegram(out, parse_mode='Markdown')
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
@@ -2580,6 +2761,19 @@ def handle_update_sync(update, loop):
                     except Exception as e:
                         log.error(f"Failed to execute /chart action for {symbol}: {e}")
                         send_telegram(f"Failed to generate chart for {symbol}: {e}")
+            elif text.startswith("/usage"):
+                cpu_usage = psutil.cpu_percent(interval=1)
+                memory_info = psutil.virtual_memory()
+                
+                usage_report = (
+                    f"🖥️ *System Resource Usage*\n\n"
+                    f"  - *CPU Usage:* {cpu_usage}%\n"
+                    f"  - *Memory Usage:* {memory_info.percent}%\n"
+                    f"    - Total: {memory_info.total / (1024**3):.2f} GB\n"
+                    f"    - Used: {memory_info.used / (1024**3):.2f} GB\n"
+                    f"    - Free: {memory_info.free / (1024**3):.2f} GB"
+                )
+                send_telegram(usage_report, parse_mode='Markdown')
             elif text.startswith("/scalein"):
                 parts = text.split()
                 if len(parts) < 3:
@@ -2705,6 +2899,10 @@ if __name__ == "__main__":
             pnl_monitor_thread_obj = threading.Thread(target=daily_pnl_monitor_thread_func, daemon=True)
             pnl_monitor_thread_obj.start()
             log.info("Started daily PnL monitor thread.")
+
+            maintenance_thread_obj = threading.Thread(target=monthly_maintenance_thread_func, daemon=True)
+            maintenance_thread_obj.start()
+            log.info("Started monthly maintenance thread.")
         else:
             log.warning("Binance client not initialized, monitor threads not started.")
         if telegram_bot:
