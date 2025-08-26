@@ -15,6 +15,7 @@ numpy
 requests
 matplotlib
 mplfinance
+psutil
 
 # Version constraints (to prevent dependency conflicts
 urllib3<2.0
