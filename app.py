@@ -75,8 +75,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "EMA_LEN": int(os.getenv("EMA_LEN", "200")),
-    "EMASIGNAL_BACKCANDLES": int(os.getenv("EMASIGNAL_BACKCANDLES", "6")),
+    "SMA_LEN": int(os.getenv("SMA_LEN", "200")),
     "BB_LENGTH_CUSTOM": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
     "BB_STD_CUSTOM": float(os.getenv("BB_STD_CUSTOM", "2.5")),
     "RSI_LEN": int(os.getenv("RSI_LEN", "2")),
@@ -89,6 +88,7 @@ CONFIG = {
     "SL_BUFFER_PCT": float(os.getenv("SL_BUFFER_PCT", "0.02")),
 
     # --- TP/SL ---
+    "TREND_LOOKBACK_CANDLES": int(os.getenv("TREND_LOOKBACK_CANDLES", "6")),
     "TP1_RR": float(os.getenv("TP1_RR", "1.0")),
     "TP2_RR": float(os.getenv("TP2_RR", "2.0")),
     "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")),
@@ -1014,9 +1014,9 @@ def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
 
 # --- New Strategy Indicators ---
 
-def ema(series: pd.Series, length: int) -> pd.Series:
-    """Calculates the Exponential Moving Average (EMA)."""
-    return series.ewm(span=length, adjust=False).mean()
+def sma(series: pd.Series, length: int) -> pd.Series:
+    """Calculates the Simple Moving Average (SMA)."""
+    return series.rolling(window=length).mean()
 
 def rsi(series: pd.Series, length: int) -> pd.Series:
     """Calculates the Relative Strength Index (RSI)."""
@@ -1038,22 +1038,19 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     lower_band = ma - (std_dev * std)
     return upper_band, lower_band
 
-def add_ema_signal(df: pd.DataFrame, ema_series: pd.Series, backcandles: int) -> pd.Series:
+def add_sma_signal(df: pd.DataFrame, sma_series: pd.Series, backcandles: int) -> pd.Series:
     """
-    Calculates the EMASignal based on candle positions relative to the EMA.
-    - 2 (Bullish): All 'backcandles' closes are above the EMA.
-    - 1 (Bearish): All 'backcandles' closes are below the EMA.
+    Calculates the SMASignal based on the last 'backcandles' positions relative to the SMA.
+    - 2 (Bullish): All 'backcandles' lows are above the SMA.
+    - 1 (Bearish): All 'backcandles' highs are below the SMA.
     - 0 (Neutral): Otherwise.
     """
-    close = df['close']
-    
-    # Ensure backcandles is at least 1 to avoid issues with rolling window
     if backcandles < 1:
         return pd.Series(0, index=df.index)
 
-    # Use rolling window to check if all values in the window are True
-    all_above = (close > ema_series).rolling(window=backcandles, min_periods=backcandles).apply(all, raw=True).fillna(0).astype(bool)
-    all_below = (close < ema_series).rolling(window=backcandles, min_periods=backcandles).apply(all, raw=True).fillna(0).astype(bool)
+    # Use 'low' for bullish and 'high' for bearish for a more robust signal
+    all_above = (df['low'] > sma_series).rolling(window=backcandles, min_periods=backcandles).apply(all, raw=True).fillna(0).astype(bool)
+    all_below = (df['high'] < sma_series).rolling(window=backcandles, min_periods=backcandles).apply(all, raw=True).fillna(0).astype(bool)
 
     signal = pd.Series(0, index=df.index)
     signal.loc[all_above] = 2  # Bullish
@@ -1065,19 +1062,19 @@ def add_order_signal(df: pd.DataFrame, offset_pct: float) -> pd.DataFrame:
     """
     Calculates the 'ordersignal' column.
     Sets a limit order price if entry conditions are met, otherwise 0.
-    Expects df to have 'EMASignal', 'close', 'BBU', 'BBL' columns.
+    Expects df to have 'SMASignal', 'close', 'BBU', 'BBL' columns.
     """
     ordersignal = pd.Series(0.0, index=df.index)
     
-    # Long entry condition: Bullish EMA signal and price touches or crosses below the lower BB
-    long_mask = (df['EMASignal'] == 2) & (df['close'] <= df['BBL'])
-    # Set limit order at the lower band, with an optional offset
-    ordersignal.loc[long_mask] = df['BBL'] * (1 + offset_pct)
+    # Long entry condition: Bullish SMA signal and price touches or crosses below the lower BB
+    long_mask = (df['SMASignal'] == 2) & (df['close'] <= df['BBL'])
+    # Set limit order at a percentage below the current close
+    ordersignal.loc[long_mask] = df['close'] * (1 - offset_pct)
 
-    # Short entry condition: Bearish EMA signal and price touches or crosses above the upper BB
-    short_mask = (df['EMASignal'] == 1) & (df['close'] >= df['BBU'])
-    # Set limit order at the upper band, with an optional offset
-    ordersignal.loc[short_mask] = df['BBU'] * (1 - offset_pct)
+    # Short entry condition: Bearish SMA signal and price touches or crosses above the upper BB
+    short_mask = (df['SMASignal'] == 1) & (df['close'] >= df['BBU'])
+    # Set limit order at a percentage above the current close
+    ordersignal.loc[short_mask] = df['close'] * (1 + offset_pct)
     
     df['ordersignal'] = ordersignal
     return df
@@ -1169,6 +1166,20 @@ def get_symbol_info(symbol: str) -> Optional[Dict[str, Any]]:
         return next((s for s in symbols if s.get('symbol') == symbol), None)
     except Exception:
         return None
+
+def get_step_size(symbol: str) -> Optional[Decimal]:
+    """Retrieves the lot step size for a given symbol from exchange info."""
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict): return None
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info: return None
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'LOT_SIZE':
+                return Decimal(str(f.get('stepSize', '1')))
+    except Exception:
+        log.exception("get_step_size failed")
+    return None
 
 def get_max_leverage(symbol: str) -> int:
     try:
@@ -1718,12 +1729,12 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
             raw_df.set_index('close_time', inplace=True)
             
             # Calculate new indicators for the validation report
-            ema_s = ema(raw_df['close'], CONFIG["EMA_LEN"])
+            sma_s = sma(raw_df['close'], CONFIG["SMA_LEN"])
             rsi_s = rsi(raw_df['close'], CONFIG["RSI_LEN"])
             bbu_s, bbl_s = bollinger_bands(raw_df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
             
             results["checks"].append({"type": "indicators_sample", "ok": True, "detail": {
-                "ema": float(ema_s.iloc[-1]), "rsi": float(rsi_s.iloc[-1]), 
+                "sma": float(sma_s.iloc[-1]), "rsi": float(rsi_s.iloc[-1]), 
                 "bbu": float(bbu_s.iloc[-1]), "bbl": float(bbl_s.iloc[-1])
             }})
         except Exception as e:
@@ -1770,10 +1781,10 @@ async def evaluate_and_enter(symbol: str):
         df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
 
         # --- Calculate New Strategy Indicators ---
-        df['ema'] = ema(df['close'], CONFIG["EMA_LEN"])
+        df['sma'] = sma(df['close'], CONFIG["SMA_LEN"])
         df['BBU'], df['BBL'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
         df['rsi'] = rsi(df['close'], CONFIG["RSI_LEN"])
-        df['EMASignal'] = add_ema_signal(df, df['ema'], CONFIG["EMASIGNAL_BACKCANDLES"])
+        df['SMASignal'] = add_sma_signal(df, df['sma'], CONFIG["TREND_LOOKBACK_CANDLES"])
         df = add_order_signal(df, CONFIG["ORDER_LIMIT_OFFSET_PCT"])
         
         # We only care about the most recent signal
@@ -1781,25 +1792,25 @@ async def evaluate_and_enter(symbol: str):
         order_signal_price = last['ordersignal']
 
         details = {
-            'price': last['close'], 'ema': last['ema'], 'BBU': last['BBU'], 
-            'BBL': last['BBL'], 'rsi': last['rsi'], 'EMASignal': int(last['EMASignal'])
+            'price': last['close'], 'sma': last['sma'], 'BBU': last['BBU'], 
+            'BBL': last['BBL'], 'rsi': last['rsi'], 'SMASignal': int(last['SMASignal'])
         }
 
         # --- New Signal Logic with Granular Rejection Reasons ---
-        ema_signal = last['EMASignal']
+        sma_signal = last['SMASignal']
         
-        if ema_signal == 0:
-            _record_rejection(symbol, "No EMA Signal / Neutral Trend", details)
+        if sma_signal == 0:
+            _record_rejection(symbol, "No Trend Signal", details)
             return
 
         side = None
-        if ema_signal == 2: # Bullish context
+        if sma_signal == 2: # Bullish context
             if last['close'] > last['BBL']:
                 details['reason_detail'] = f"Price {last['close']:.4f} > BBL {last['BBL']:.4f}"
                 _record_rejection(symbol, "Price above Lower BB", details)
                 return
             side = 'BUY'
-        elif ema_signal == 1: # Bearish context
+        elif sma_signal == 1: # Bearish context
             if last['close'] < last['BBU']:
                 details['reason_detail'] = f"Price {last['close']:.4f} < BBU {last['BBU']:.4f}"
                 _record_rejection(symbol, "Price below Upper BB", details)
@@ -1807,11 +1818,9 @@ async def evaluate_and_enter(symbol: str):
             side = 'SELL'
         
         if not side:
-            # This case should ideally not be hit if ema_signal is 1 or 2, but as a safeguard:
             _record_rejection(symbol, "Signal logic error (no side)", details)
             return
 
-        # This check is now a safeguard, as the logic above should cover all cases.
         if order_signal_price <= 0:
             _record_rejection(symbol, "Order signal price is zero despite conditions met", details)
             return
@@ -1821,22 +1830,16 @@ async def evaluate_and_enter(symbol: str):
 
         # --- Pre-Trade Checks (re-using existing logic) ---
         async with managed_trades_lock, pending_limit_orders_lock:
-            # Check if there is already a managed trade for this symbol
             if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
                 _record_rejection(symbol, "Trade exists and hedging is disabled", details)
                 return
-            
-            # Check if there is already a pending limit order for this symbol
             if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
                 _record_rejection(symbol, "Pending limit order already exists", details)
                 return
-
-            # Check for max concurrent trades (including pending orders)
             if len(managed_trades) + len(pending_limit_orders) >= CONFIG["MAX_CONCURRENT_TRADES"]:
                 _record_rejection(symbol, "Max concurrent trades reached", {'open_trades': len(managed_trades), 'pending_orders': len(pending_limit_orders)})
                 return
 
-        # Check for cooldown period after the last trade was closed
         last_close = last_trade_close_time.get(symbol)
         if last_close:
             n_since = candles_since_close(df, last_close)
@@ -1848,8 +1851,9 @@ async def evaluate_and_enter(symbol: str):
         df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
         last = df.iloc[-1] # Refresh last row to include ATR
         
-        backcandles = CONFIG["EMASIGNAL_BACKCANDLES"]
-        signal_window = df.iloc[-backcandles-1:-1] 
+        # Corrected SL swing window to include the current bar
+        lookback = CONFIG["TREND_LOOKBACK_CANDLES"]
+        signal_window = df.iloc[-(lookback + 1):] 
 
         if side == 'BUY':
             swing_level = signal_window['low'].min()
@@ -1902,10 +1906,26 @@ async def evaluate_and_enter(symbol: str):
             notional = qty * entry_price_for_calc
             await asyncio.to_thread(send_telegram, f"📈 Risk Boosted: {symbol}\nNew Risk: {risk_usdt:.2f} USDT\nNotional: {notional:.2f} USDT")
 
+        qty_before_round = qty
         qty = await asyncio.to_thread(round_qty, symbol, qty)
+
         if qty <= 0:
-            _record_rejection(symbol, "Quantity rounded to zero", {'risk_usdt': risk_usdt, 'price_dist': price_distance})
-            return
+            log.warning(f"Quantity for {symbol} rounded to zero. Initial: {qty_before_round}. Attempting to boost to min step size.")
+            step_size_dec = await asyncio.to_thread(get_step_size, symbol)
+            if step_size_dec:
+                qty = float(step_size_dec)
+                new_risk = qty * price_distance
+                
+                if new_risk > balance:
+                     _record_rejection(symbol, "Qty too small, cannot boost risk", {'min_qty': qty, 'required_risk': new_risk, 'balance': balance})
+                     return
+
+                risk_usdt = new_risk
+                notional = qty * entry_price_for_calc
+                log.info(f"Quantity for {symbol} boosted to {qty}, new risk is {risk_usdt:.2f} USDT.")
+            else:
+                _record_rejection(symbol, "Quantity rounded to zero", {'risk_usdt': risk_usdt, 'price_dist': price_distance})
+                return
 
         # --- Leverage Calculation (reused from original logic) ---
         if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
@@ -2268,13 +2288,6 @@ def monitor_thread_func():
                    (meta['side'] == 'SELL' and rsi_now <= 50):
                     should_close = True
                     exit_reason = f"RSI Exit ({rsi_now:.2f})"
-
-                # 2. Max Trade Age Exit
-                trade_open_time = datetime.fromisoformat(meta['open_time'])
-                max_age_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME']) * CONFIG['MAX_TRADE_AGE_BARS']
-                if max_age_duration and (datetime.utcnow() - trade_open_time > max_age_duration):
-                    should_close = True
-                    exit_reason = f"Max Age Exit (>{max_age_duration})"
 
                 if should_close:
                     log.info(f"Closing trade {tid} for {sym}. Reason: {exit_reason}")
@@ -2718,7 +2731,7 @@ def generate_adv_chart_sync(symbol: str):
         if df.empty:
             return "Could not fetch k-line data for " + symbol, None
 
-        df['ema'] = ema(df['close'], CONFIG["EMA_LEN"])
+        df['sma'] = sma(df['close'], CONFIG["SMA_LEN"])
         df['bbu'], df['bbl'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
 
         conn = sqlite3.connect(CONFIG["DB_FILE"])
@@ -2747,16 +2760,16 @@ def generate_adv_chart_sync(symbol: str):
             addplots.append(mpf.make_addplot(plot_sell_entries, type='scatter', marker='v', color='r', markersize=100))
             addplots.append(mpf.make_addplot(plot_exits, type='scatter', marker='x', color='blue', markersize=100))
 
-        ema_plot = mpf.make_addplot(df['ema'], color='purple', width=0.7)
+        sma_plot = mpf.make_addplot(df['sma'], color='purple', width=0.7)
         bb_plots = mpf.make_addplot(df[['bbu', 'bbl']], color=['blue', 'blue'], width=0.5, linestyle='--')
         addplots.insert(0, bb_plots)
-        addplots.insert(0, ema_plot)
+        addplots.insert(0, sma_plot)
         
         fig, axes = mpf.plot(
             df,
             type='candle',
             style='yahoo',
-            title=f'{symbol} Chart with EMA/BB and Trades',
+            title=f'{symbol} Chart with SMA/BB and Trades',
             ylabel='Price (USDT)',
             addplot=addplots,
             returnfig=True,
