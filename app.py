@@ -82,13 +82,13 @@ CONFIG = {
     
     # --- ORDER MANAGEMENT ---
     "USE_LIMIT_ENTRY": os.getenv("USE_LIMIT_ENTRY", "true").lower() in ("true", "1", "yes"),
-    "ORDER_ENTRY_TIMEOUT": int(os.getenv("ORDER_ENTRY_TIMEOUT", "5")), # In number of bars
-    "MAX_TRADE_AGE_BARS": int(os.getenv("MAX_TRADE_AGE_BARS", "10")), # In number of bars
-    "ORDER_LIMIT_OFFSET_PCT": float(os.getenv("ORDER_LIMIT_OFFSET_PCT", "0.0")),
+    "ORDER_ENTRY_TIMEOUT": int(os.getenv("ORDER_ENTRY_TIMEOUT", "6")), # In number of bars
+    "MAX_TRADE_AGE_BARS": int(os.getenv("MAX_TRADE_AGE_BARS", "1000")), # In number of bars
+    "ORDER_LIMIT_OFFSET_PCT": float(os.getenv("ORDER_LIMIT_OFFSET_PCT", "0.03")),
     "SL_BUFFER_PCT": float(os.getenv("SL_BUFFER_PCT", "0.02")),
 
     # --- TP/SL ---
-    "TREND_LOOKBACK_CANDLES": int(os.getenv("TREND_LOOKBACK_CANDLES", "6")),
+    "EMASIGNAL_BACKCANDLES": int(os.getenv("EMASIGNAL_BACKCANDLES", "6")),
     "TP1_RR": float(os.getenv("TP1_RR", "1.0")),
     "TP2_RR": float(os.getenv("TP2_RR", "2.0")),
     "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")),
@@ -1038,23 +1038,26 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     lower_band = ma - (std_dev * std)
     return upper_band, lower_band
 
-def add_sma_signal(df: pd.DataFrame, sma_series: pd.Series, backcandles: int) -> pd.Series:
+def add_emasignal(df: pd.DataFrame, sma_series: pd.Series, backcandles: int) -> pd.Series:
     """
-    Calculates the SMASignal based on the last 'backcandles' positions relative to the SMA.
-    - 2 (Bullish): All 'backcandles' lows are above the SMA.
-    - 1 (Bearish): All 'backcandles' highs are below the SMA.
-    - 0 (Neutral): Otherwise.
+    Calculates the EMASignal based on the last 'backcandles' positions relative to the SMA.
+    - 2 (Bullish): All 'backcandles'+1 lows are above the SMA.
+    - 1 (Bearish): All 'backcandles'+1 highs are below the SMA.
+    - 3 (Neutral): Otherwise (e.g., candles spanning the SMA).
     """
     if backcandles < 1:
-        return pd.Series(0, index=df.index)
+        return pd.Series(3, index=df.index)
 
-    # Use 'low' for bullish and 'high' for bearish for a more robust signal
-    all_above = (df['low'] > sma_series).rolling(window=backcandles, min_periods=backcandles).apply(all, raw=True).fillna(0).astype(bool)
-    all_below = (df['high'] < sma_series).rolling(window=backcandles, min_periods=backcandles).apply(all, raw=True).fillna(0).astype(bool)
+    # Per user request, look back N candles (backcandles) + the current one.
+    window_size = backcandles + 1
 
-    signal = pd.Series(0, index=df.index)
-    signal.loc[all_above] = 2  # Bullish
-    signal.loc[all_below] = 1  # Bearish
+    all_lows_above = (df['low'] > sma_series).rolling(window=window_size, min_periods=window_size).apply(all, raw=True).fillna(0).astype(bool)
+    all_highs_below = (df['high'] < sma_series).rolling(window=window_size, min_periods=window_size).apply(all, raw=True).fillna(0).astype(bool)
+
+    # Default to neutral
+    signal = pd.Series(3, index=df.index)
+    signal.loc[all_highs_below] = 1  # Bearish
+    signal.loc[all_lows_above] = 2  # Bullish
     
     return signal
 
@@ -1062,17 +1065,17 @@ def add_order_signal(df: pd.DataFrame, offset_pct: float) -> pd.DataFrame:
     """
     Calculates the 'ordersignal' column.
     Sets a limit order price if entry conditions are met, otherwise 0.
-    Expects df to have 'SMASignal', 'close', 'BBU', 'BBL' columns.
+    Expects df to have 'EMASignal', 'close', 'BBU', 'BBL' columns.
     """
     ordersignal = pd.Series(0.0, index=df.index)
     
-    # Long entry condition: Bullish SMA signal and price touches or crosses below the lower BB
-    long_mask = (df['SMASignal'] == 2) & (df['close'] <= df['BBL'])
+    # Long entry condition: Bullish EMA signal and price touches or crosses below the lower BB
+    long_mask = (df['EMASignal'] == 2) & (df['close'] <= df['BBL'])
     # Set limit order at a percentage below the current close
     ordersignal.loc[long_mask] = df['close'] * (1 - offset_pct)
 
-    # Short entry condition: Bearish SMA signal and price touches or crosses above the upper BB
-    short_mask = (df['SMASignal'] == 1) & (df['close'] >= df['BBU'])
+    # Short entry condition: Bearish EMA signal and price touches or crosses above the upper BB
+    short_mask = (df['EMASignal'] == 1) & (df['close'] >= df['BBU'])
     # Set limit order at a percentage above the current close
     ordersignal.loc[short_mask] = df['close'] * (1 + offset_pct)
     
@@ -1784,7 +1787,7 @@ async def evaluate_and_enter(symbol: str):
         df['sma'] = sma(df['close'], CONFIG["SMA_LEN"])
         df['BBU'], df['BBL'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
         df['rsi'] = rsi(df['close'], CONFIG["RSI_LEN"])
-        df['SMASignal'] = add_sma_signal(df, df['sma'], CONFIG["TREND_LOOKBACK_CANDLES"])
+        df['EMASignal'] = add_emasignal(df, df['sma'], CONFIG["EMASIGNAL_BACKCANDLES"])
         df = add_order_signal(df, CONFIG["ORDER_LIMIT_OFFSET_PCT"])
         
         # We only care about the most recent signal
@@ -1793,24 +1796,24 @@ async def evaluate_and_enter(symbol: str):
 
         details = {
             'price': last['close'], 'sma': last['sma'], 'BBU': last['BBU'], 
-            'BBL': last['BBL'], 'rsi': last['rsi'], 'SMASignal': int(last['SMASignal'])
+            'BBL': last['BBL'], 'rsi': last['rsi'], 'EMASignal': int(last['EMASignal'])
         }
 
         # --- New Signal Logic with Granular Rejection Reasons ---
-        sma_signal = last['SMASignal']
+        ema_signal = last['EMASignal']
         
-        if sma_signal == 0:
-            _record_rejection(symbol, "No Trend Signal", details)
+        if ema_signal == 3:
+            _record_rejection(symbol, "Neutral Trend Signal", details)
             return
 
         side = None
-        if sma_signal == 2: # Bullish context
+        if ema_signal == 2: # Bullish context
             if last['close'] > last['BBL']:
                 details['reason_detail'] = f"Price {last['close']:.4f} > BBL {last['BBL']:.4f}"
                 _record_rejection(symbol, "Price above Lower BB", details)
                 return
             side = 'BUY'
-        elif sma_signal == 1: # Bearish context
+        elif ema_signal == 1: # Bearish context
             if last['close'] < last['BBU']:
                 details['reason_detail'] = f"Price {last['close']:.4f} < BBU {last['BBU']:.4f}"
                 _record_rejection(symbol, "Price below Upper BB", details)
@@ -1852,7 +1855,7 @@ async def evaluate_and_enter(symbol: str):
         last = df.iloc[-1] # Refresh last row to include ATR
         
         # Corrected SL swing window to include the current bar
-        lookback = CONFIG["TREND_LOOKBACK_CANDLES"]
+        lookback = CONFIG["EMASIGNAL_BACKCANDLES"]
         signal_window = df.iloc[-(lookback + 1):] 
 
         if side == 'BUY':
