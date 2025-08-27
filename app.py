@@ -95,17 +95,14 @@ CONFIG = {
     # --- CORE ---
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
-    "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
-
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
     "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "5")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
-    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
-    "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
-    "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
-
+    # --- INDICATOR SETTINGS ---
+    "BB_LENGTH_CUSTOM": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
+    "BB_STD_CUSTOM": float(os.getenv("BB_STD_CUSTOM", "2.5")),
     "ATR_LENGTH": int(os.getenv("ATR_LENGTH", "14")),
     "SL_TP_ATR_MULT": float(os.getenv("SL_TP_ATR_MULT", "2.5")),
 
@@ -116,35 +113,8 @@ CONFIG = {
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
     "MAX_BOT_LEVERAGE": int(os.getenv("MAX_BOT_LEVERAGE", "30")),
 
-    "VOLATILITY_ADJUST_ENABLED": os.getenv("VOLATILITY_ADJUST_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "TRENDING_ADX": float(os.getenv("TRENDING_ADX", "40.0")),
-    "TRENDING_CHOP": float(os.getenv("TRENDING_CHOP", "40.0")),
-    "TRENDING_RISK_MULT": float(os.getenv("TRENDING_RISK_MULT", "1.5")),
-    "CHOPPY_ADX": float(os.getenv("CHOPPY_ADX", "25.0")),
-    "CHOPPY_CHOP": float(os.getenv("CHOPPY_CHOP", "60.0")),
-    "CHOPPY_RISK_MULT": float(os.getenv("CHOPPY_RISK_MULT", "0.5")),
-
-    "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
-    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "35.0")),
-
-    "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
-    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "55.0")),
-
-    "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
-    "BB_STD": float(os.getenv("BB_STD", "2.0")),
-    "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "12.0")),
-
-    "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "BE_AUTO_MOVE_ENABLED": os.getenv("BE_AUTO_MOVE_ENABLED", "true").lower() in ("true", "1", "yes"),
-
-    "DYN_SLTP_ENABLED": os.getenv("DYN_SLTP_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "TP1_ATR_MULT": float(os.getenv("TP1_ATR_MULT", "2.0")),
-    "TP2_ATR_MULT": float(os.getenv("TP2_ATR_MULT", "3.0")),
-    "TP3_ATR_MULT": float(os.getenv("TP3_ATR_MULT", "4.0")),
-    "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")), # 50%
-    "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.25")), # 25%
 
     "MAX_DAILY_LOSS": float(os.getenv("MAX_DAILY_LOSS", "-2.0")), # Negative value, e.g. -50.0 for $50 loss
     "MAX_DAILY_PROFIT": float(os.getenv("MAX_DAILY_PROFIT", "5.0")), # 0 disables this
@@ -942,26 +912,6 @@ def load_managed_trades_from_db() -> Dict[str, Dict[str, Any]]:
 # -------------------------
 # Indicators
 # -------------------------
-def kama(series: pd.Series, length: int, fast: int, slow: int) -> pd.Series:
-    price = series.values
-    n = len(price)
-    kama_arr = np.zeros(n)
-    sc_fast = 2 / (fast + 1)
-    sc_slow = 2 / (slow + 1)
-    if n >= length:
-        kama_arr[:length] = np.mean(price[:length])
-    else:
-        kama_arr[:] = price.mean()
-    for i in range(length, n):
-        change = abs(price[i] - price[i - length])
-        volatility = np.sum(np.abs(price[i - length + 1:i + 1] - price[i - length:i]))
-        er = 0.0
-        if volatility != 0:
-            er = change / volatility
-        sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
-        kama_arr[i] = kama_arr[i - 1] + sc * (price[i] - kama_arr[i - 1])
-    return pd.Series(kama_arr, index=series.index)
-
 def atr(df: pd.DataFrame, length: int) -> pd.Series:
     high = df['high']; low = df['low']; close = df['close']
     tr1 = high - low
@@ -969,47 +919,6 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=1).mean()
-
-def adx(df: pd.DataFrame, length: int) -> pd.Series:
-    high = df['high']; low = df['low']; close = df['close']
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
-    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
-    tr1 = (high - low)
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_w = tr.rolling(length, min_periods=1).mean()
-    plus_di = 100 * (plus_dm.rolling(length, min_periods=1).sum() / atr_w)
-    minus_di = 100 * (minus_dm.rolling(length, min_periods=1).sum() / atr_w)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0) * 100
-    return dx.rolling(length, min_periods=1).mean()
-
-def choppiness_index(df: pd.DataFrame, length: int) -> pd.Series:
-    high = df['high']; low = df['low']; close = df['close']
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    sum_tr = tr.rolling(length, min_periods=1).sum()
-    hh = high.rolling(length, min_periods=1).max()
-    ll = low.rolling(length, min_periods=1).min()
-    denom = hh - ll
-    denom = denom.replace(0, np.nan)
-    chop = 100 * (np.log10(sum_tr / denom) / np.log10(length))
-    chop = chop.replace([np.inf, -np.inf], 100).fillna(100)
-    return chop
-
-def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
-    ma = df['close'].rolling(length, min_periods=1).mean()
-    std = df['close'].rolling(length, min_periods=1).std().fillna(0)
-    upper = ma + std_mult * std
-    lower = ma - std_mult * std
-    mid = ma.replace(0, np.nan)
-    width = (upper - lower) / mid
-    width = width.replace([np.inf, -np.inf], 100).fillna(100)
-    return width
 
 # --- New Strategy Indicators ---
 
@@ -1664,12 +1573,6 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
         results["checks"].append({"type": "env", "ok": False, "detail": f"Missing env: {missing}"})
     else:
         results["checks"].append({"type": "env", "ok": True})
-    adx_val = CONFIG["ADX_THRESHOLD"]
-    if not (0 <= adx_val <= 100):
-        results["ok"] = False
-        results["checks"].append({"type": "adx_threshold", "ok": False, "detail": adx_val})
-    else:
-        results["checks"].append({"type": "adx_threshold", "ok": True})
     if client is None:
         results["ok"] = False
         results["checks"].append({"type": "binance_connect", "ok": False, "detail": "Client not initialized (check keys)"})
