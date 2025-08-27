@@ -767,7 +767,7 @@ def get_merged_freeze_intervals() -> list[tuple[datetime, datetime, str]]:
     return final_intervals
 
 
-def get_session_freeze_status(now: datetime) -> (bool, Optional[str]):
+def get_session_freeze_status(now: datetime) -> tuple[bool, Optional[str]]:
     """
     Checks if the current time is within a session freeze window using the merged intervals.
     Returns a tuple of (is_frozen, session_name).
@@ -1266,6 +1266,49 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float):
         raise
     except Exception as e:
         log.exception("Exception placing limit order: %s", e)
+        raise
+
+def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int):
+    """
+    Places a simple market order to open or increase a position.
+    This is a blocking call.
+    """
+    global client, IS_HEDGE_MODE
+    if CONFIG["DRY_RUN"]:
+        log.info(f"[DRY RUN] Would open market {side} order for {qty} {symbol}.")
+        return {"status": "FILLED"}
+    
+    if client is None:
+        raise RuntimeError("Binance client not initialized")
+    
+    try:
+        log.info(f"Attempting to change leverage to {leverage}x for {symbol}")
+        client.futures_change_leverage(symbol=symbol, leverage=leverage)
+    except Exception as e:
+        log.warning("Failed to change leverage (non-fatal, may use previous leverage): %s", e)
+
+    position_side = 'LONG' if side == 'BUY' else 'SHORT'
+
+    params = {
+        'symbol': symbol,
+        'side': side,
+        'type': 'MARKET',
+        'quantity': str(qty),
+    }
+
+    if IS_HEDGE_MODE:
+        params['positionSide'] = position_side
+
+    try:
+        log.info(f"Placing market order for {symbol}: {params}")
+        order_response = client.futures_create_order(**params)
+        log.info(f"Market order placement successful for {symbol}. Response: {order_response}")
+        return order_response
+    except BinanceAPIException as e:
+        log.exception("BinanceAPIException placing market order: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception placing market order: %s", e)
         raise
 
 def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, leverage: int, stop_price: float, take_price: float):
@@ -1972,7 +2015,7 @@ def monitor_thread_func():
                 continue
 
             # --- Process Pending Limit Orders ---
-            async with pending_limit_orders_lock:
+            with pending_limit_orders_lock:
                 pending_snapshot = dict(pending_limit_orders)
 
             if pending_snapshot:
@@ -2526,7 +2569,7 @@ async def scanning_loop():
             # To prevent rapid-fire errors, wait a bit before retrying.
             await asyncio.sleep(60)
 
-def _generate_pnl_report_sync(query: str, params: tuple, title: str) -> (str, Optional[bytes]):
+def _generate_pnl_report_sync(query: str, params: tuple, title: str) -> tuple[str, Optional[bytes]]:
     """A helper function to generate a PnL report from a given SQL query."""
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     try:
