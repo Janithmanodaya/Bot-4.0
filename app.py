@@ -975,7 +975,7 @@ def init_binance_client_sync():
 
     try:
         # Set a longer timeout for all requests to Binance
-        requests_params = {"timeout": 30}
+        requests_params = {"timeout": 60}
         client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=requests_params)
         log.info("Binance client in MAINNET mode (forced).")
         try:
@@ -1839,6 +1839,14 @@ def monitor_thread_func():
                             time.sleep(retry_delay)
                             continue
                         raise  # Re-raise the exception if it's not a retryable timeout or the last attempt
+                    except requests.exceptions.ReadTimeout as e:
+                        if attempt < max_retries - 1:
+                            log.warning(f"Read timeout fetching positions (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay}s: {e}")
+                            send_telegram(f"⚠️ Binance API read timeout, retrying... ({attempt + 1}/{max_retries})")
+                            time.sleep(retry_delay)
+                            continue
+                        log.error(f"Final attempt to fetch positions failed due to ReadTimeout: {e}")
+                        raise # Re-raise on last attempt
             except BinanceAPIException as e:
                 log.error("Caught BinanceAPIException in monitor thread: %s", e)
                 
