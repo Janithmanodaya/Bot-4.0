@@ -1,6 +1,6 @@
 # app.py
 """
-KAMA trend-following bot — complete version with fixes:
+EMA/BB Strategy Bot — Refactored from KAMA base.
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
  - Monitor thread persists unrealized PnL and SL updates back to managed_trades
@@ -63,7 +63,7 @@ USE_TESTNET = False  # Force MAINNET — testnet mode removed per user request
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("kama-bot")
+log = logging.getLogger("ema-bb-bot")
 
 # Globals
 client: Optional[Client] = None
@@ -466,7 +466,7 @@ async def periodic_rogue_check_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scan_task, telegram_thread, monitor_thread_obj, pnl_monitor_thread_obj, client, monitor_stop_event, main_loop
-    log.info("KAMA strategy bot starting up...")
+    log.info("EMA/BB Strategy Bot starting up...")
     
     # --- Startup Logic ---
     init_db()
@@ -505,14 +505,14 @@ async def lifespan(app: FastAPI):
         log.info("Telegram not configured; telegram thread not started.")
     
     try:
-        await asyncio.to_thread(send_telegram, "KAMA strategy bot started. Running={}".format(running))
+        await asyncio.to_thread(send_telegram, "EMA/BB Strategy Bot started. Running={}".format(running))
     except Exception:
         log.exception("Failed to send startup telegram")
 
     yield
 
     # --- Shutdown Logic ---
-    log.info("KAMA strategy bot shutting down...")
+    log.info("EMA/BB Strategy Bot shutting down...")
     if scan_task:
         scan_task.cancel()
         try:
@@ -539,7 +539,7 @@ async def lifespan(app: FastAPI):
         pass
 
     try:
-        await send_telegram("KAMA strategy bot shut down.")
+        await send_telegram("EMA/BB Strategy Bot shut down.")
     except Exception:
         pass
     log.info("Shutdown complete.")
@@ -1716,14 +1716,15 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
             for c in ['open','high','low','close','volume']:
                 raw_df[c] = raw_df[c].astype(float)
             raw_df.set_index('close_time', inplace=True)
-            k = kama(raw_df['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
-            a = atr(raw_df, CONFIG["ATR_LENGTH"])
-            ad = adx(raw_df, CONFIG["ADX_LENGTH"])
-            ch = choppiness_index(raw_df, CONFIG["CHOP_LENGTH"])
-            bw = bb_width(raw_df, CONFIG["BB_LENGTH"], CONFIG["BB_STD"])
+            
+            # Calculate new indicators for the validation report
+            ema_s = ema(raw_df['close'], CONFIG["EMA_LEN"])
+            rsi_s = rsi(raw_df['close'], CONFIG["RSI_LEN"])
+            bbu_s, bbl_s = bollinger_bands(raw_df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
+            
             results["checks"].append({"type": "indicators_sample", "ok": True, "detail": {
-                "kama": float(k.iloc[-1]), "atr": float(a.iloc[-1]), "adx": float(ad.iloc[-1]),
-                "chop": float(ch.iloc[-1]), "bbw": float(bw.iloc[-1])
+                "ema": float(ema_s.iloc[-1]), "rsi": float(rsi_s.iloc[-1]), 
+                "bbu": float(bbu_s.iloc[-1]), "bbl": float(bbl_s.iloc[-1])
             }})
         except Exception as e:
             results["ok"] = False
@@ -1784,12 +1785,37 @@ async def evaluate_and_enter(symbol: str):
             'BBL': last['BBL'], 'rsi': last['rsi'], 'EMASignal': int(last['EMASignal'])
         }
 
-        # --- New Signal Logic ---
-        if order_signal_price <= 0:
-            _record_rejection(symbol, "No order signal", details)
+        # --- New Signal Logic with Granular Rejection Reasons ---
+        ema_signal = last['EMASignal']
+        
+        if ema_signal == 0:
+            _record_rejection(symbol, "No EMA Signal / Neutral Trend", details)
             return
-            
-        side = 'BUY' if last['EMASignal'] == 2 else 'SELL'
+
+        side = None
+        if ema_signal == 2: # Bullish context
+            if last['close'] > last['BBL']:
+                details['reason_detail'] = f"Price {last['close']:.4f} > BBL {last['BBL']:.4f}"
+                _record_rejection(symbol, "Price above Lower BB", details)
+                return
+            side = 'BUY'
+        elif ema_signal == 1: # Bearish context
+            if last['close'] < last['BBU']:
+                details['reason_detail'] = f"Price {last['close']:.4f} < BBU {last['BBU']:.4f}"
+                _record_rejection(symbol, "Price below Upper BB", details)
+                return
+            side = 'SELL'
+        
+        if not side:
+            # This case should ideally not be hit if ema_signal is 1 or 2, but as a safeguard:
+            _record_rejection(symbol, "Signal logic error (no side)", details)
+            return
+
+        # This check is now a safeguard, as the logic above should cover all cases.
+        if order_signal_price <= 0:
+            _record_rejection(symbol, "Order signal price is zero despite conditions met", details)
+            return
+
         details['side'] = side
         details['limit_price'] = order_signal_price
 
@@ -2692,7 +2718,8 @@ def generate_adv_chart_sync(symbol: str):
         if df.empty:
             return "Could not fetch k-line data for " + symbol, None
 
-        df['kama'] = kama(df['close'], CONFIG["KAMA_LENGTH"], CONFIG["KAMA_FAST"], CONFIG["KAMA_SLOW"])
+        df['ema'] = ema(df['close'], CONFIG["EMA_LEN"])
+        df['bbu'], df['bbl'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
 
         conn = sqlite3.connect(CONFIG["DB_FILE"])
         trades_df = pd.read_sql_query(f"SELECT * FROM trades WHERE symbol = '{symbol}' AND close_time IS NOT NULL", conn)
@@ -2720,14 +2747,16 @@ def generate_adv_chart_sync(symbol: str):
             addplots.append(mpf.make_addplot(plot_sell_entries, type='scatter', marker='v', color='r', markersize=100))
             addplots.append(mpf.make_addplot(plot_exits, type='scatter', marker='x', color='blue', markersize=100))
 
-        kama_plot = mpf.make_addplot(df['kama'], color='purple', width=0.7)
-        addplots.insert(0, kama_plot)
+        ema_plot = mpf.make_addplot(df['ema'], color='purple', width=0.7)
+        bb_plots = mpf.make_addplot(df[['bbu', 'bbl']], color=['blue', 'blue'], width=0.5, linestyle='--')
+        addplots.insert(0, bb_plots)
+        addplots.insert(0, ema_plot)
         
         fig, axes = mpf.plot(
             df,
             type='candle',
             style='yahoo',
-            title=f'{symbol} Chart with KAMA and Trades',
+            title=f'{symbol} Chart with EMA/BB and Trades',
             ylabel='Price (USDT)',
             addplot=addplots,
             returnfig=True,
