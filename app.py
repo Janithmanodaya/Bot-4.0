@@ -82,32 +82,27 @@ CONFIG = {
     
     # --- ORDER MANAGEMENT ---
     "USE_LIMIT_ENTRY": os.getenv("USE_LIMIT_ENTRY", "true").lower() in ("true", "1", "yes"),
-    "ORDER_ENTRY_TIMEOUT": int(os.getenv("ORDER_ENTRY_TIMEOUT", "6")), # In number of bars
-    "MAX_TRADE_AGE_BARS": int(os.getenv("MAX_TRADE_AGE_BARS", "1000")), # In number of bars
-    "ORDER_LIMIT_OFFSET_PCT": float(os.getenv("ORDER_LIMIT_OFFSET_PCT", "0.03")),
+    "ORDER_ENTRY_TIMEOUT": int(os.getenv("ORDER_ENTRY_TIMEOUT", "1")), # 1 candle timeout for limit orders
+    "ORDER_LIMIT_OFFSET_PCT": float(os.getenv("ORDER_LIMIT_OFFSET_PCT", "0.005")),
     "SL_BUFFER_PCT": float(os.getenv("SL_BUFFER_PCT", "0.02")),
+    "LOSS_COOLDOWN_HOURS": int(os.getenv("LOSS_COOLDOWN_HOURS", "6")),
 
-    # --- TP/SL ---
-    "EMASIGNAL_BACKCANDLES": int(os.getenv("EMASIGNAL_BACKCANDLES", "6")),
-    "TP1_RR": float(os.getenv("TP1_RR", "1.0")),
-    "TP2_RR": float(os.getenv("TP2_RR", "2.0")),
-    "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")),
-    "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.5")),
+    # --- TP/SL & TRADE MANAGEMENT ---
+    "PARTIAL_TP_CLOSE_PCT": float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.5")),
+    "BE_TRIGGER_PROFIT_PCT": float(os.getenv("BE_TRIGGER_PROFIT_PCT", "0.006")),
+    "BE_SL_PROFIT_PCT": float(os.getenv("BE_SL_PROFIT_PCT", "0.001")),
     
     # --- CORE ---
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
-    "BIG_TIMEFRAME": os.getenv("BIG_TIMEFRAME", "4h"),
-
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
     "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "5")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
-    "KAMA_LENGTH": int(os.getenv("KAMA_LENGTH", "10")),
-    "KAMA_FAST": int(os.getenv("KAMA_FAST", "2")),
-    "KAMA_SLOW": int(os.getenv("KAMA_SLOW", "30")),
-
+    # --- INDICATOR SETTINGS ---
+    "BB_LENGTH_CUSTOM": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
+    "BB_STD_CUSTOM": float(os.getenv("BB_STD_CUSTOM", "2.5")),
     "ATR_LENGTH": int(os.getenv("ATR_LENGTH", "14")),
     "SL_TP_ATR_MULT": float(os.getenv("SL_TP_ATR_MULT", "2.5")),
 
@@ -118,35 +113,8 @@ CONFIG = {
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
     "MAX_BOT_LEVERAGE": int(os.getenv("MAX_BOT_LEVERAGE", "30")),
 
-    "VOLATILITY_ADJUST_ENABLED": os.getenv("VOLATILITY_ADJUST_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "TRENDING_ADX": float(os.getenv("TRENDING_ADX", "40.0")),
-    "TRENDING_CHOP": float(os.getenv("TRENDING_CHOP", "40.0")),
-    "TRENDING_RISK_MULT": float(os.getenv("TRENDING_RISK_MULT", "1.5")),
-    "CHOPPY_ADX": float(os.getenv("CHOPPY_ADX", "25.0")),
-    "CHOPPY_CHOP": float(os.getenv("CHOPPY_CHOP", "60.0")),
-    "CHOPPY_RISK_MULT": float(os.getenv("CHOPPY_RISK_MULT", "0.5")),
-
-    "ADX_LENGTH": int(os.getenv("ADX_LENGTH", "14")),
-    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "35.0")),
-
-    "CHOP_LENGTH": int(os.getenv("CHOP_LENGTH", "14")),
-    "CHOP_THRESHOLD": float(os.getenv("CHOP_THRESHOLD", "55.0")),
-
-    "BB_LENGTH": int(os.getenv("BB_LENGTH", "20")),
-    "BB_STD": float(os.getenv("BB_STD", "2.0")),
-    "BBWIDTH_THRESHOLD": float(os.getenv("BBWIDTH_THRESHOLD", "12.0")),
-
-    "MIN_CANDLES_AFTER_CLOSE": int(os.getenv("MIN_CANDLES_AFTER_CLOSE", "10")),
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "BE_AUTO_MOVE_ENABLED": os.getenv("BE_AUTO_MOVE_ENABLED", "true").lower() in ("true", "1", "yes"),
-
-    "DYN_SLTP_ENABLED": os.getenv("DYN_SLTP_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "TP1_ATR_MULT": float(os.getenv("TP1_ATR_MULT", "2.0")),
-    "TP2_ATR_MULT": float(os.getenv("TP2_ATR_MULT", "3.0")),
-    "TP3_ATR_MULT": float(os.getenv("TP3_ATR_MULT", "4.0")),
-    "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")), # 50%
-    "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.25")), # 25%
 
     "MAX_DAILY_LOSS": float(os.getenv("MAX_DAILY_LOSS", "-2.0")), # Negative value, e.g. -50.0 for $50 loss
     "MAX_DAILY_PROFIT": float(os.getenv("MAX_DAILY_PROFIT", "5.0")), # 0 disables this
@@ -174,6 +142,7 @@ session_freeze_override = False
 notified_frozen_session: Optional[str] = None
 
 rejected_trades = deque(maxlen=5)
+symbol_loss_cooldown: Dict[str, datetime] = {}
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
@@ -943,26 +912,6 @@ def load_managed_trades_from_db() -> Dict[str, Dict[str, Any]]:
 # -------------------------
 # Indicators
 # -------------------------
-def kama(series: pd.Series, length: int, fast: int, slow: int) -> pd.Series:
-    price = series.values
-    n = len(price)
-    kama_arr = np.zeros(n)
-    sc_fast = 2 / (fast + 1)
-    sc_slow = 2 / (slow + 1)
-    if n >= length:
-        kama_arr[:length] = np.mean(price[:length])
-    else:
-        kama_arr[:] = price.mean()
-    for i in range(length, n):
-        change = abs(price[i] - price[i - length])
-        volatility = np.sum(np.abs(price[i - length + 1:i + 1] - price[i - length:i]))
-        er = 0.0
-        if volatility != 0:
-            er = change / volatility
-        sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
-        kama_arr[i] = kama_arr[i - 1] + sc * (price[i] - kama_arr[i - 1])
-    return pd.Series(kama_arr, index=series.index)
-
 def atr(df: pd.DataFrame, length: int) -> pd.Series:
     high = df['high']; low = df['low']; close = df['close']
     tr1 = high - low
@@ -970,47 +919,6 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=1).mean()
-
-def adx(df: pd.DataFrame, length: int) -> pd.Series:
-    high = df['high']; low = df['low']; close = df['close']
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
-    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
-    tr1 = (high - low)
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_w = tr.rolling(length, min_periods=1).mean()
-    plus_di = 100 * (plus_dm.rolling(length, min_periods=1).sum() / atr_w)
-    minus_di = 100 * (minus_dm.rolling(length, min_periods=1).sum() / atr_w)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0) * 100
-    return dx.rolling(length, min_periods=1).mean()
-
-def choppiness_index(df: pd.DataFrame, length: int) -> pd.Series:
-    high = df['high']; low = df['low']; close = df['close']
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    sum_tr = tr.rolling(length, min_periods=1).sum()
-    hh = high.rolling(length, min_periods=1).max()
-    ll = low.rolling(length, min_periods=1).min()
-    denom = hh - ll
-    denom = denom.replace(0, np.nan)
-    chop = 100 * (np.log10(sum_tr / denom) / np.log10(length))
-    chop = chop.replace([np.inf, -np.inf], 100).fillna(100)
-    return chop
-
-def bb_width(df: pd.DataFrame, length: int, std_mult: float) -> pd.Series:
-    ma = df['close'].rolling(length, min_periods=1).mean()
-    std = df['close'].rolling(length, min_periods=1).std().fillna(0)
-    upper = ma + std_mult * std
-    lower = ma - std_mult * std
-    mid = ma.replace(0, np.nan)
-    width = (upper - lower) / mid
-    width = width.replace([np.inf, -np.inf], 100).fillna(100)
-    return width
 
 # --- New Strategy Indicators ---
 
@@ -1038,49 +946,6 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     lower_band = ma - (std_dev * std)
     return upper_band, lower_band
 
-def add_emasignal(df: pd.DataFrame, sma_series: pd.Series, backcandles: int) -> pd.Series:
-    """
-    Calculates the EMASignal based on the last 'backcandles' positions relative to the SMA.
-    - 2 (Bullish): All 'backcandles'+1 lows are above the SMA.
-    - 1 (Bearish): All 'backcandles'+1 highs are below the SMA.
-    - 3 (Neutral): Otherwise (e.g., candles spanning the SMA).
-    """
-    if backcandles < 1:
-        return pd.Series(3, index=df.index)
-
-    # Per user request, look back N candles (backcandles) + the current one.
-    window_size = backcandles + 1
-
-    all_lows_above = (df['low'] > sma_series).rolling(window=window_size, min_periods=window_size).apply(all, raw=True).fillna(0).astype(bool)
-    all_highs_below = (df['high'] < sma_series).rolling(window=window_size, min_periods=window_size).apply(all, raw=True).fillna(0).astype(bool)
-
-    # Default to neutral
-    signal = pd.Series(3, index=df.index)
-    signal.loc[all_highs_below] = 1  # Bearish
-    signal.loc[all_lows_above] = 2  # Bullish
-    
-    return signal
-
-def add_order_signal(df: pd.DataFrame, offset_pct: float) -> pd.DataFrame:
-    """
-    Calculates the 'ordersignal' column.
-    Sets a limit order price if entry conditions are met, otherwise 0.
-    Expects df to have 'EMASignal', 'close', 'BBU', 'BBL' columns.
-    """
-    ordersignal = pd.Series(0.0, index=df.index)
-    
-    # Long entry condition: Bullish EMA signal and price touches or crosses below the lower BB
-    long_mask = (df['EMASignal'] == 2) & (df['close'] <= df['BBL'])
-    # Set limit order at a percentage below the current close
-    ordersignal.loc[long_mask] = df['close'] * (1 - offset_pct)
-
-    # Short entry condition: Bearish EMA signal and price touches or crosses above the upper BB
-    short_mask = (df['EMASignal'] == 1) & (df['close'] >= df['BBU'])
-    # Set limit order at a percentage above the current close
-    ordersignal.loc[short_mask] = df['close'] * (1 + offset_pct)
-    
-    df['ordersignal'] = ordersignal
-    return df
 
 # -------------------------
 # Binance Init
@@ -1774,128 +1639,88 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
 
 async def evaluate_and_enter(symbol: str):
     log.info("Evaluating symbol: %s", symbol)
-    global managed_trades, running, frozen
+    global managed_trades, running, frozen, symbol_loss_cooldown
     if frozen or not running:
         reason = "Bot is frozen or not running"
         _record_rejection(symbol, reason, {"running": running, "frozen": frozen})
         return
-    try:
-        # We need enough data for the longest indicator, which is EMA(200)
-        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
 
-        # --- Calculate New Strategy Indicators ---
-        df['sma'] = sma(df['close'], CONFIG["SMA_LEN"])
-        df['BBU'], df['BBL'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
-        df['rsi'] = rsi(df['close'], CONFIG["RSI_LEN"])
-        df['EMASignal'] = add_emasignal(df, df['sma'], CONFIG["EMASIGNAL_BACKCANDLES"])
-        df = add_order_signal(df, CONFIG["ORDER_LIMIT_OFFSET_PCT"])
-        
-        # We only care about the most recent signal
-        last = df.iloc[-1]
-        order_signal_price = last['ordersignal']
-
-        details = {
-            'price': last['close'], 'sma': last['sma'], 'BBU': last['BBU'], 
-            'BBL': last['BBL'], 'rsi': last['rsi'], 'EMASignal': int(last['EMASignal'])
-        }
-
-        # --- New Signal Logic with Granular Rejection Reasons ---
-        ema_signal = last['EMASignal']
-        
-        if ema_signal == 3:
-            _record_rejection(symbol, "Neutral Trend Signal", details)
+    # --- Cooldown Check ---
+    if symbol in symbol_loss_cooldown:
+        cooldown_end_time = symbol_loss_cooldown[symbol] + timedelta(hours=CONFIG['LOSS_COOLDOWN_HOURS'])
+        if datetime.now(timezone.utc) < cooldown_end_time:
+            log.info(f"Symbol {symbol} is in cooldown period until {cooldown_end_time}. Skipping evaluation.")
+            _record_rejection(symbol, "In post-loss cooldown", {"cooldown_ends": cooldown_end_time.isoformat()})
             return
+        else:
+            # Cooldown has expired, remove it
+            log.info(f"Cooldown for {symbol} has expired. Removing from list.")
+            del symbol_loss_cooldown[symbol]
 
+    try:
+        # 1. Fetch klines and calculate indicators
+        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
+        df['BBU'], df['BBL'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
+        df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
+        
+        last = df.iloc[-1]
+
+        # 2. Check for entry signal based on Bollinger Bands
         side = None
-        if ema_signal == 2: # Bullish context
-            if last['close'] > last['BBL']:
-                details['reason_detail'] = f"Price {last['close']:.4f} > BBL {last['BBL']:.4f}"
-                _record_rejection(symbol, "Price above Lower BB", details)
-                return
+        if last['close'] <= last['BBL']:
             side = 'BUY'
-        elif ema_signal == 1: # Bearish context
-            if last['close'] < last['BBU']:
-                details['reason_detail'] = f"Price {last['close']:.4f} < BBU {last['BBU']:.4f}"
-                _record_rejection(symbol, "Price below Upper BB", details)
-                return
+        elif last['close'] >= last['BBU']:
             side = 'SELL'
         
         if not side:
-            _record_rejection(symbol, "Signal logic error (no side)", details)
+            _record_rejection(symbol, "No BB entry signal", {'price': f"{last['close']:.4f}", 'BBU': f"{last['BBU']:.4f}", 'BBL': f"{last['BBL']:.4f}"})
             return
 
-        if order_signal_price <= 0:
-            _record_rejection(symbol, "Order signal price is zero despite conditions met", details)
-            return
-
-        details['side'] = side
-        details['limit_price'] = order_signal_price
-
-        # --- Pre-Trade Checks (re-using existing logic) ---
+        # 3. Pre-trade checks
         async with managed_trades_lock, pending_limit_orders_lock:
             if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
-                _record_rejection(symbol, "Trade exists and hedging is disabled", details)
+                _record_rejection(symbol, "Trade exists and hedging is disabled", {})
                 return
             if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
-                _record_rejection(symbol, "Pending limit order already exists", details)
+                _record_rejection(symbol, "Pending limit order already exists", {})
                 return
             if len(managed_trades) + len(pending_limit_orders) >= CONFIG["MAX_CONCURRENT_TRADES"]:
                 _record_rejection(symbol, "Max concurrent trades reached", {'open_trades': len(managed_trades), 'pending_orders': len(pending_limit_orders)})
                 return
 
-        last_close = last_trade_close_time.get(symbol)
-        if last_close:
-            n_since = candles_since_close(df, last_close)
-            if n_since < CONFIG["MIN_CANDLES_AFTER_CLOSE"]:
-                _record_rejection(symbol, f"In cooldown period ({n_since}/{CONFIG['MIN_CANDLES_AFTER_CLOSE']} candles)", details)
-                return
-        
-        # --- Calculate Provisional SL and Quantity ---
-        df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
-        last = df.iloc[-1] # Refresh last row to include ATR
-        
-        # Corrected SL swing window to include the current bar
-        lookback = CONFIG["EMASIGNAL_BACKCANDLES"]
-        signal_window = df.iloc[-(lookback + 1):] 
-
+        # 4. Calculate Limit Price
+        offset = CONFIG["ORDER_LIMIT_OFFSET_PCT"]
         if side == 'BUY':
-            swing_level = signal_window['low'].min()
-            stop_price = swing_level * (1 - CONFIG["SL_BUFFER_PCT"])
+            limit_price = last['close'] * (1 - offset)
         else: # SELL
-            swing_level = signal_window['high'].max()
-            stop_price = swing_level * (1 + CONFIG["SL_BUFFER_PCT"])
+            limit_price = last['close'] * (1 + offset)
 
-        entry_price_for_calc = order_signal_price if CONFIG["USE_LIMIT_ENTRY"] else last['close']
-        price_distance = abs(entry_price_for_calc - stop_price)
+        # 5. Calculate SL and TP
+        atr_now = last['atr']
+        if atr_now <= 0:
+            _record_rejection(symbol, "Invalid ATR value", {'atr': atr_now})
+            return
 
-        # ATR Fallback for SL
-        if price_distance <= 0:
-            log.warning(f"Invalid swing point for SL on {symbol}. Falling back to ATR.")
-            atr_now = last['atr']
-            sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
-            if sl_distance <= 0:
-                _record_rejection(symbol, "Invalid ATR for SL distance", {'atr': atr_now})
-                return
-            
-            if side == 'BUY':
-                stop_price = entry_price_for_calc - sl_distance
-            else: # SELL
-                stop_price = entry_price_for_calc + sl_distance
-            
-            price_distance = abs(entry_price_for_calc - stop_price)
-            if price_distance <= 0:
-                _record_rejection(symbol, "Invalid price distance even with ATR fallback", {})
-                return
+        sl_distance_atr = CONFIG["SL_TP_ATR_MULT"] * atr_now
         
+        if side == 'BUY':
+            stop_price = limit_price - sl_distance_atr
+            take_price = limit_price + (2 * sl_distance_atr)
+        else: # SELL
+            stop_price = limit_price + sl_distance_atr
+            take_price = limit_price - (2 * sl_distance_atr)
+
+        # 6. Calculate Quantity (reusing existing robust logic)
+        price_distance = abs(limit_price - stop_price)
         balance = await asyncio.to_thread(get_account_balance_usdt)
         risk_usdt = calculate_risk_amount(balance)
         qty = risk_usdt / price_distance
         
-        notional = qty * entry_price_for_calc
+        notional = qty * limit_price
         min_notional = CONFIG["MIN_NOTIONAL_USDT"]
         if notional < min_notional:
             log.warning(f"Notional value for {symbol} is {notional:.2f}, below min {min_notional:.2f}. Attempting to boost risk.")
-            required_qty = min_notional / entry_price_for_calc
+            required_qty = min_notional / limit_price
             new_risk = required_qty * price_distance
             
             if new_risk > balance:
@@ -1906,7 +1731,7 @@ async def evaluate_and_enter(symbol: str):
 
             risk_usdt = new_risk
             qty = required_qty
-            notional = qty * entry_price_for_calc
+            notional = qty * limit_price
             await asyncio.to_thread(send_telegram, f"📈 Risk Boosted: {symbol}\nNew Risk: {risk_usdt:.2f} USDT\nNotional: {notional:.2f} USDT")
 
         qty_before_round = qty
@@ -1924,13 +1749,13 @@ async def evaluate_and_enter(symbol: str):
                      return
 
                 risk_usdt = new_risk
-                notional = qty * entry_price_for_calc
+                notional = qty * limit_price
                 log.info(f"Quantity for {symbol} boosted to {qty}, new risk is {risk_usdt:.2f} USDT.")
             else:
                 _record_rejection(symbol, "Quantity rounded to zero", {'risk_usdt': risk_usdt, 'price_dist': price_distance})
                 return
 
-        # --- Leverage Calculation (reused from original logic) ---
+        # Leverage calculation
         if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
             margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"]
         else:
@@ -1941,101 +1766,38 @@ async def evaluate_and_enter(symbol: str):
         max_leverage_from_exchange = get_max_leverage(symbol)
         leverage = max(1, min(leverage, max_leverage_from_config, max_leverage_from_exchange))
         
-        # --- Branch for Limit vs Market Entry ---
-        if CONFIG["USE_LIMIT_ENTRY"]:
-            try:
-                limit_order_resp = await asyncio.to_thread(
-                    place_limit_order_sync, symbol, side, qty, order_signal_price
-                )
-                
-                order_id = str(limit_order_resp.get('orderId'))
-                pending_order_id = f"{symbol}_{order_id}"
-
-                pending_meta = {
-                    "id": pending_order_id,
-                    "order_id": order_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "qty": qty,
-                    "limit_price": order_signal_price,
-                    "stop_price": stop_price,
-                    "leverage": leverage,
-                    "risk_usdt": risk_usdt,
-                    "place_time": datetime.utcnow().isoformat(),
-                    "df_snapshot_json": df.to_json()
-                }
-                
-                async with pending_limit_orders_lock:
-                    pending_limit_orders[pending_order_id] = pending_meta
-                
-                log.info(f"Placed pending limit order: {pending_meta}")
-                await asyncio.to_thread(send_telegram, f"⏳ New Limit Order Placed for {symbol} | Side: {side}, Qty: {qty}, Price: {order_signal_price:.4f}")
-
-            except Exception as e:
-                await asyncio.to_thread(log_and_send_error, f"Failed to place limit order for {symbol}", e)
-        else:
-            # --- Place Market Order ---
-            market_entry_price = last['close']
-            sl_distance = abs(market_entry_price - stop_price)
+        # 7. Place Limit Order
+        try:
+            limit_order_resp = await asyncio.to_thread(
+                place_limit_order_sync, symbol, side, qty, limit_price
+            )
             
-            if side == 'BUY':
-                tp1_price = market_entry_price + (sl_distance * CONFIG["TP1_RR"])
-                tp2_price = market_entry_price + (sl_distance * CONFIG["TP2_RR"])
-            else: # SELL
-                tp1_price = market_entry_price - (sl_distance * CONFIG["TP1_RR"])
-                tp2_price = market_entry_price - (sl_distance * CONFIG["TP2_RR"])
+            order_id = str(limit_order_resp.get('orderId'))
+            pending_order_id = f"{symbol}_{order_id}"
 
-            try:
-                batch_response = await asyncio.to_thread(
-                    place_market_order_with_sl_tp_sync, symbol, side, qty, leverage, stop_price, tp2_price
-                )
-                
-                market_order = batch_response[0]
-                actual_entry_price = float(market_order.get('avgPrice', market_entry_price))
-                
-                sl_order = batch_response[1]
-                tp_order = batch_response[2]
+            # Store all necessary info for when the order is filled
+            pending_meta = {
+                "id": pending_order_id,
+                "order_id": order_id,
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "limit_price": limit_price,
+                "stop_price": stop_price,
+                "take_price": take_price, # Store the calculated TP for later use
+                "leverage": leverage,
+                "risk_usdt": risk_usdt,
+                "place_time": datetime.utcnow().isoformat(),
+            }
+            
+            async with pending_limit_orders_lock:
+                pending_limit_orders[pending_order_id] = pending_meta
+            
+            log.info(f"Placed pending limit order: {pending_meta}")
+            await asyncio.to_thread(send_telegram, f"⏳ New Limit Order Placed for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}")
 
-                order_id = str(market_order.get('orderId', f"mkt_{int(time.time())}"))
-                sltp = {"stop_order": sl_order, "tp_order": tp_order}
-                trade_id = f"{symbol}_{order_id}"
-                
-                meta = {
-                    "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
-                    "initial_qty": qty, "qty": qty, "notional": qty * actual_entry_price, 
-                    "leverage": leverage, "sl": stop_price, "tp": tp2_price, 
-                    "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp, 
-                    "trailing": False, "dyn_sltp": True, "tp1": tp1_price, "tp2": tp2_price, 
-                    "tp3": None, "trade_phase": 0, "be_moved": False, "risk_usdt": risk_usdt,
-                    "entry_reason": "MARKET_ENTRY"
-                }
-
-                async with managed_trades_lock:
-                    managed_trades[trade_id] = meta
-                
-                record_trade({
-                    'id': trade_id, 'symbol': symbol, 'side': side, 'entry_price': actual_entry_price,
-                    'exit_price': None, 'qty': qty, 'notional': meta['notional'], 'pnl': None,
-                    'open_time': meta['open_time'], 'close_time': None, 'risk_usdt': risk_usdt,
-                    'entry_reason': meta.get('entry_reason'), 'tp1': meta.get('tp1'), 'tp2': meta.get('tp2')
-                })
-                await asyncio.to_thread(add_managed_trade_to_db, meta)
-
-                dry_run_prefix = "[DRY RUN] " if CONFIG["DRY_RUN"] else ""
-                open_msg = (
-                    f"✅ *New Market Trade Opened* {dry_run_prefix}\n\n"
-                    f"**Symbol:** {symbol}\n"
-                    f"**Side:** {side}\n"
-                    f"**Entry:** `{actual_entry_price:.4f}`\n"
-                    f"**Qty:** `{qty}`\n"
-                    f"**Risk:** `{risk_usdt:.2f} USDT`\n"
-                    f"**SL:** `{stop_price:.4f}` | **TP1:** `{tp1_price:.4f}` | **TP2:** `{tp2_price:.4f}`"
-                )
-                await asyncio.to_thread(send_telegram, open_msg, parse_mode='Markdown')
-                log.info("%sOpened market trade: %s", dry_run_prefix, meta)
-
-            except Exception as e:
-                await asyncio.to_thread(log_and_send_error, f"Failed to open market order for {symbol}", e)
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to place limit order for {symbol}", e)
         
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
@@ -2054,7 +1816,7 @@ def get_account_balance_usdt():
     return 0.0
 
 def monitor_thread_func():
-    global managed_trades, last_trade_close_time, running, overload_notified
+    global managed_trades, last_trade_close_time, running, overload_notified, symbol_loss_cooldown
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
         loop_start_time = time.time()
@@ -2080,42 +1842,44 @@ def monitor_thread_func():
                             
                             actual_entry_price = float(order_info.get('avgPrice', p_meta['limit_price']))
                             
-                            sl_distance = abs(actual_entry_price - p_meta['stop_price'])
-                            if p_meta['side'] == 'BUY':
-                                tp1_price = actual_entry_price + (sl_distance * CONFIG["TP1_RR"])
-                                tp2_price = actual_entry_price + (sl_distance * CONFIG["TP2_RR"])
-                            else: # SELL
-                                tp1_price = actual_entry_price - (sl_distance * CONFIG["TP1_RR"])
-                                tp2_price = actual_entry_price - (sl_distance * CONFIG["TP2_RR"])
+                            # The stop_price and take_price are now passed directly from the pending order metadata
+                            stop_price = p_meta['stop_price']
+                            take_price = p_meta['take_price'] # This is for internal monitoring
 
+                            # Place SL order ONLY. The TP is monitored by the bot.
                             sltp_orders = place_batch_sl_tp_sync(
                                 symbol=p_meta['symbol'], side=p_meta['side'],
-                                sl_price=p_meta['stop_price'], tp_price=tp2_price, qty=p_meta['qty']
+                                sl_price=stop_price, tp_price=None, qty=p_meta['qty']
                             )
 
                             trade_id = f"{p_meta['symbol']}_managed_{p_meta['order_id']}"
                             meta = {
                                 "id": trade_id, "symbol": p_meta['symbol'], "side": p_meta['side'], "entry_price": actual_entry_price,
                                 "initial_qty": p_meta['qty'], "qty": p_meta['qty'], "notional": p_meta['qty'] * actual_entry_price, 
-                                "leverage": p_meta['leverage'], "sl": p_meta['stop_price'], "tp": tp2_price, 
+                                "leverage": p_meta['leverage'], 
+                                "sl": stop_price, 
+                                "tp": take_price, # The internally monitored TP level
                                 "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders, 
-                                "trailing": False, "dyn_sltp": True, "tp1": tp1_price, "tp2": tp2_price, 
-                                "tp3": None, "trade_phase": 0, "be_moved": False, "risk_usdt": p_meta['risk_usdt'],
+                                "be_moved": False, 
+                                "trailing_active": False,
+                                "tp_hit": False,
+                                "risk_usdt": p_meta['risk_usdt'],
                                 "entry_reason": "LIMIT_FILL"
                             }
 
                             with managed_trades_lock:
                                 managed_trades[trade_id] = meta
                             
+                            # Use a simplified record_trade call, as many fields are for the new management style
                             record_trade({
                                 'id': trade_id, 'symbol': meta['symbol'], 'side': meta['side'], 'entry_price': meta['entry_price'],
                                 'exit_price': None, 'qty': meta['qty'], 'notional': meta['notional'], 'pnl': None,
                                 'open_time': meta['open_time'], 'close_time': None, 'risk_usdt': meta['risk_usdt'],
-                                'entry_reason': meta.get('entry_reason'), 'tp1': meta.get('tp1'), 'tp2': meta.get('tp2')
+                                'entry_reason': meta.get('entry_reason'), 'tp1': take_price # Store main TP here for reporting
                             })
                             add_managed_trade_to_db(meta)
                             
-                            send_telegram(f"✅ Limit Order Filled for {p_meta['symbol']} | Side: {p_meta['side']}, Entry: {actual_entry_price:.4f}")
+                            send_telegram(f"✅ Limit Order Filled & Trade Opened for {p_meta['symbol']} | Side: {p_meta['side']}, Entry: {actual_entry_price:.4f}, SL: {stop_price:.4f}, TP: {take_price:.4f}")
                             to_remove_pending.append(p_id)
 
                         elif order_status in ['CANCELED', 'EXPIRED', 'REJECTED']:
@@ -2252,6 +2016,12 @@ def monitor_thread_func():
                     meta['close_time'] = close_time.isoformat()
                     exit_reason = meta.get('exit_reason', 'SL/TP') # Default to SL/TP if not set by an early exit
                     
+                    # --- Post-Loss Cooldown Logic ---
+                    if unreal < 0:
+                        symbol_loss_cooldown[sym] = close_time
+                        log.info(f"Symbol {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown due to a losing trade (PnL: {unreal:.4f}).")
+                        send_telegram(f"🧊 Symbol {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
+
                     record_trade({
                         'id': meta['id'], 'symbol': meta['symbol'], 'side': meta['side'],
                         'entry_price': meta['entry_price'], 'exit_price': float(pos.get('entryPrice') or 0.0),
@@ -2281,99 +2051,100 @@ def monitor_thread_func():
                     log.warning(f"Skipping monitoring cycle for {tid} due to missing kline data.")
                     continue
 
-                # --- New Exit Conditions ---
-                should_close = False
-                exit_reason = ""
-                
-                # 1. RSI Exit
-                rsi_now = rsi(df_monitor['close'], CONFIG["RSI_LEN"]).iloc[-1]
-                if (meta['side'] == 'BUY' and rsi_now >= 50) or \
-                   (meta['side'] == 'SELL' and rsi_now <= 50):
-                    should_close = True
-                    exit_reason = f"RSI Exit ({rsi_now:.2f})"
+                # --- New In-Trade Management Logic ---
+                try:
+                    current_price = df_monitor['close'].iloc[-1]
+                    entry_price = meta['entry_price']
+                    side = meta['side']
 
-                if should_close:
-                    log.info(f"Closing trade {tid} for {sym}. Reason: {exit_reason}")
-                    try:
-                        with managed_trades_lock:
-                            if tid in managed_trades:
-                                managed_trades[tid]['exit_reason'] = exit_reason
-                        
-                        cancel_trade_sltp_orders_sync(meta)
-                        close_partial_market_position_sync(sym, meta['side'], meta['qty'])
-                        send_telegram(f"👋 Trade Closed for {sym}. Reason: {exit_reason}")
-                    except Exception as e:
-                        log_and_send_error(f"Failed to force-close trade {tid} due to {exit_reason}", e)
-                    continue
-
-                # --- New TP/SL Management ---
-                if meta.get('dyn_sltp'):
-                    try:
-                        current_price = df_monitor['close'].iloc[-1]
-                        
-                        # Check for TP1 and move SL to Break-Even
-                        if meta.get('trade_phase') == 0 and meta.get('tp1') is not None:
-                            hit_tp1 = (meta['side'] == 'BUY' and current_price >= meta['tp1']) or \
-                                      (meta['side'] == 'SELL' and current_price <= meta['tp1'])
-                            if hit_tp1:
-                                log.info(f"Trade {tid} hit TP1 at {meta['tp1']}.")
-                                qty_to_close = meta['initial_qty'] * CONFIG['TP1_CLOSE_PCT']
+                    # 1. Check for Partial Take Profit first
+                    if not meta.get('tp_hit'):
+                        tp_price = meta.get('tp')
+                        if tp_price:
+                            hit_tp = (side == 'BUY' and current_price >= tp_price) or \
+                                     (side == 'SELL' and current_price <= tp_price)
+                            
+                            if hit_tp:
+                                log.info(f"Trade {tid} hit internal TP at {tp_price}. Closing {CONFIG['PARTIAL_TP_CLOSE_PCT']*100}%.")
+                                qty_to_close = meta['initial_qty'] * CONFIG['PARTIAL_TP_CLOSE_PCT']
                                 qty_to_close = round_qty(sym, qty_to_close)
                                 
                                 if qty_to_close > 0:
-                                    close_partial_market_position_sync(sym, meta['side'], qty_to_close)
+                                    close_partial_market_position_sync(sym, side, qty_to_close)
+                                
+                                cancel_trade_sltp_orders_sync(meta)
                                 
                                 new_qty = meta['qty'] - qty_to_close
-                                cancel_trade_sltp_orders_sync(meta)
-                                new_sl = meta['entry_price']
-                                new_orders = place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
-                                
+                                new_sl_price = entry_price * (1.001 if side == 'BUY' else 0.999)
+                                new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, tp_price=None, qty=new_qty)
+
                                 with managed_trades_lock:
                                     if tid in managed_trades:
-                                        managed_trades[tid]['trade_phase'] = 1
                                         managed_trades[tid]['qty'] = new_qty
-                                        managed_trades[tid]['sl'] = new_sl
                                         managed_trades[tid]['sltp_orders'] = new_orders
+                                        managed_trades[tid]['tp_hit'] = True
                                         managed_trades[tid]['be_moved'] = True
+                                        managed_trades[tid]['trailing_active'] = True
+                                        managed_trades[tid]['sl'] = new_sl_price
                                         add_managed_trade_to_db(managed_trades[tid])
-                                send_telegram(f"✅ TP1 hit for {tid} ({sym}). Closed {CONFIG['TP1_CLOSE_PCT']*100}%. SL moved to breakeven.")
+                                
+                                send_telegram(f"✅ TP hit for {tid} ({sym}). Closed {CONFIG['PARTIAL_TP_CLOSE_PCT']*100}%. SL moved to BE. Remainder is trailing.")
                                 continue
-                    except Exception as e:
-                        log_and_send_error(f"Failed to process new TP/SL logic for {tid}", e)
 
-                # --- Trailing Stop Logic (New: trails after TP1) ---
-                if CONFIG['TRAILING_ENABLED'] and meta.get('trade_phase', 0) > 0:
-                    try:
+                    # 2. Check for Break-Even Trigger
+                    if not meta.get('be_moved'):
+                        profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
+                        if profit_pct >= CONFIG['BE_TRIGGER_PROFIT_PCT']:
+                            log.info(f"Trade {tid} hit BE trigger at {profit_pct:.2%}. Moving SL.")
+                            
+                            cancel_trade_sltp_orders_sync(meta)
+                            
+                            new_sl_price = entry_price * (1 + CONFIG['BE_SL_PROFIT_PCT'] if side == 'BUY' else 1 - CONFIG['BE_SL_PROFIT_PCT'])
+                            
+                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, tp_price=None, qty=meta['qty'])
+                            
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['sl'] = new_sl_price
+                                    managed_trades[tid]['sltp_orders'] = new_orders
+                                    managed_trades[tid]['be_moved'] = True
+                                    managed_trades[tid]['trailing_active'] = True
+                                    add_managed_trade_to_db(managed_trades[tid])
+                            
+                            send_telegram(f"📈 Breakeven triggered for {tid} ({sym}). SL moved to {new_sl_price:.4f} and trailing stop activated.")
+                            continue
+
+                    # 3. Check for Trailing Stop
+                    if meta.get('trailing_active'):
                         atr_now = atr(df_monitor, CONFIG["ATR_LENGTH"]).iloc[-1]
-                        current_price = df_monitor['close'].iloc[-1]
                         
                         new_sl = None
-                        # For longs, new SL is current price - ATR multiplier
-                        if meta['side'] == 'BUY':
+                        current_sl = meta['sl']
+                        
+                        if side == 'BUY':
                             potential_sl = current_price - (atr_now * CONFIG["SL_TP_ATR_MULT"])
-                            # We only move the SL up
-                            if potential_sl > meta['sl']:
+                            if potential_sl > current_sl:
                                 new_sl = potential_sl
                         else: # SELL
                             potential_sl = current_price + (atr_now * CONFIG["SL_TP_ATR_MULT"])
-                            # We only move the SL down
-                            if potential_sl < meta['sl']:
+                            if potential_sl < current_sl:
                                 new_sl = potential_sl
                         
                         if new_sl:
-                            log.info(f"Trailing SL for {tid}. Old: {meta['sl']:.4f}, New: {new_sl:.4f}")
+                            log.info(f"Trailing SL for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
                             cancel_trade_sltp_orders_sync(meta)
-                            new_orders = place_batch_sl_tp_sync(sym, meta['side'], sl_price=new_sl, tp_price=meta['tp'])
+                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, tp_price=None, qty=meta['qty'])
                             
                             with managed_trades_lock:
                                 if tid in managed_trades:
                                     managed_trades[tid]['sl'] = new_sl
                                     managed_trades[tid]['sltp_orders'] = new_orders
                                     add_managed_trade_to_db(managed_trades[tid])
-                            send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
                             
-                    except Exception as e:
-                        log_and_send_error(f"Failed to process trailing SL for {tid}", e)
+                            send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
+                
+                except Exception as e:
+                    log_and_send_error(f"Failed to process in-trade management logic for {tid}", e)
 
             if to_remove:
                 with managed_trades_lock:
