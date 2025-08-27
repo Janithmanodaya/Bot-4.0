@@ -121,9 +121,9 @@ CONFIG = {
     "BE_AUTO_MOVE_ENABLED": os.getenv("BE_AUTO_MOVE_ENABLED", "true").lower() in ("true", "1", "yes"),
 
     "DYN_SLTP_ENABLED": os.getenv("DYN_SLTP_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "TP1_ATR_MULT": float(os.getenv("TP1_ATR_MULT", "1.0")),
-    "TP2_ATR_MULT": float(os.getenv("TP2_ATR_MULT", "2.0")),
-    "TP3_ATR_MULT": float(os.getenv("TP3_ATR_MULT", "3.0")),
+    "TP1_ATR_MULT": float(os.getenv("TP1_ATR_MULT", "2.0")),
+    "TP2_ATR_MULT": float(os.getenv("TP2_ATR_MULT", "3.0")),
+    "TP3_ATR_MULT": float(os.getenv("TP3_ATR_MULT", "4.0")),
     "TP1_CLOSE_PCT": float(os.getenv("TP1_CLOSE_PCT", "0.5")), # 50%
     "TP2_CLOSE_PCT": float(os.getenv("TP2_CLOSE_PCT", "0.25")), # 25%
 
