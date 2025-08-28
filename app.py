@@ -45,6 +45,9 @@ from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, 
 
 import mplfinance as mpf
 
+import firebase_admin
+from firebase_admin import credentials, db
+
 from dotenv import load_dotenv
 
 # Load .env file into environment (if present)
@@ -69,6 +72,7 @@ log = logging.getLogger("ema-bb-bot")
 client: Optional[Client] = None
 telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
+firebase_db = None
 
 # -------------------------
 # CONFIG (edit values here)
@@ -127,6 +131,7 @@ CONFIG = {
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
     "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
     "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "10")),
+    "FIREBASE_DATABASE_URL": os.getenv("FIREBASE_DATABASE_URL", "https://techno-a3e6c-default-rtdb.firebaseio.com/"),
 }
 
 running = (CONFIG["START_MODE"] == "running")
@@ -202,10 +207,13 @@ EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
 async def reconcile_open_trades():
     global managed_trades
-    log.info("--- Starting Trade Reconciliation ---")
+    log.info("--- Starting Trade Reconciliation (with Firebase data) ---")
 
-    db_trades = await asyncio.to_thread(load_managed_trades_from_db)
-    log.info(f"Found {len(db_trades)} managed trade(s) in the database.")
+    fb_trades = {}
+    async with managed_trades_lock:
+        fb_trades = dict(managed_trades)
+    
+    log.info(f"Found {len(fb_trades)} managed trade(s) in Firebase to reconcile.")
 
     try:
         if client is None:
@@ -227,7 +235,7 @@ async def reconcile_open_trades():
     retained_trades = {}
     
     # 1. Reconcile trades that are already in the database
-    for trade_id, trade_meta in db_trades.items():
+    for trade_id, trade_meta in fb_trades.items():
         symbol = trade_meta['symbol']
         if symbol in open_positions:
             log.info(f"✅ Reconciled DB trade: {trade_id} ({symbol}) is active. Restoring.")
@@ -280,7 +288,12 @@ async def reconcile_open_trades():
 
                 # Add to managed trades and save to DB
                 retained_trades[trade_id] = meta
-                await asyncio.to_thread(add_managed_trade_to_db, meta)
+                await asyncio.to_thread(add_managed_trade_to_db, meta) # Keep as backup
+                if firebase_db:
+                    try:
+                        await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+                    except Exception as e:
+                        log.exception(f"Failed to save imported trade {trade_id} to Firebase: {e}")
 
                 # Cancel any existing SL/TP orders for this symbol before placing new ones
                 await asyncio.to_thread(cancel_close_orders_sync, symbol)
@@ -384,7 +397,12 @@ async def check_and_import_rogue_trades():
                 # Add to managed trades and save to DB
                 async with managed_trades_lock:
                     managed_trades[trade_id] = meta
-                await asyncio.to_thread(add_managed_trade_to_db, meta)
+                await asyncio.to_thread(add_managed_trade_to_db, meta) # Keep as backup
+                if firebase_db:
+                    try:
+                        await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+                    except Exception as e:
+                        log.exception(f"Failed to save imported trade {trade_id} to Firebase: {e}")
 
                 msg = (f"ℹ️ **Position Auto-Imported**\n\n"
                        f"Found and imported a rogue position for **{symbol}**.\n\n"
@@ -429,6 +447,57 @@ async def periodic_rogue_check_loop():
             await asyncio.sleep(60)
 
 
+def init_firebase_sync():
+    """
+    Initializes the Firebase Admin SDK.
+    Returns (ok: bool, error_message: str)
+    """
+    global firebase_db
+    try:
+        cred = credentials.Certificate("firebase_credentials.json")
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': CONFIG['FIREBASE_DATABASE_URL']
+        })
+        firebase_db = db.reference()
+        log.info("Firebase connection initialized successfully.")
+        return True, ""
+    except Exception as e:
+        log.exception("Failed to initialize Firebase: %s", e)
+        err = f"Firebase init error: {e}"
+        send_telegram(f"🔥 Firebase Init Failed: {e}\nThe bot cannot persist state and may not function correctly.")
+        return False, err
+
+
+def load_state_from_firebase_sync():
+    """
+    Loads pending orders and managed trades from Firebase into memory on startup.
+    """
+    global pending_limit_orders, managed_trades
+    if not firebase_db:
+        log.warning("Firebase not initialized, cannot load state from Firebase.")
+        return
+
+    log.info("--- Loading State from Firebase ---")
+    try:
+        # Load pending orders
+        pending_data = firebase_db.child("pending_limit_orders").get()
+        if pending_data:
+            with pending_limit_orders_lock:
+                pending_limit_orders.update(pending_data)
+            log.info(f"Loaded {len(pending_data)} pending order(s) from Firebase.")
+
+        # Load managed trades
+        trades_data = firebase_db.child("managed_trades").get()
+        if trades_data:
+            with managed_trades_lock:
+                managed_trades.update(trades_data)
+            log.info(f"Loaded {len(trades_data)} managed trade(s) from Firebase.")
+            
+    except Exception as e:
+        log.exception("Failed to load state from Firebase: %s", e)
+        send_telegram("⚠️ Failed to load state from Firebase on startup. The bot may not be aware of existing trades.")
+
+
 # -------------------------
 # App Lifespan Manager
 # -------------------------
@@ -439,6 +508,10 @@ async def lifespan(app: FastAPI):
     
     # --- Startup Logic ---
     init_db()
+    
+    # New Firebase init
+    await asyncio.to_thread(init_firebase_sync)
+    await asyncio.to_thread(load_state_from_firebase_sync)
 
     main_loop = asyncio.get_running_loop()
 
@@ -1802,7 +1875,15 @@ async def evaluate_and_enter(symbol: str):
             
             async with pending_limit_orders_lock:
                 pending_limit_orders[pending_order_id] = pending_meta
-            
+                if firebase_db:
+                    try:
+                        await asyncio.to_thread(
+                            firebase_db.child("pending_limit_orders").child(pending_order_id).set,
+                            pending_meta
+                        )
+                    except Exception as e:
+                        log.exception(f"Failed to save pending order {pending_order_id} to Firebase: {e}")
+
             log.info(f"Placed pending limit order: {pending_meta}")
             await asyncio.to_thread(send_telegram, f"⏳ New Limit Order Placed for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}")
 
@@ -1887,7 +1968,12 @@ def monitor_thread_func():
                                 'open_time': meta['open_time'], 'close_time': None, 'risk_usdt': meta['risk_usdt'],
                                 'entry_reason': meta.get('entry_reason'), 'tp1': take_price # Store main TP here for reporting
                             })
-                            add_managed_trade_to_db(meta)
+                            add_managed_trade_to_db(meta) # Keep for now as backup
+                            if firebase_db:
+                                try:
+                                    firebase_db.child("managed_trades").child(trade_id).set(meta)
+                                except Exception as e:
+                                    log.exception(f"Failed to save new managed trade {trade_id} to Firebase: {e}")
                             
                             send_telegram(f"✅ Limit Order Filled & Trade Opened for {p_meta['symbol']} | Side: {p_meta['side']}, Entry: {actual_entry_price:.4f}, SL: {stop_price:.4f}, TP: {take_price:.4f}")
                             to_remove_pending.append(p_id)
@@ -1939,6 +2025,11 @@ def monitor_thread_func():
                     with pending_limit_orders_lock:
                         for p_id in to_remove_pending:
                             pending_limit_orders.pop(p_id, None)
+                            if firebase_db:
+                                try:
+                                    firebase_db.child("pending_limit_orders").child(p_id).delete()
+                                except Exception as e:
+                                    log.exception(f"Failed to delete pending order {p_id} from Firebase: {e}")
 
             positions = []
             try:
@@ -1967,22 +2058,19 @@ def monitor_thread_func():
                 log.error("Caught BinanceAPIException in monitor thread: %s", e)
                 
                 if e.code == -2015:
-                    # This is a fatal auth/IP error. Freeze the bot and retry periodically.
+                    # This is a fatal auth/IP error. The hosting platform should restart the service.
                     ip = get_public_ip()
                     error_msg = (
                         f"🚨 **CRITICAL AUTH ERROR** 🚨\n\n"
-                        f"Binance API keys are invalid, have incorrect permissions, or the server's IP address is not whitelisted.\n\n"
+                        f"Binance API keys are invalid or the server's IP is not whitelisted.\n\n"
                         f"Error Code: `{e.code}`\n"
-                        f"Server IP: {ip} \n\n"
-                        f"Please add this IP to your Binance API key's whitelist. "
-                        f"The bot is now FROZEN and will retry every 2 minutes."
+                        f"Server IP: `{ip}`\n\n"
+                        f"The bot will now attempt to restart to get a new IP address. Please add the new IP to your Binance whitelist if the error persists."
                     )
-                    send_telegram(error_msg)
-                    running = False
-                    frozen = True
-                    log.info("Bot frozen due to auth error. Waiting 2 minutes before next attempt...")
-                    time.sleep(120)
-                    continue
+                    send_telegram(error_msg, parse_mode='Markdown')
+                    log.warning(f"IP Whitelist Error (Code: -2015). Server IP: {ip}. Restarting in 60 seconds...")
+                    time.sleep(60)
+                    sys.exit(1) # Exit with error code to trigger platform restart
 
                 # Handle other, potentially transient, API errors
                 html_content = None
@@ -2055,7 +2143,12 @@ def monitor_thread_func():
                         'entry_reason': meta.get('entry_reason'), 'exit_reason': exit_reason,
                         'tp1': meta.get('tp1'), 'tp2': meta.get('tp2')
                     })
-                    remove_managed_trade_from_db(tid)
+                    remove_managed_trade_from_db(tid) # Keep as backup
+                    if firebase_db:
+                        try:
+                            firebase_db.child("managed_trades").child(tid).delete()
+                        except Exception as e:
+                            log.exception(f"Failed to delete managed trade {tid} from Firebase: {e}")
                     with managed_trades_lock:
                         last_trade_close_time[sym] = close_time
                     
@@ -2110,7 +2203,12 @@ def monitor_thread_func():
                                         managed_trades[tid]['be_moved'] = True
                                         managed_trades[tid]['trailing_active'] = True
                                         managed_trades[tid]['sl'] = new_sl_price
-                                        add_managed_trade_to_db(managed_trades[tid])
+                                        add_managed_trade_to_db(managed_trades[tid]) # Keep as backup
+                                        if firebase_db:
+                                            try:
+                                                firebase_db.child("managed_trades").child(tid).set(managed_trades[tid])
+                                            except Exception as e:
+                                                log.exception(f"Failed to update managed trade {tid} in Firebase after partial TP: {e}")
                                 
                                 send_telegram(f"✅ TP hit for {tid} ({sym}). Closed {CONFIG['PARTIAL_TP_CLOSE_PCT']*100}%. SL moved to BE. Remainder is trailing.")
                                 continue
@@ -2133,7 +2231,12 @@ def monitor_thread_func():
                                     managed_trades[tid]['sltp_orders'] = new_orders
                                     managed_trades[tid]['be_moved'] = True
                                     managed_trades[tid]['trailing_active'] = True
-                                    add_managed_trade_to_db(managed_trades[tid])
+                                    add_managed_trade_to_db(managed_trades[tid]) # Keep as backup
+                                    if firebase_db:
+                                        try:
+                                            firebase_db.child("managed_trades").child(tid).set(managed_trades[tid])
+                                        except Exception as e:
+                                            log.exception(f"Failed to update managed trade {tid} in Firebase after BE trigger: {e}")
                             
                             send_telegram(f"📈 Breakeven triggered for {tid} ({sym}). SL moved to {new_sl_price:.4f} and trailing stop activated.")
                             continue
@@ -2163,7 +2266,12 @@ def monitor_thread_func():
                                 if tid in managed_trades:
                                     managed_trades[tid]['sl'] = new_sl
                                     managed_trades[tid]['sltp_orders'] = new_orders
-                                    add_managed_trade_to_db(managed_trades[tid])
+                                    add_managed_trade_to_db(managed_trades[tid]) # Keep as backup
+                                    if firebase_db:
+                                        try:
+                                            firebase_db.child("managed_trades").child(tid).set(managed_trades[tid])
+                                        except Exception as e:
+                                            log.exception(f"Failed to update managed trade {tid} in Firebase after trailing stop: {e}")
                             
                             send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
                 
