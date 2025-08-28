@@ -1778,6 +1778,12 @@ async def evaluate_and_enter(symbol: str):
             order_id = str(limit_order_resp.get('orderId'))
             pending_order_id = f"{symbol}_{order_id}"
 
+            # Calculate expiry time for the end of the current candle
+            candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+            # The last index in df is the close time of the most recently completed candle,
+            # which is the open time of the current candle.
+            expiry_time = df.index[-1] + candle_duration
+
             # Store all necessary info for when the order is filled
             pending_meta = {
                 "id": pending_order_id,
@@ -1791,6 +1797,7 @@ async def evaluate_and_enter(symbol: str):
                 "leverage": leverage,
                 "risk_usdt": risk_usdt,
                 "place_time": datetime.utcnow().isoformat(),
+                "expiry_time": expiry_time.isoformat(),
             }
             
             async with pending_limit_orders_lock:
@@ -1849,10 +1856,10 @@ def monitor_thread_func():
                             stop_price = p_meta['stop_price']
                             take_price = p_meta['take_price'] # This is for internal monitoring
 
-                            # Place SL order ONLY. The TP is monitored by the bot.
+                            # Place SL and TP orders together after the limit order is filled.
                             sltp_orders = place_batch_sl_tp_sync(
                                 symbol=p_meta['symbol'], side=p_meta['side'],
-                                sl_price=stop_price, tp_price=None, qty=p_meta['qty']
+                                sl_price=stop_price, tp_price=take_price, qty=p_meta['qty']
                             )
 
                             trade_id = f"{p_meta['symbol']}_managed_{p_meta['order_id']}"
@@ -1890,18 +1897,32 @@ def monitor_thread_func():
                             send_telegram(f"❌ Limit Order {order_status} for {p_meta['symbol']}.")
                             to_remove_pending.append(p_id)
 
-                        else: # Still NEW or PARTIALLY_FILLED, check for timeout
-                            timeout_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME']) * CONFIG['ORDER_ENTRY_TIMEOUT']
-                            if timeout_duration:
-                                placed_time = datetime.fromisoformat(p_meta['place_time'])
-                                if datetime.utcnow() - placed_time > timeout_duration:
-                                    log.warning(f"Pending order {p_id} for {p_meta['symbol']} has timed out. Cancelling.")
+                        else: # Still NEW or PARTIALLY_FILLED, check for expiry
+                            expiry_time_str = p_meta.get('expiry_time')
+                            if expiry_time_str:
+                                # New logic: expire at the end of the candle
+                                expiry_time = datetime.fromisoformat(expiry_time_str)
+                                if datetime.now(timezone.utc) > expiry_time:
+                                    log.warning(f"Pending order {p_id} for {p_meta['symbol']} has expired at candle close. Cancelling.")
                                     try:
                                         client.futures_cancel_order(symbol=p_meta['symbol'], orderId=p_meta['order_id'])
-                                        send_telegram(f"⌛️ Limit Order for {p_meta['symbol']} timed out and was cancelled.")
+                                        send_telegram(f"⌛️ Limit Order for {p_meta['symbol']} expired at candle close and was cancelled.")
                                     except Exception as e:
-                                        log_and_send_error(f"Failed to cancel timed-out order {p_id}", e)
+                                        log_and_send_error(f"Failed to cancel expired order {p_id}", e)
                                     to_remove_pending.append(p_id)
+                            else:
+                                # Fallback to old logic for orders created before this change
+                                timeout_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME']) * CONFIG['ORDER_ENTRY_TIMEOUT']
+                                if timeout_duration:
+                                    placed_time = datetime.fromisoformat(p_meta['place_time'])
+                                    if datetime.utcnow() - placed_time > timeout_duration:
+                                        log.warning(f"Pending order {p_id} for {p_meta['symbol']} has timed out (legacy). Cancelling.")
+                                        try:
+                                            client.futures_cancel_order(symbol=p_meta['symbol'], orderId=p_meta['order_id'])
+                                            send_telegram(f"⌛️ Limit Order for {p_meta['symbol']} timed out and was cancelled.")
+                                        except Exception as e:
+                                            log_and_send_error(f"Failed to cancel timed-out order {p_id}", e)
+                                        to_remove_pending.append(p_id)
                     except BinanceAPIException as e:
                         if e.code == -2013: # Order does not exist
                             log.warning(f"Pending order {p_id} not found on exchange. Assuming it was filled/canceled and removing.", e)
