@@ -92,7 +92,7 @@ CONFIG = {
     "LOSS_COOLDOWN_HOURS": int(os.getenv("LOSS_COOLDOWN_HOURS", "6")),
 
     # --- TP/SL & TRADE MANAGEMENT ---
-    "PARTIAL_TP_CLOSE_PCT": float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.5")),
+    "PARTIAL_TP_CLOSE_PCT": float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.8")),
     "BE_TRIGGER_PROFIT_PCT": float(os.getenv("BE_TRIGGER_PROFIT_PCT", "0.006")),
     "BE_SL_PROFIT_PCT": float(os.getenv("BE_SL_PROFIT_PCT", "0.001")),
     
