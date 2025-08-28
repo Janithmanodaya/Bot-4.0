@@ -450,15 +450,34 @@ async def periodic_rogue_check_loop():
 
 def init_firebase_sync():
     """
-    Initializes the Firebase Admin SDK.
+    Initializes the Firebase Admin SDK from an environment variable or a file.
     Returns (ok: bool, error_message: str)
     """
     global firebase_db
     try:
-        cred = credentials.Certificate("firebase_credentials.json")
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': CONFIG['FIREBASE_DATABASE_URL']
-        })
+        # Check for credentials in environment variable first
+        cred_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        if cred_json_str:
+            log.info("Initializing Firebase from environment variable.")
+            cred_dict = json.loads(cred_json_str)
+            cred = credentials.Certificate(cred_dict)
+        else:
+            # Fallback to local file
+            log.info("Initializing Firebase from firebase_credentials.json file.")
+            if not os.path.exists("firebase_credentials.json"):
+                log.error("firebase_credentials.json not found and FIREBASE_CREDENTIALS_JSON env var is not set.")
+                send_telegram("🔥 Firebase Init Failed: Credentials not found.")
+                return False, "Credentials not found"
+            cred = credentials.Certificate("firebase_credentials.json")
+
+        # Check if Firebase app is already initialized
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': CONFIG['FIREBASE_DATABASE_URL']
+            })
+        else:
+            log.warning("Firebase app already initialized. Skipping re-initialization.")
+
         firebase_db = db.reference()
         log.info("Firebase connection initialized successfully.")
         return True, ""
@@ -1166,7 +1185,6 @@ def round_price(symbol: str, price: float) -> str:
             return f"{price:.8f}"  # Fallback
         symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
         if not symbol_info:
-            log.warning(f"Could not find symbol info for {symbol} in exchange info cache. Using fallback price formatting.")
             return f"{price:.8f}"  # Fallback
         for f in symbol_info.get('filters', []):
             if f.get('filterType') == 'PRICE_FILTER':
@@ -1178,15 +1196,10 @@ def round_price(symbol: str, price: float) -> str:
 
                 getcontext().prec = 28
                 p = Decimal(str(price))
-                
-                # Previous implementation used ROUND_DOWN. Switching to default rounding (ROUND_HALF_EVEN)
-                # as ROUND_DOWN might be too aggressive for certain order types/sides, causing the -4014 error.
-                rounded_price = p.quantize(tick_size)
+                rounded_price = p.quantize(tick_size, rounding=ROUND_DOWN)
                 
                 # Format with the correct number of decimal places to preserve trailing zeros
-                formatted_price = f"{rounded_price:.{decimal_places}f}"
-                log.info(f"Rounding price for {symbol}: original={price}, rounded={formatted_price}, tick_size={tick_size_str}")
-                return formatted_price
+                return f"{rounded_price:.{decimal_places}f}"
     except Exception:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
