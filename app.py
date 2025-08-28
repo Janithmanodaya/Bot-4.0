@@ -2356,7 +2356,7 @@ async def scanning_loop():
                 continue
 
             log.info("Starting concurrent symbol scan...")
-            symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"]]
+            symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"] if s.strip()]
             tasks = [evaluate_and_enter(s) for s in symbols]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
