@@ -123,7 +123,7 @@ CONFIG = {
 
     "DB_FILE": os.getenv("DB_FILE", "trades.db"),
     
-    "DRY_RUN": os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
+    "DRY_RUN": os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes"),
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
     "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
     "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "10")),
