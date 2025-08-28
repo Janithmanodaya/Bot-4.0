@@ -1166,6 +1166,7 @@ def round_price(symbol: str, price: float) -> str:
             return f"{price:.8f}"  # Fallback
         symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
         if not symbol_info:
+            log.warning(f"Could not find symbol info for {symbol} in exchange info cache. Using fallback price formatting.")
             return f"{price:.8f}"  # Fallback
         for f in symbol_info.get('filters', []):
             if f.get('filterType') == 'PRICE_FILTER':
@@ -1177,10 +1178,15 @@ def round_price(symbol: str, price: float) -> str:
 
                 getcontext().prec = 28
                 p = Decimal(str(price))
-                rounded_price = p.quantize(tick_size, rounding=ROUND_DOWN)
+                
+                # Previous implementation used ROUND_DOWN. Switching to default rounding (ROUND_HALF_EVEN)
+                # as ROUND_DOWN might be too aggressive for certain order types/sides, causing the -4014 error.
+                rounded_price = p.quantize(tick_size)
                 
                 # Format with the correct number of decimal places to preserve trailing zeros
-                return f"{rounded_price:.{decimal_places}f}"
+                formatted_price = f"{rounded_price:.{decimal_places}f}"
+                log.info(f"Rounding price for {symbol}: original={price}, rounded={formatted_price}, tick_size={tick_size_str}")
+                return formatted_price
     except Exception:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
