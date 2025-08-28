@@ -491,6 +491,7 @@ def init_firebase_sync():
 def load_state_from_firebase_sync():
     """
     Loads pending orders and managed trades from Firebase into memory on startup.
+    Handles cases where the database paths do not exist.
     """
     global pending_limit_orders, managed_trades
     if not firebase_db:
@@ -500,20 +501,33 @@ def load_state_from_firebase_sync():
     log.info("--- Loading State from Firebase ---")
     try:
         # Load pending orders
-        pending_data = firebase_db.child("pending_limit_orders").get()
-        if pending_data:
-            with pending_limit_orders_lock:
-                pending_limit_orders.update(pending_data)
-            log.info(f"Loaded {len(pending_data)} pending order(s) from Firebase.")
+        try:
+            pending_data = firebase_db.child("pending_limit_orders").get()
+            if pending_data:
+                with pending_limit_orders_lock:
+                    pending_limit_orders.update(pending_data)
+                log.info(f"Loaded {len(pending_data)} pending order(s) from Firebase.")
+            else:
+                log.info("No pending orders found in Firebase.")
+        except firebase_admin.exceptions.NotFoundError:
+            log.info("'/pending_limit_orders' path not found in Firebase. Assuming no pending orders.")
+            pass # Path doesn't exist, which is fine
 
         # Load managed trades
-        trades_data = firebase_db.child("managed_trades").get()
-        if trades_data:
-            with managed_trades_lock:
-                managed_trades.update(trades_data)
-            log.info(f"Loaded {len(trades_data)} managed trade(s) from Firebase.")
-            
+        try:
+            trades_data = firebase_db.child("managed_trades").get()
+            if trades_data:
+                with managed_trades_lock:
+                    managed_trades.update(trades_data)
+                log.info(f"Loaded {len(trades_data)} managed trade(s) from Firebase.")
+            else:
+                log.info("No managed trades found in Firebase.")
+        except firebase_admin.exceptions.NotFoundError:
+            log.info("'/managed_trades' path not found in Firebase. Assuming no managed trades.")
+            pass # Path doesn't exist, which is fine
+
     except Exception as e:
+        # Catch any other unexpected errors during state loading
         log.exception("Failed to load state from Firebase: %s", e)
         send_telegram("⚠️ Failed to load state from Firebase on startup. The bot may not be aware of existing trades.")
 
