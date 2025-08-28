@@ -274,7 +274,7 @@ async def reconcile_open_trades():
                     "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
                     "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
                     "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
-                    "dyn_sltp": CONFIG["DYN_SLTP_ENABLED"], "tp1": None, "tp2": None, "tp3": None,
+                    "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
                     "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0 # Risk is unknown for imported trades
                 }
 
@@ -371,7 +371,7 @@ async def check_and_import_rogue_trades():
                     "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
                     "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
                     "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
-                    "dyn_sltp": CONFIG["DYN_SLTP_ENABLED"], "tp1": None, "tp2": None, "tp3": None,
+                    "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
                     "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0
                 }
 
