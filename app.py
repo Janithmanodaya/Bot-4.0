@@ -92,6 +92,17 @@ CONFIG = {
     "SL_BUFFER_PCT": float(os.getenv("SL_BUFFER_PCT", "0.02")),
     "LOSS_COOLDOWN_HOURS": int(os.getenv("LOSS_COOLDOWN_HOURS", "6")),
 
+    # --- FAST MOVE FILTER (avoids entry on volatile candles) ---
+    "FAST_MOVE_FILTER_ENABLED": os.getenv("FAST_MOVE_FILTER_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "FAST_MOVE_ATR_MULT": float(os.getenv("FAST_MOVE_ATR_MULT", "2.0")), # Candle size > ATR * mult
+    "FAST_MOVE_RETURN_PCT": float(os.getenv("FAST_MOVE_RETURN_PCT", "0.005")), # 1m return > 0.5%
+    "FAST_MOVE_VOL_MULT": float(os.getenv("FAST_MOVE_VOL_MULT", "2.0")), # Volume > avg_vol * mult
+
+    # --- ADX TREND FILTER ---
+    "ADX_FILTER_ENABLED": os.getenv("ADX_FILTER_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "ADX_PERIOD": int(os.getenv("ADX_PERIOD", "14")),
+    "ADX_THRESHOLD": float(os.getenv("ADX_THRESHOLD", "25.0")),
+
     # --- TP/SL & TRADE MANAGEMENT ---
     "PARTIAL_TP_CLOSE_PCT": float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.8")),
     "BE_TRIGGER_PROFIT_PCT": float(os.getenv("BE_TRIGGER_PROFIT_PCT", "0.006")),
@@ -1054,6 +1065,42 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     return upper_band, lower_band
 
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Calculates the Average Directional Index (ADX).
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+
+    # Calculate +DM, -DM and TR
+    plus_dm = high.diff()
+    minus_dm = low.diff().mul(-1)
+    
+    plus_dm[plus_dm < 0] = 0
+    plus_dm[plus_dm < minus_dm] = 0
+    
+    minus_dm[minus_dm < 0] = 0
+    minus_dm[minus_dm < plus_dm] = 0
+
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+
+    # Smoothed values using Wilder's smoothing (approximated by EMA with alpha=1/period)
+    alpha = 1 / period
+    atr_smooth = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_smooth)
+    minus_di = 100 * (minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_smooth)
+    
+    # DX and ADX
+    # To avoid division by zero, set denominator to 1 where it's zero
+    dx_denominator = plus_di + minus_di
+    dx_denominator[dx_denominator == 0] = 1
+    dx = 100 * (abs(plus_di - minus_di) / dx_denominator)
+    adx_series = dx.ewm(alpha=alpha, adjust=False).mean()
+    
+    return adx_series
+
+
 # -------------------------
 # Binance Init
 # -------------------------
@@ -1774,6 +1821,55 @@ async def evaluate_and_enter(symbol: str):
         
         # Use the most recently closed candle for the signal, not the current open one.
         signal_candle = df.iloc[-2]
+
+        # --- ADX Trend Filter ---
+        if CONFIG.get("ADX_FILTER_ENABLED", True):
+            df['adx'] = adx(df, period=CONFIG.get("ADX_PERIOD", 14))
+            adx_value = df['adx'].iloc[-2]
+            if not pd.isna(adx_value) and adx_value > CONFIG.get("ADX_THRESHOLD", 25.0):
+                reason = "ADX > threshold (trending market)"
+                details = {'adx': f"{adx_value:.2f}", 'threshold': CONFIG.get("ADX_THRESHOLD", 25.0)}
+                _record_rejection(symbol, reason, details)
+                return
+
+        # --- Fast Move Filter ---
+        if CONFIG.get("FAST_MOVE_FILTER_ENABLED", False):
+            # 1. Candle Size Filter
+            candle_size = signal_candle['high'] - signal_candle['low']
+            atr_threshold = signal_candle['atr'] * CONFIG.get("FAST_MOVE_ATR_MULT", 2.0)
+            if candle_size > atr_threshold:
+                reason = "Candle size > ATR threshold"
+                details = {'candle_size': f"{candle_size:.4f}", 'atr_threshold': f"{atr_threshold:.4f}"}
+                _record_rejection(symbol, reason, details)
+                return
+
+            # 2. Volume Spike Filter
+            df['avg_volume'] = df['volume'].rolling(window=CONFIG["BB_LENGTH_CUSTOM"]).mean()
+            signal_candle_avg_vol = df['avg_volume'].iloc[-2]
+            if signal_candle_avg_vol > 0: # Avoid division by zero if avg vol is 0
+                vol_threshold = signal_candle_avg_vol * CONFIG.get("FAST_MOVE_VOL_MULT", 2.0)
+                if signal_candle['volume'] > vol_threshold:
+                    reason = "Volume spike detected"
+                    details = {'volume': f"{signal_candle['volume']:.2f}", 'avg_volume': f"{signal_candle_avg_vol:.2f}"}
+                    _record_rejection(symbol, reason, details)
+                    return
+            
+            # 3. 1-Minute Return Filter
+            try:
+                df_1m = await asyncio.to_thread(fetch_klines_sync, symbol, '1m', limit=2)
+                if len(df_1m) >= 2:
+                    last_close = df_1m['close'].iloc[-1]
+                    prev_close = df_1m['close'].iloc[-2]
+                    if prev_close > 0: # Avoid division by zero
+                        one_min_return = abs((last_close / prev_close) - 1)
+                        return_threshold = CONFIG.get("FAST_MOVE_RETURN_PCT", 0.005)
+                        if one_min_return > return_threshold:
+                            reason = "1-minute return > threshold"
+                            details = {'1m_return_pct': f"{one_min_return:.4%}", 'threshold_pct': f"{return_threshold:.4%}"}
+                            _record_rejection(symbol, reason, details)
+                            return
+            except Exception as e:
+                log.warning(f"Could not perform 1-minute return check for {symbol}: {e}")
 
         # 2. Check for entry signal based on Bollinger Bands
         side = None
