@@ -1143,7 +1143,8 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float):
         params['positionSide'] = position_side
 
     try:
-        log.info(f"Placing limit order for {symbol}: {params}")
+        # Enhanced logging for debugging price formatting issues
+        log.info(f"Attempting to place limit order with params: {params}")
         order_response = client.futures_create_order(**params)
         log.info(f"Limit order placement successful for {symbol}. Response: {order_response}")
         return order_response
