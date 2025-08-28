@@ -87,6 +87,7 @@ CONFIG = {
     # --- ORDER MANAGEMENT ---
     "USE_LIMIT_ENTRY": os.getenv("USE_LIMIT_ENTRY", "true").lower() in ("true", "1", "yes"),
     "ORDER_ENTRY_TIMEOUT": int(os.getenv("ORDER_ENTRY_TIMEOUT", "1")), # 1 candle timeout for limit orders
+    "ORDER_EXPIRY_CANDLES": int(os.getenv("ORDER_EXPIRY_CANDLES", "2")), # How many candles a limit order is valid for
     "ORDER_LIMIT_OFFSET_PCT": float(os.getenv("ORDER_LIMIT_OFFSET_PCT", "0.005")),
     "SL_BUFFER_PCT": float(os.getenv("SL_BUFFER_PCT", "0.02")),
     "LOSS_COOLDOWN_HOURS": int(os.getenv("LOSS_COOLDOWN_HOURS", "6")),
@@ -1851,11 +1852,12 @@ async def evaluate_and_enter(symbol: str):
             order_id = str(limit_order_resp.get('orderId'))
             pending_order_id = f"{symbol}_{order_id}"
 
-            # Calculate expiry time for the end of the current candle
+            # Calculate expiry time based on the number of candles configured
             candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
-            # The last index in df is the close time of the most recently completed candle,
-            # which is the open time of the current candle.
-            expiry_time = df.index[-1] + candle_duration
+            expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+            # df.index[-1] is the close time of the current (incomplete) candle.
+            # We subtract 1 from expiry_candles because the first candle's duration is already included.
+            expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
 
             # Store all necessary info for when the order is filled
             pending_meta = {
