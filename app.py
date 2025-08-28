@@ -1089,17 +1089,24 @@ def round_price(symbol: str, price: float) -> str:
     try:
         info = get_exchange_info_sync()
         if not info or not isinstance(info, dict):
-            return f"{price:.8f}" # Fallback
+            return f"{price:.8f}"  # Fallback
         symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
         if not symbol_info:
-            return f"{price:.8f}" # Fallback
+            return f"{price:.8f}"  # Fallback
         for f in symbol_info.get('filters', []):
             if f.get('filterType') == 'PRICE_FILTER':
-                tick_size = Decimal(str(f.get('tickSize', '0.00000001')))
+                tick_size_str = f.get('tickSize', '0.00000001')
+                tick_size = Decimal(tick_size_str)
+                
+                # Determine the number of decimal places from the tick_size
+                decimal_places = abs(tick_size.as_tuple().exponent)
+
                 getcontext().prec = 28
                 p = Decimal(str(price))
                 rounded_price = p.quantize(tick_size, rounding=ROUND_DOWN)
-                return f"{rounded_price}"
+                
+                # Format with the correct number of decimal places to preserve trailing zeros
+                return f"{rounded_price:.{decimal_places}f}"
     except Exception:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
@@ -1653,21 +1660,22 @@ async def evaluate_and_enter(symbol: str):
 
     try:
         # 1. Fetch klines and calculate indicators
-        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
+        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 201) # Fetch 201 to have 200 for indicators and one last closed candle
         df['BBU'], df['BBL'] = bollinger_bands(df['close'], CONFIG["BB_LENGTH_CUSTOM"], CONFIG["BB_STD_CUSTOM"])
         df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
         
-        last = df.iloc[-1]
+        # Use the most recently closed candle for the signal, not the current open one.
+        signal_candle = df.iloc[-2]
 
         # 2. Check for entry signal based on Bollinger Bands
         side = None
-        if last['close'] <= last['BBL']:
+        if signal_candle['close'] <= signal_candle['BBL']:
             side = 'BUY'
-        elif last['close'] >= last['BBU']:
+        elif signal_candle['close'] >= signal_candle['BBU']:
             side = 'SELL'
         
         if not side:
-            _record_rejection(symbol, "No BB entry signal", {'price': f"{last['close']:.4f}", 'BBU': f"{last['BBU']:.4f}", 'BBL': f"{last['BBL']:.4f}"})
+            _record_rejection(symbol, "No BB entry signal", {'price': f"{signal_candle['close']:.4f}", 'BBU': f"{signal_candle['BBU']:.4f}", 'BBL': f"{signal_candle['BBL']:.4f}"})
             return
 
         # 3. Pre-trade checks
@@ -1682,15 +1690,15 @@ async def evaluate_and_enter(symbol: str):
                 _record_rejection(symbol, "Max concurrent trades reached", {'open_trades': len(managed_trades), 'pending_orders': len(pending_limit_orders)})
                 return
 
-        # 4. Calculate Limit Price
+        # 4. Calculate Limit Price using the close of the signal candle
         offset = CONFIG["ORDER_LIMIT_OFFSET_PCT"]
         if side == 'BUY':
-            limit_price = last['close'] * (1 - offset)
+            limit_price = signal_candle['close'] * (1 - offset)
         else: # SELL
-            limit_price = last['close'] * (1 + offset)
+            limit_price = signal_candle['close'] * (1 + offset)
 
         # 5. Calculate SL and TP
-        atr_now = last['atr']
+        atr_now = signal_candle['atr']
         if atr_now <= 0:
             _record_rejection(symbol, "Invalid ATR value", {'atr': atr_now})
             return
