@@ -2134,6 +2134,7 @@ def monitor_thread_func():
                         log.info(f"Symbol {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown due to a losing trade (PnL: {unreal:.4f}).")
                         send_telegram(f"🧊 Symbol {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
 
+                    log.info(f"TRADE_CLOSE_EVENT: ID={tid}, Symbol={sym}, PnL={unreal:.4f}, Reason={exit_reason}. Preparing to record and remove from managed trades.")
                     record_trade({
                         'id': meta['id'], 'symbol': meta['symbol'], 'side': meta['side'],
                         'entry_price': meta['entry_price'], 'exit_price': float(pos.get('entryPrice') or 0.0),
@@ -2279,9 +2280,16 @@ def monitor_thread_func():
                     log_and_send_error(f"Failed to process in-trade management logic for {tid}", e)
 
             if to_remove:
+                log.info(f"Preparing to remove {len(to_remove)} closed trade(s) from managed state: {to_remove}")
                 with managed_trades_lock:
+                    log.info(f"State before removal: {len(managed_trades)} trades. Keys: {list(managed_trades.keys())}")
                     for tid in to_remove:
-                        managed_trades.pop(tid, None)
+                        removed_trade = managed_trades.pop(tid, None)
+                        if removed_trade:
+                            log.info(f"Successfully removed trade {tid} from in-memory state.")
+                        else:
+                            log.warning(f"Attempted to remove trade {tid} from state, but it was not found.")
+                    log.info(f"State after removal: {len(managed_trades)} trades. Keys: {list(managed_trades.keys())}")
 
             # --- Overload Monitoring ---
             loop_end_time = time.time()
@@ -2348,6 +2356,10 @@ def daily_pnl_monitor_thread_func():
             result = cur.fetchone()[0]
             conn.close()
             daily_pnl = result if result is not None else 0.0
+            
+            if daily_pnl != current_daily_pnl:
+                log.info(f"DAILY_PNL_UPDATE: Old PnL: {current_daily_pnl:.4f}, New PnL from DB: {daily_pnl:.4f}")
+
             current_daily_pnl = daily_pnl
 
             # Loss Limit Check
@@ -2441,42 +2453,41 @@ def monthly_maintenance_thread_func():
 
 async def manage_session_freeze_state():
     """
-    Checks session freeze status and sends notifications on state changes.
-    Returns True if the bot should be frozen, False otherwise.
-    Manual override is possible via `session_freeze_override` global.
+    Checks session freeze status, sends notifications, and returns the effective freeze state.
+    Returns True if the bot's trading logic should be frozen, False otherwise.
     """
-    global session_freeze_active, notified_frozen_session, session_freeze_override
+    global frozen, session_freeze_override, session_freeze_active, notified_frozen_session
 
-    # Check for manual override first
-    if session_freeze_override:
-        # If a session freeze was active, ensure it's cleared so it doesn't pop up again
-        if session_freeze_active:
-            session_freeze_active = False
-            notified_frozen_session = None # Clear this to prevent the "ended" message
-            log.info("Session freeze is currently overridden by user command.")
-        return False # Report "not frozen" because of the override
+    is_naturally_frozen, session_name = get_session_freeze_status(datetime.now(timezone.utc))
 
-    now_utc = datetime.now(timezone.utc)
-    is_frozen, session_name = get_session_freeze_status(now_utc)
+    # Determine the effective freeze status for the bot's trading logic.
+    # The bot is frozen if it's manually frozen OR if it's in a natural session freeze that has NOT been overridden.
+    is_effectively_frozen = frozen or (is_naturally_frozen and not session_freeze_override)
 
-    if is_frozen:
-        # If we are entering a NEW freeze window
-        if not session_freeze_active or notified_frozen_session != session_name:
-            log.info(f"Entering freeze period for {session_name} session. Bot will not open new trades.")
-            # When a new natural freeze starts, any previous override is reset.
-            session_freeze_override = False
-            await asyncio.to_thread(send_telegram, f"⚠️ Session Change: {session_name}\\nThe bot is now frozen for 2 hours and will not open new trades. Existing trades are still monitored.")
+    # --- Handle notifications and state changes for natural session freezes ---
+    if is_naturally_frozen:
+        if not session_freeze_active:  # A new natural freeze period has just begun
+            log.info(f"Entering session freeze for {session_name}.")
+            # A new natural freeze always resets any previous user override.
+            if session_freeze_override:
+                log.info("Resetting user override because a new session freeze has started.")
+                session_freeze_override = False
+            
+            await asyncio.to_thread(send_telegram, f"⚠️ Session Change: {session_name}\\nThe bot is now frozen for this session. Use /unfreeze to override.")
             session_freeze_active = True
             notified_frozen_session = session_name
-        return True # Is frozen
-    else:
-        # If we are exiting a freeze window
-        if session_freeze_active:
-            log.info("Exiting session freeze period. Bot is now active for new trades.")
+    
+    else:  # Not in a natural freeze window
+        if session_freeze_active:  # A natural freeze period has just ended
+            log.info("Exiting session freeze period.")
             await asyncio.to_thread(send_telegram, f"✅ Session freeze for {notified_frozen_session} has ended. The bot is now active again.")
             session_freeze_active = False
             notified_frozen_session = None
-        return False # Is not frozen
+            # Also reset the override flag when a session naturally ends, so it doesn't carry over.
+            if session_freeze_override:
+                session_freeze_override = False
+
+    return is_effectively_frozen
 
 
 async def scanning_loop():
@@ -2881,11 +2892,22 @@ def handle_update_sync(update, loop):
                 # Bot Status section
                 status_lines = [f"▶️ Running: *{running}*"]
                 status_lines.append(f"✋ Manual Freeze: *{frozen}*")
-                session_status_text = f"⏰ Session Freeze: *{session_freeze_active}*"
-                if session_freeze_active:
-                    session_status_text += f" ({notified_frozen_session})"
+                
+                # Build a more descriptive session freeze status
+                is_natural_freeze, session_name = get_session_freeze_status(datetime.now(timezone.utc))
+                effective_freeze = frozen or (is_natural_freeze and not session_freeze_override)
+                
+                session_status_text = f"❄️ Effective Freeze: *{effective_freeze}*"
+                details = []
+                if frozen:
+                    details.append("Manual")
+                if is_natural_freeze:
+                    details.append(f"Session: {session_name}")
                 if session_freeze_override:
-                    session_status_text += " (Overridden)"
+                    details.append("Overridden")
+                if details:
+                    session_status_text += f" ({'; '.join(details)})"
+                
                 status_lines.append(session_status_text)
                 status_lines.append(f"📈 Managed Trades: *{len(trades)}*")
 
