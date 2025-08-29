@@ -30,6 +30,8 @@ from collections import deque
 from decimal import Decimal, ROUND_DOWN, getcontext
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -1257,10 +1259,24 @@ def init_binance_client_sync():
         return False, "Missing BINANCE_API_KEY or BINANCE_API_SECRET"
 
     try:
-        # Set a longer timeout for all requests to Binance
-        requests_params = {"timeout": 60}
+        # --- Configure robust session with retries ---
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
+            raise_on_status=False # Let the library handle the error after retries
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        requests_params = {"timeout": 60, "session": session}
+        
         client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=requests_params)
-        log.info("Binance client in MAINNET mode (forced).")
+        log.info("Binance client in MAINNET mode (forced) with retry logic.")
+        
         try:
             client.ping()
             log.info("Connected to Binance API (ping ok).")
