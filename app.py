@@ -2773,28 +2773,41 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
     leverage = max(1, min(leverage, max_leverage))
 
     # 6. Place Orders
+    # Wrap the entire trade execution in a single block to catch any failure
+    # and prevent the bot from getting stuck in a bad state.
     try:
-        log.info(f"S4: Placing MARKET {side} order for {qty} {symbol} at ~{current_price}")
-        await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
-        
-        time.sleep(2) # Allow position to register on the exchange
-        positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
-        position_side = 'LONG' if side == 'BUY' else 'SHORT'
-        pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
-        
-        if not pos:
-             raise RuntimeError(f"Position for {symbol} not found after S4 market order.")
+        # Step 1: Place Market Order
+        try:
+            log.info(f"S4: Placing MARKET {side} order for {qty} {symbol} at ~{current_price}")
+            await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
+        except Exception as e:
+            raise RuntimeError(f"S4_FAIL_STEP_1_MARKET_ORDER: {e}")
+
+        # Step 2: Fetch Position Info
+        pos = None
+        try:
+            time.sleep(2) # Allow position to register on the exchange
+            positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+            if not pos:
+                raise RuntimeError(f"Position for {symbol} not found after S4 market order.")
+        except Exception as e:
+            raise RuntimeError(f"S4_FAIL_STEP_2_FETCH_POS: {e}")
         
         actual_entry_price = float(pos['entryPrice'])
         actual_qty = abs(float(pos['positionAmt']))
         
-        # Place the 2% hard stop loss
-        sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
-        
-        log.info(f"S4: Placing initial hard SL for {symbol} at {sl_price}")
-        sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
-        
-        # 7. Create and store managed trade metadata
+        # Step 3: Place Hard Stop-Loss
+        sltp_orders = {}
+        try:
+            sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
+            log.info(f"S4: Placing initial hard SL for {symbol} at {sl_price}")
+            sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
+        except Exception as e:
+            raise RuntimeError(f"S4_FAIL_STEP_3_PLACE_SL: {e}")
+
+        # Step 4: Create and store managed trade metadata
         trade_id = f"{symbol}_S4_{int(time.time())}"
         meta = {
             "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
@@ -2807,16 +2820,28 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
             "s4_last_candle_ts": signal_candle.name.isoformat(), # Timestamp of the signal candle
         }
 
-        async with managed_trades_lock:
-            managed_trades[trade_id] = meta
-        
-        await asyncio.to_thread(add_managed_trade_to_db, meta)
-        if firebase_db:
-             await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+        # Step 5: Save to local state and SQLite DB
+        try:
+            async with managed_trades_lock:
+                managed_trades[trade_id] = meta
+            await asyncio.to_thread(add_managed_trade_to_db, meta)
+        except Exception as e:
+            raise RuntimeError(f"S4_FAIL_STEP_5_LOCAL_SAVE: {e}")
 
+        # Step 6: Save to Firebase
+        if firebase_db:
+            try:
+                log.info(f"S4: Attempting to save trade {trade_id} to Firebase.")
+                await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+                log.info(f"S4: Successfully saved trade {trade_id} to Firebase.")
+            except Exception as e:
+                raise RuntimeError(f"S4_FAIL_STEP_6_FIREBASE_SAVE: {e}")
+
+        # Step 7: Send Telegram Notification
         await asyncio.to_thread(send_telegram, f"✅ New S4 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Hard SL: {sl_price:.4f}, Initial Trail: {initial_trail_stop:.4f}")
 
     except Exception as e:
+        # The new error messages from the inner blocks will be caught here
         await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
 
 
