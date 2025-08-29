@@ -4206,7 +4206,10 @@ def handle_update_sync(update, loop):
                 
                 unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
                 
-                # PnL Info section
+                # Account & PnL Info
+                balance = get_account_balance_usdt()
+                balance_str = f"{balance:.2f} USDT" if balance > 0 else "N/A (API Error?)"
+                
                 pnl_info = (
                     f"Today's Realized PnL: {current_daily_pnl:.2f} USDT\n"
                     f"Current Unrealized PnL: {unrealized_pnl:.2f} USDT"
@@ -4240,7 +4243,9 @@ def handle_update_sync(update, loop):
                 txt = (
                     f"📊 *Bot Status*\n\n"
                     f"{'\n'.join(status_lines)}\n\n"
-                    f"💰 *PnL Info*\n{pnl_info}"
+                    f"💰 *Account Info*\n"
+                    f"Available Balance: *{balance_str}*\n\n"
+                    f"📈 *Trade PnL Info*\n{pnl_info}"
                 )
                 send_telegram(txt, parse_mode='Markdown')
                 try:
