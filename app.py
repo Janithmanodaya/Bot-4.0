@@ -1314,24 +1314,21 @@ def init_binance_client_sync():
         return False, "Missing BINANCE_API_KEY or BINANCE_API_SECRET"
 
     try:
-        # --- Configure robust session with retries ---
-        session = requests.Session()
+        requests_params = {"timeout": 60}
+        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=requests_params)
+
+        # --- Configure robust session with retries on the client's existing session ---
+        session = client.session
         retry_strategy = Retry(
-            total=3,
+            total=5,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"],
-            raise_on_status=False # Let the library handle the error after retries
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "DELETE"],
+            raise_on_status=False
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        
-        requests_params = {"timeout": 60}
-        
-        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, requests_params=requests_params)
-        # Overwrite the client's default session with our custom one that has retry logic
-        client.session = session
         log.info("Binance client in MAINNET mode (forced) with retry logic.")
         
         try:
