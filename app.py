@@ -81,7 +81,7 @@ firebase_db = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": int(os.getenv("STRATEGY_MODE", "0")),  # 0=both, 1=original BB, 2=new SuperTrend
+    "STRATEGY_MODE": int(os.getenv("STRATEGY_MODE", "0")),  # 0=all, 1=BB, 2=SuperTrend, 3=AdvSuperTrend
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -108,6 +108,19 @@ CONFIG = {
         "HIGH_VOL_CONF_THRESHOLD": float(os.getenv("S2_HIGH_VOL_THRESH", "0.01")),
         "HIGH_VOL_CONF_ADJUSTMENT": float(os.getenv("S2_HIGH_VOL_ADJUST", "5.0")),
     },
+    "STRATEGY_3": { # Advanced SuperTrend strategy
+        "SUPERTREND_ATR_PERIOD": int(os.getenv("S3_ST_ATR_PERIOD", "20")),
+        "SUPERTREND_MULTIPLIER": float(os.getenv("S3_ST_MULTIPLIER", "2.5")),
+        "TRAILING_ATR_PERIOD": int(os.getenv("S3_TRAIL_ATR_PERIOD", "2")),
+        "TRAILING_HHV_PERIOD": int(os.getenv("S3_TRAIL_HHV_PERIOD", "10")),
+        "TRAILING_ATR_MULTIPLIER": float(os.getenv("S3_TRAIL_ATR_MULT", "3.0")),
+        "INITIAL_STOP_PCT": float(os.getenv("S3_INITIAL_STOP_PCT", "0.03")),
+        "TRAILING_ACTIVATION_PROFIT_PCT": float(os.getenv("S3_TRAIL_ACT_PROFIT_PCT", "0.01")),
+        "VOLATILITY_MAX_ATR20_PCT": float(os.getenv("S3_VOL_MAX_ATR20_PCT", "3.0")),
+        "VOLATILITY_MAX_ATR2_PCT": float(os.getenv("S3_VOL_MAX_ATR2_PCT", "3.0")),
+        "MAX_LOSS_USD_SMALL_BALANCE": float(os.getenv("S3_MAX_LOSS_SMALL", "0.50")),
+        "MAX_LOSS_USD_LARGE_BALANCE": float(os.getenv("S3_MAX_LOSS_LARGE", "1.00")),
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -118,6 +131,11 @@ CONFIG = {
             "ATR_MULTIPLIER": float(os.getenv("S2_ATR_MULTIPLIER", "2.0")),
             "BE_TRIGGER": float(os.getenv("S2_BE_TRIGGER", "0.006")),
             "BE_SL_OFFSET": float(os.getenv("S2_BE_SL_OFFSET", "0.001"))
+        },
+        "3": {  # Advanced SuperTrend strategy (custom trailing logic)
+            "ATR_MULTIPLIER": float(os.getenv("S3_TRAIL_ATR_MULT", "3.0")), # Value from S3 config
+            "BE_TRIGGER": 0.0, # Not used in S3
+            "BE_SL_OFFSET": 0.0 # Not used in S3
         }
     },
 
@@ -1011,6 +1029,13 @@ def init_db():
     try:
         cur.execute("ALTER TABLE managed_trades ADD COLUMN atr_at_entry REAL")
     except sqlite3.OperationalError: pass
+    # --- New columns for Strategy 3 ---
+    try:
+        cur.execute("ALTER TABLE managed_trades ADD COLUMN s3_trailing_active INTEGER")
+    except sqlite3.OperationalError: pass
+    try:
+        cur.execute("ALTER TABLE managed_trades ADD COLUMN s3_trailing_stop REAL")
+    except sqlite3.OperationalError: pass
 
     conn.commit()
     conn.close()
@@ -1049,14 +1074,18 @@ def add_managed_trade_to_db(rec: Dict[str, Any]):
         rec.get('tp1'), rec.get('tp2'), rec.get('tp3'),
         rec.get('trade_phase', 0), int(rec.get('be_moved', False)),
         rec.get('risk_usdt'), rec.get('strategy_id', 1),
-        rec.get('atr_at_entry')
+        rec.get('atr_at_entry'),
+        # S3 specific fields
+        int(rec.get('s3_trailing_active', False)),
+        rec.get('s3_trailing_stop')
     )
     cur.execute("""
     INSERT OR REPLACE INTO managed_trades (
         id, symbol, side, entry_price, initial_qty, qty, notional,
         leverage, sl, tp, open_time, sltp_orders, trailing, dyn_sltp,
-        tp1, tp2, tp3, trade_phase, be_moved, risk_usdt, strategy_id, atr_at_entry
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        tp1, tp2, tp3, trade_phase, be_moved, risk_usdt, strategy_id, atr_at_entry,
+        s3_trailing_active, s3_trailing_stop
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, values)
     conn.commit()
     conn.close()
@@ -1110,6 +1139,7 @@ def load_managed_trades_from_db() -> Dict[str, Dict[str, Any]]:
         rec['trailing'] = bool(rec.get('trailing'))
         rec['dyn_sltp'] = bool(rec.get('dyn_sltp'))
         rec['be_moved'] = bool(rec.get('be_moved'))
+        rec['s3_trailing_active'] = bool(rec.get('s3_trailing_active'))
         trades[rec['id']] = rec
     return trades
 
@@ -1123,6 +1153,25 @@ def atr(df: pd.DataFrame, length: int) -> pd.Series:
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=1).mean()
+
+def atr_wilder(df: pd.DataFrame, length: int) -> pd.Series:
+    """Calculates the Average True Range (ATR) using Wilder's smoothing."""
+    high = df['high']; low = df['low']; close = df['close']
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    # Wilder's smoothing is an EMA with alpha = 1/length
+    return tr.ewm(alpha=1/length, adjust=False).mean()
+
+def hhv(series: pd.Series, length: int) -> pd.Series:
+    """Calculates the Highest High Value over a given period."""
+    return series.rolling(window=length).max()
+
+def llv(series: pd.Series, length: int) -> pd.Series:
+    """Calculates the Lowest Low Value over a given period."""
+    return series.rolling(window=length).min()
+
 
 # --- New Strategy Indicators ---
 
@@ -1186,17 +1235,23 @@ def adx(df: pd.DataFrame, period: int = 14):
     df['adx'] = dx.ewm(alpha=alpha, adjust=False).mean()
 
 
-def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_series: Optional[pd.Series] = None):
     """
     Calculates the SuperTrend indicator and adds 'supertrend' and 
     'supertrend_direction' columns to the DataFrame.
+    Can accept a pre-calculated ATR series.
     """
     high = df['high']
     low = df['low']
     close = df['close']
     
     # ATR
-    df['atr_st'] = atr(df, period)
+    if atr_series is not None:
+        # Use the provided ATR series
+        df['atr_st'] = atr_series
+    else:
+        # Calculate ATR internally for backward compatibility
+        df['atr_st'] = atr(df, period)
 
     # Basic upper and lower bands
     hl2 = (high + low) / 2
@@ -2011,62 +2066,76 @@ def calculate_signal_confidence(signal_candle, side: str) -> tuple[float, dict]:
 
 def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     """
-    Determine which strategy to use for this symbol based on market conditions,
-    including hard-stop filters. Returns None if no strategy is suitable.
+    Determine which strategy to use for this symbol based on market conditions.
+    Returns the strategy ID (1, 2, or 3) or None if no strategy is suitable.
     """
     last = df.iloc[-1]
     
     # --- Data validation ---
-    if pd.isna(last.get('atr')) or last.get('atr') == 0 or pd.isna(last.get('close')) or last.get('close') == 0 or pd.isna(last.get('adx')):
+    required_cols = ['atr', 'adx', 'atr20', 'close']
+    if any(pd.isna(last.get(col)) or (last.get(col) == 0 and col=='close') for col in required_cols):
         log.warning(f"Could not determine strategy for {symbol} due to missing indicator data. Skipping.")
         return None
 
-    # --- Hard-Stop Filters ---
+    # --- Pre-condition Filters for each strategy ---
     s1_params = CONFIG['STRATEGY_1']
     s2_params = CONFIG['STRATEGY_2']
+    s3_params = CONFIG['STRATEGY_3']
     
-    volatility_ratio = last['atr'] / last['close']
-    adx_value = last['adx']
+    # S1 uses standard ATR for volatility
+    volatility_ratio_s1 = last['atr'] / last['close']
+    s1_allowed = volatility_ratio_s1 <= s1_params.get('MAX_VOLATILITY_FOR_ENTRY', 0.03)
 
-    s1_allowed = volatility_ratio <= s1_params.get('MAX_VOLATILITY_FOR_ENTRY', 0.03)
+    # S2 uses ADX
+    adx_value = last['adx']
     s2_allowed = adx_value >= s2_params.get('MIN_ADX_FOR_ENTRY', 15)
 
-    log.info(f"Strategy selection for {symbol}: Volatility={volatility_ratio:.4f} (S1 allowed: {s1_allowed}), ADX={adx_value:.2f} (S2 allowed: {s2_allowed})")
+    # S3 uses ATR(20) for volatility
+    atr20_pct = (last['atr20'] / last['close']) * 100
+    s3_allowed = atr20_pct <= s3_params.get('VOLATILITY_MAX_ATR20_PCT', 3.0)
+
+    log.info(f"Strategy selection checks for {symbol}: S1_allowed={s1_allowed}, S2_allowed={s2_allowed}, S3_allowed={s3_allowed}")
 
     # --- Mode-based selection ---
     mode = CONFIG["STRATEGY_MODE"]
     
-    # Mode 1: Only BB allowed
     if mode == 1:
         return 1 if s1_allowed else None
     
-    # Mode 2: Only SuperTrend allowed
     if mode == 2:
         return 2 if s2_allowed else None
 
-    # Mode 0: Both strategies are candidates
+    if mode == 3:
+        return 3 if s3_allowed else None
+
+    # Mode 0: Auto-select from all available strategies
     if mode == 0:
-        # If both are filtered out, no trade
+        # Prioritize S3 as it's the most advanced
+        if s3_allowed:
+            log.info(f"Auto-selecting Strategy 3 for {symbol}.")
+            return 3
+        
+        # Fallback to S1/S2 logic
         if not s1_allowed and not s2_allowed:
-            log.info(f"Both strategies for {symbol} were filtered out by market conditions.")
+            log.info(f"All strategies for {symbol} were filtered out by market conditions.")
             return None
-        # If only one is allowed, pick it
         if s1_allowed and not s2_allowed:
-            log.info(f"S2 filtered out, selecting S1 for {symbol}.")
+            log.info(f"Auto-selecting Strategy 1 for {symbol}.")
             return 1
         if not s1_allowed and s2_allowed:
-            log.info(f"S1 filtered out, selecting S2 for {symbol}.")
+            log.info(f"Auto-selecting Strategy 2 for {symbol}.")
             return 2
         
-        # If both are allowed, use the original volatility logic to decide
-        if volatility_ratio > 0.015: # High volatility -> prefer SuperTrend
+        # If both S1 and S2 are allowed, use original volatility logic
+        if volatility_ratio_s1 > 0.015:
             log.info(f"High volatility detected for {symbol}, selecting SuperTrend strategy (2).")
             return 2
-        else: # Low/Medium volatility -> prefer BB
+        else:
             log.info(f"Low/Medium volatility detected for {symbol}, selecting BB strategy (1).")
             return 1
 
-    # Fallback, should not be reached
+    # Fallback, should not be reached if mode is valid
+    log.warning(f"Invalid STRATEGY_MODE: {mode}. No strategy selected.")
     return None
 
 async def evaluate_and_enter(symbol: str):
@@ -2082,21 +2151,24 @@ async def evaluate_and_enter(symbol: str):
 
     try:
         # --- Pre-computation and Strategy Selection ---
-        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 201)
+        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300) # Fetch more data for indicators
         
-        # Calculate ATR, which is needed for volatility check in strategy selection
+        # --- Calculate all indicators needed for strategy selection ---
+        # S1/S2 use standard ATR
         df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
-
-        # Calculate ADX, needed for strategy selection filters
+        # S2 uses ADX
         adx(df, period=CONFIG['ADX_PERIOD'])
-
+        # S3 selection logic uses Wilder's ATR(20)
+        df['atr20'] = atr_wilder(df, length=CONFIG['STRATEGY_3']['SUPERTREND_ATR_PERIOD'])
+        
         # Decide which strategy to use
         strategy_id = select_strategy(df, symbol)
 
         if strategy_id is None:
+            # This is a normal outcome if no strategy's conditions are met
             log.info(f"No suitable strategy found for {symbol} at this time.")
-            _record_rejection(symbol, "No suitable strategy", {})
-            return # Exit gracefully
+            # _record_rejection(symbol, "No suitable strategy", {}) # Avoid spamming rejects log
+            return
 
         # --- Strategy-Specific Cooldown Check ---
         if symbol in symbol_loss_cooldown and strategy_id in symbol_loss_cooldown[symbol]:
@@ -2113,11 +2185,14 @@ async def evaluate_and_enter(symbol: str):
 
         # --- Dispatch to selected strategy ---
         if strategy_id == 1:
-            log.info(f"Dispatching to Bollinger Band Strategy for {symbol}")
+            log.info(f"Dispatching to Bollinger Band Strategy (S1) for {symbol}")
             await evaluate_strategy_bb(symbol, df)
         elif strategy_id == 2:
-            log.info(f"Dispatching to SuperTrend Strategy for {symbol}")
+            log.info(f"Dispatching to SuperTrend Strategy (S2) for {symbol}")
             await evaluate_strategy_supertrend(symbol, df)
+        elif strategy_id == 3:
+            log.info(f"Dispatching to Advanced SuperTrend Strategy (S3) for {symbol}")
+            await evaluate_strategy_3(symbol, df)
         else:
             log.info(f"No strategy selected for {symbol} (mode: {CONFIG['STRATEGY_MODE']}, id: {strategy_id}). Skipping.")
 
@@ -2417,6 +2492,159 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
 
     log.info(f"Placed pending limit order (S2-SuperTrend): {pending_meta}")
     await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S2-ST) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}, Conf: {confidence:.1f}%")
+
+
+async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
+    """
+    Evaluates and executes trades based on the Advanced SuperTrend strategy (S3).
+    """
+    global managed_trades
+    s3_params = CONFIG['STRATEGY_3']
+
+    # 1. Pre-trade checks (is a trade already open?)
+    async with managed_trades_lock:
+        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+            # S3 uses market orders, so no pending order check is needed here.
+            # _record_rejection(symbol, "S3-Trade exists and hedging is disabled", {})
+            return
+
+    # 2. Calculate Indicators
+    required_len = s3_params['SUPERTREND_ATR_PERIOD'] + s3_params['TRAILING_HHV_PERIOD']
+    if len(df) < required_len:
+        log.warning(f"Not enough data for S3 on {symbol}, need {required_len} have {len(df)}")
+        return
+
+    df['atr20'] = atr_wilder(df, length=s3_params['SUPERTREND_ATR_PERIOD'])
+    df['atr2'] = atr_wilder(df, length=s3_params['TRAILING_ATR_PERIOD'])
+    
+    supertrend(df, period=s3_params['SUPERTREND_ATR_PERIOD'], 
+               multiplier=s3_params['SUPERTREND_MULTIPLIER'], 
+               atr_series=df['atr20'])
+    
+    df['hhv10'] = hhv(df['high'], length=s3_params['TRAILING_HHV_PERIOD'])
+    df['llv10'] = llv(df['low'], length=s3_params['TRAILING_HHV_PERIOD'])
+
+    # 3. Check for Signal (on the previously closed candle)
+    if len(df) < 3: return
+    
+    prev_candle = df.iloc[-3]
+    signal_candle = df.iloc[-2]
+    
+    side = None
+    if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
+        side = 'BUY'
+    elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
+        side = 'SELL'
+        
+    if not side:
+        return # No signal
+
+    # 4. Pre-entry Filters
+    # Volatility Filter (ATR20 for signal quality)
+    atr20_pct = (signal_candle['atr20'] / signal_candle['close']) * 100
+    if atr20_pct > s3_params['VOLATILITY_MAX_ATR20_PCT']:
+        _record_rejection(symbol, "S3-Pre-entry ATR(20) volatility too high", {'atr20_pct': atr20_pct})
+        return
+        
+    # Volatility Filter (ATR2 for entry risk)
+    atr2_pct = (signal_candle['atr2'] / signal_candle['close']) * 100
+    if atr2_pct > s3_params['VOLATILITY_MAX_ATR2_PCT']:
+        _record_rejection(symbol, "S3-Pre-entry ATR(2) volatility too high", {'atr2_pct': atr2_pct})
+        return
+
+    # Alignment Filter
+    trail_distance = s3_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
+    supertrend_band = signal_candle['supertrend']
+    
+    if side == 'BUY':
+        candidate_trail = signal_candle['hhv10'] - trail_distance
+        if candidate_trail >= supertrend_band:
+            _record_rejection(symbol, "S3-Alignment fail (long)", {'trail': candidate_trail, 'st_band': supertrend_band})
+            return
+    else: # SELL
+        candidate_trail = signal_candle['llv10'] + trail_distance
+        if candidate_trail <= supertrend_band:
+            _record_rejection(symbol, "S3-Alignment fail (short)", {'trail': candidate_trail, 'st_band': supertrend_band})
+            return
+            
+    # 5. Passed all checks, prepare to enter trade
+    entry_price = df['open'].iloc[-1]
+    stop_pct = s3_params['INITIAL_STOP_PCT']
+
+    # 6. Calculate Position Size
+    balance = await asyncio.to_thread(get_account_balance_usdt)
+    if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"]:
+        max_loss_usd = s3_params['MAX_LOSS_USD_SMALL_BALANCE']
+    else:
+        max_loss_usd = s3_params['MAX_LOSS_USD_LARGE_BALANCE']
+    
+    price_distance = entry_price * stop_pct
+    if price_distance <= 0:
+        _record_rejection(symbol, "S3-Invalid price distance for sizing", {'dist': price_distance})
+        return
+
+    qty = max_loss_usd / price_distance
+    notional = qty * entry_price
+    
+    if notional < CONFIG["MIN_NOTIONAL_USDT"]:
+        _record_rejection(symbol, "S3-Notional value too small", {'notional': notional, 'min': CONFIG["MIN_NOTIONAL_USDT"]})
+        return
+
+    qty = await asyncio.to_thread(round_qty, symbol, qty)
+    if qty <= 0:
+        _record_rejection(symbol, "S3-Qty rounded to zero", {'original_qty': max_loss_usd / price_distance})
+        return
+        
+    actual_risk_usdt = qty * price_distance
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
+
+    # 7. Place Orders
+    try:
+        log.info(f"S3: Placing MARKET {side} order for {qty} {symbol} at ~{entry_price}")
+        await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
+        
+        time.sleep(2)
+        positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+        pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+        
+        if not pos:
+             raise RuntimeError(f"Position for {symbol} not found after market order placement.")
+        
+        actual_entry_price = float(pos['entryPrice'])
+        actual_qty = abs(float(pos['positionAmt']))
+        
+        sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
+        
+        log.info(f"S3: Placing initial SL for {symbol} at {sl_price}")
+        sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
+        
+        # 8. Create and store managed trade metadata
+        trade_id = f"{symbol}_S3_{int(time.time())}"
+        meta = {
+            "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
+            "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
+            "leverage": leverage, "sl": sl_price, "tp": 0,
+            "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
+            "risk_usdt": actual_risk_usdt, "strategy_id": 3,
+            "atr_at_entry": signal_candle['atr2'],
+            "s3_trailing_active": False, "s3_trailing_stop": sl_price,
+        }
+
+        async with managed_trades_lock:
+            managed_trades[trade_id] = meta
+        
+        await asyncio.to_thread(add_managed_trade_to_db, meta)
+        if firebase_db:
+             await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+
+        await asyncio.to_thread(send_telegram, f"✅ New S3 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Initial SL: {sl_price:.4f}")
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"Failed to execute S3 trade for {symbol}", e)
 
 
 def calculate_trailing_distance(strategy_id: str, volatility_ratio: float, trend_strength: float) -> float:
@@ -2815,6 +3043,91 @@ def monitor_thread_func():
                                         add_managed_trade_to_db(managed_trades[tid])
                                 send_telegram(f"✅ S2-TP2 Hit for {sym}. Closed 30%, SL moved to 1R profit. Trailing activated.")
                                 continue
+                        continue # End of S2 logic
+                    
+                    elif strategy_id == '3':
+                        # --- Advanced SuperTrend (S3) Exit & Management Logic ---
+                        s3_params = CONFIG['STRATEGY_3']
+                        
+                        # Calculate indicators needed for S3 logic
+                        df_monitor['atr2'] = atr_wilder(df_monitor, length=s3_params['TRAILING_ATR_PERIOD'])
+                        df_monitor['atr20'] = atr_wilder(df_monitor, length=s3_params['SUPERTREND_ATR_PERIOD'])
+                        supertrend(df_monitor, period=s3_params['SUPERTREND_ATR_PERIOD'], multiplier=s3_params['SUPERTREND_MULTIPLIER'], atr_series=df_monitor['atr20'])
+                        df_monitor['hhv10'] = hhv(df_monitor['high'], length=s3_params['TRAILING_HHV_PERIOD'])
+                        df_monitor['llv10'] = llv(df_monitor['low'], length=s3_params['TRAILING_HHV_PERIOD'])
+
+                        atr2_now = df_monitor['atr2'].iloc[-1]
+                        
+                        close_trade = False
+                        exit_reason = None
+
+                        # Exit Rule 1: Volatility Closure
+                        atr2_pct = (atr2_now / current_price) * 100 if current_price > 0 else 0
+                        if atr2_pct > s3_params['VOLATILITY_MAX_ATR2_PCT']:
+                            log.warning(f"S3 Volatility Exit for {tid}. ATR% {atr2_pct:.2f} > {s3_params['VOLATILITY_MAX_ATR2_PCT']}%")
+                            close_trade = True
+                            exit_reason = 'VOLATILITY_CLOSE'
+
+                        # Exit Rule 2: SuperTrend Flip
+                        if not close_trade:
+                            st_direction = df_monitor['supertrend_direction'].iloc[-1]
+                            if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
+                                log.info(f"S3 SuperTrend Flip Exit for {tid}.")
+                                close_trade = True
+                                exit_reason = 'SUPERTREND_FLIP'
+                        
+                        if close_trade:
+                            log.info(f"Closing trade {tid} for reason: {exit_reason}")
+                            cancel_trade_sltp_orders_sync(meta)
+                            close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['exit_reason'] = exit_reason
+                            continue
+
+                        # Trailing Stop Management
+                        is_trailing_active = meta.get('s3_trailing_active', False)
+                        
+                        if not is_trailing_active:
+                            profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
+                            if profit_pct >= s3_params['TRAILING_ACTIVATION_PROFIT_PCT']:
+                                log.info(f"S3: Activating trailing stop for {tid} at {profit_pct:.2f}% profit.")
+                                is_trailing_active = True
+                                with managed_trades_lock:
+                                    if tid in managed_trades:
+                                        managed_trades[tid]['s3_trailing_active'] = True
+                                        add_managed_trade_to_db(managed_trades[tid])
+
+                        if is_trailing_active:
+                            trail_dist = s3_params['TRAILING_ATR_MULTIPLIER'] * atr2_now
+                            current_trailing_stop = meta.get('s3_trailing_stop', meta['sl'])
+                            new_sl = None
+
+                            if side == 'BUY':
+                                candidate_trail = df_monitor['hhv10'].iloc[-1] - trail_dist
+                                price_based_trail = current_price - trail_dist
+                                effective_candidate = min(candidate_trail, price_based_trail)
+                                if effective_candidate > current_trailing_stop: new_sl = effective_candidate
+                            else: # SELL
+                                candidate_trail = df_monitor['llv10'].iloc[-1] + trail_dist
+                                price_based_trail = current_price + trail_dist
+                                effective_candidate = max(candidate_trail, price_based_trail)
+                                if effective_candidate < current_trailing_stop: new_sl = effective_candidate
+                            
+                            if new_sl:
+                                log.info(f"S3 Trailing SL for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl:.4f}")
+                                cancel_trade_sltp_orders_sync(meta)
+                                new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                                with managed_trades_lock:
+                                    if tid in managed_trades:
+                                        managed_trades[tid].update({
+                                            'sl': new_sl, 
+                                            'sltp_orders': new_orders, 
+                                            's3_trailing_stop': new_sl
+                                        })
+                                        add_managed_trade_to_db(managed_trades[tid])
+                                send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
+                        continue # End of S3 logic
 
                     # --- Generic BE & Trailing Logic ---
                     # This block handles Strategy 1's BE/Trailing, and Strategy 2's final trailing phase.
