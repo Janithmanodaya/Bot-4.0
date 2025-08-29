@@ -2571,6 +2571,14 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
     if not side:
         return # No signal
 
+    # --- New: Signal Expiry Check ---
+    signal_close_time = signal_candle.name.to_pydatetime()
+    time_since_signal = datetime.now(timezone.utc) - signal_close_time
+    if time_since_signal > timedelta(minutes=3):
+        log.info(f"S3 signal for {symbol} is too old ({time_since_signal}). Skipping.")
+        _record_rejection(symbol, "S3 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
+        return
+
     # 4. Pre-entry Filters
     # Volatility Filter (ATR20 for signal quality)
     atr20_pct = (signal_candle['atr20'] / signal_candle['close']) * 100
@@ -2721,6 +2729,14 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
         
     if not side:
         return # No signal
+
+    # --- New: Signal Expiry Check ---
+    signal_close_time = signal_candle.name.to_pydatetime()
+    time_since_signal = datetime.now(timezone.utc) - signal_close_time
+    if time_since_signal > timedelta(minutes=3):
+        log.info(f"S4 signal for {symbol} is too old ({time_since_signal}). Skipping.")
+        _record_rejection(symbol, "S4 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
+        return
 
     # 4. Pre-entry Alignment Filter (New Rule)
     trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
