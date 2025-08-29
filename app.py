@@ -2167,6 +2167,53 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     log.info(f"Selected Strategy {strategy_id} for {symbol}.")
     return strategy_id
 
+def check_for_liquidity_grab(df: pd.DataFrame, symbol: str) -> bool:
+    """
+    Checks the 3 candles prior to the signal candle for signs of a liquidity grab.
+    A liquidity grab is defined as a large candle (>1% total size) with a
+    body of at least 0.5% and wicks that are at least 2x the size of the body.
+    Returns True if a liquidity grab candle is found, False otherwise.
+    """
+    # Signal candle is at index -2. We check indices -5, -4, -3.
+    if len(df) < 6: # Need at least 5 previous candles + current forming one
+        return False
+
+    # Check the three candles before the signal candle
+    for i in range(-5, -2):
+        candle = df.iloc[i]
+        
+        open_price = candle['open']
+        high_price = candle['high']
+        low_price = candle['low']
+        close_price = candle['close']
+
+        if open_price == 0: continue # Avoid division by zero on bad data
+
+        # New preliminary check based on total candle size
+        total_candle_size_abs = high_price - low_price
+        total_candle_size_pct = (total_candle_size_abs / open_price) * 100
+        
+        if total_candle_size_pct <= 1.0:
+            continue # Not a large candle, so not a liquidity grab. Move to the next one.
+
+        # Original checks, now only run on large candles
+        body_size_abs = abs(open_price - close_price)
+        upper_wick = high_price - max(open_price, close_price)
+        lower_wick = min(open_price, close_price) - low_price
+        total_wick_size = upper_wick + lower_wick
+        body_size_pct = (body_size_abs / open_price) * 100
+
+        is_large_body = body_size_pct >= 0.5
+        is_large_wick = body_size_abs > 0 and (total_wick_size / body_size_abs) >= 2.0
+
+        if is_large_body and is_large_wick:
+            log.info(f"Liquidity grab candle detected for {symbol} at {candle.name}. Total Size: {total_candle_size_pct:.2f}%, Body: {body_size_pct:.2f}%, Wick/Body Ratio: {total_wick_size/body_size_abs if body_size_abs > 0 else 'inf'}. Skipping trade.")
+            _record_rejection(symbol, "Liquidity Grab Detected", {"candle_time": candle.name.isoformat()})
+            return True # Found a liquidity grab candle
+
+    return False # No liquidity grab detected
+
+
 async def evaluate_and_enter(symbol: str):
     """
     Main evaluation function that acts as a dispatcher based on the selected strategy.
@@ -2533,6 +2580,10 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
     global managed_trades
     s3_params = CONFIG['STRATEGY_3']
 
+    # --- New: Liquidity Grab Check ---
+    if check_for_liquidity_grab(df, symbol):
+        return
+
     # 1. Pre-trade checks (is a trade already open?)
     async with managed_trades_lock:
         if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
@@ -2696,6 +2747,10 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
     global managed_trades
     s4_params = CONFIG['STRATEGY_4']
     
+    # --- New: Liquidity Grab Check ---
+    if check_for_liquidity_grab(df, symbol):
+        return
+
     # 1. Pre-trade checks
     async with managed_trades_lock:
         if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
