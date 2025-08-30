@@ -288,6 +288,9 @@ scan_task: Optional[asyncio.Task] = None
 rogue_check_task: Optional[asyncio.Task] = None
 notified_rogue_symbols: set[str] = set()
 
+# Flag for one-time startup sync
+initial_sync_complete: bool = False
+
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
@@ -3809,13 +3812,37 @@ async def manage_session_freeze_state():
 
 
 async def scanning_loop():
+    global initial_sync_complete
     while True:
         try:
+            # --- ONE-TIME INITIAL SYNC ---
+            if not initial_sync_complete:
+                timeframe_str = CONFIG["TIMEFRAME"]
+                timeframe_delta = timeframe_to_timedelta(timeframe_str)
+                if timeframe_delta:
+                    now = datetime.now(timezone.utc)
+                    timeframe_seconds = timeframe_delta.total_seconds()
+                    last_close_timestamp = (now.timestamp() // timeframe_seconds) * timeframe_seconds
+                    last_close_dt = datetime.fromtimestamp(last_close_timestamp, tz=timezone.utc)
+                    next_close_dt = last_close_dt + timeframe_delta
+                    
+                    buffer_seconds = CONFIG.get("CANDLE_SYNC_BUFFER_SEC", 10)
+                    wait_until_dt = next_close_dt + timedelta(seconds=buffer_seconds)
+
+                    sleep_duration_seconds = (wait_until_dt - now).total_seconds()
+                    sleep_duration_seconds = max(1.0, sleep_duration_seconds)
+                    
+                    log.info(f"Performing initial sync with {timeframe_str} candle. Waiting for {sleep_duration_seconds:.2f} seconds.")
+                    await asyncio.sleep(sleep_duration_seconds)
+                
+                initial_sync_complete = True
+                log.info("Initial sync complete. Starting regular scan cycles.")
+
+            # --- REGULAR LOOP ---
             if not running:
                 await asyncio.sleep(2)
                 continue
 
-            # Check for session freeze
             if await manage_session_freeze_state():
                 log.info("Scan cycle skipped due to session freeze.")
                 cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
@@ -3831,43 +3858,16 @@ async def scanning_loop():
                 if isinstance(result, Exception):
                     log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
             
-            log.info("Scan cycle complete.")
-
-            # --- New: Candle-synchronized sleep ---
-            timeframe_str = CONFIG["TIMEFRAME"]
-            timeframe_delta = timeframe_to_timedelta(timeframe_str)
-
-            if not timeframe_delta:
-                # Fallback to old logic if timeframe is invalid
-                log.warning(f"Invalid timeframe '{timeframe_str}', falling back to fixed cooldown.")
-                cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
-                log.info(f"Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
-                await asyncio.sleep(cooldown_seconds)
-            else:
-                # Calculate the timestamp of the next candle close
-                now = datetime.now(timezone.utc)
-                timeframe_seconds = timeframe_delta.total_seconds()
-                last_close_timestamp = (now.timestamp() // timeframe_seconds) * timeframe_seconds
-                last_close_dt = datetime.fromtimestamp(last_close_timestamp, tz=timezone.utc)
-                next_close_dt = last_close_dt + timeframe_delta
-
-                # Add the configured buffer
-                buffer_seconds = CONFIG.get("CANDLE_SYNC_BUFFER_SEC", 10)
-                wait_until_dt = next_close_dt + timedelta(seconds=buffer_seconds)
-
-                # Calculate how long to sleep
-                sleep_duration_seconds = (wait_until_dt - now).total_seconds()
-                sleep_duration_seconds = max(1.0, sleep_duration_seconds) # Ensure we sleep for at least 1s
-
-                log.info(f"Synchronizing with next {timeframe_str} candle. Waiting for {sleep_duration_seconds:.2f} seconds.")
-                await asyncio.sleep(sleep_duration_seconds)
+            # Use the simple fixed cooldown for subsequent cycles
+            cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
+            log.info(f"Scan cycle complete. Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
+            await asyncio.sleep(cooldown_seconds)
 
         except asyncio.CancelledError:
             log.info("Scanning loop cancelled.")
             break
         except Exception as e:
             log.exception("An unhandled error occurred in the main scanning loop: %s", e)
-            # To prevent rapid-fire errors, wait a bit before retrying.
             await asyncio.sleep(60)
 
 def _generate_pnl_report_sync(query: str, params: tuple, title: str) -> tuple[str, Optional[bytes]]:
