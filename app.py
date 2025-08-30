@@ -2379,10 +2379,14 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optio
     risk_usdt = calculate_risk_amount(balance, strategy_id=1)
     qty = risk_usdt / price_distance if price_distance > 0 else 0.0
     
-    # --- Min Notional Boost Logic (preserved) ---
+    # --- Min Notional Boost Logic ---
     notional = qty * limit_price
-    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
+    if full_test:
+        log.info(f"S1 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+
     if notional < min_notional:
+        log.info(f"S1: Boosting quantity for {'full test' if full_test else 'standard'} order to meet min notional of ${min_notional:.2f}.")
         required_qty = min_notional / limit_price
         new_risk = required_qty * price_distance
         if new_risk > balance:
@@ -2592,7 +2596,9 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     ideal_qty = base_qty * size_multiplier
     
     # --- New Robust Quantity Calculation ---
-    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
+    if full_test:
+        log.info(f"S2 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
     qty_for_min_notional = min_notional / limit_price if limit_price > 0 else 0.0
     
     qty = max(ideal_qty, qty_for_min_notional)
@@ -2767,8 +2773,15 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
                 return
             
     # 5. Passed all checks, prepare to enter trade
-    entry_price = df['open'].iloc[-1]
+    entry_price = df['open'].iloc[-1] # This is the REAL market price for a real trade
     stop_pct = s3_params['INITIAL_STOP_PCT']
+    
+    # For test orders, we use a far-away limit price instead of market.
+    # This price must be used for the notional calculation.
+    price_for_order = entry_price
+    if test_signal:
+        price_for_order = entry_price * 0.5 if side == 'BUY' else entry_price * 1.5
+        log.info(f"S3 TEST MODE: Using far-limit price {price_for_order:.4f} for calculations.")
 
     # 6. Calculate Position Size
     balance = await asyncio.to_thread(get_account_balance_usdt)
@@ -2777,6 +2790,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
     else:
         max_loss_usd = s3_params['MAX_LOSS_USD_LARGE_BALANCE']
     
+    # Sizing is based on the hard stop from the REAL entry price
     price_distance = entry_price * stop_pct
     if price_distance <= 0:
         _record_rejection(symbol, "S3-Invalid price distance for sizing", {'dist': price_distance})
@@ -2785,8 +2799,11 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
     ideal_qty = max_loss_usd / price_distance if price_distance > 0 else 0.0
     
     # --- New Robust Quantity Calculation ---
-    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
-    qty_for_min_notional = min_notional / entry_price if entry_price > 0 else 0.0
+    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
+    if full_test:
+        log.info(f"S3 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+
+    qty_for_min_notional = min_notional / price_for_order if price_for_order > 0 else 0.0
     
     qty = max(ideal_qty, qty_for_min_notional)
 
@@ -2806,7 +2823,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
         
     # --- Recalculate final risk and leverage ---
     actual_risk_usdt = qty * price_distance
-    notional = qty * entry_price
+    notional = qty * entry_price # Notional for leverage is based on real price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
@@ -2815,7 +2832,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
     # 7. Place Orders
     if test_signal:
         # --- TEST MODE LOGIC ---
-        limit_price = entry_price * 0.5 if side == 'BUY' else entry_price * 1.5
+        limit_price = price_for_order # Use the already-calculated far price
         sl_price = limit_price * (1 - stop_pct) if side == 'BUY' else limit_price * (1 + stop_pct)
         log.info(f"S3 TEST MODE: Placing {'full' if full_test else 'simple'} test order for {symbol} at far-limit price {limit_price:.4f}")
 
@@ -2965,6 +2982,12 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 _record_rejection(symbol, "S4-Alignment fail (short)", {'trail': initial_trail_stop, 'price': current_price})
                 return
             
+    # For test orders, we use a far-away limit price instead of market.
+    price_for_order = current_price
+    if test_signal:
+        price_for_order = current_price * 0.5 if side == 'BUY' else current_price * 1.5
+        log.info(f"S4 TEST MODE: Using far-limit price {price_for_order:.4f} for calculations.")
+
     # 5. Calculate Position Size
     stop_pct = s4_params['INITIAL_STOP_PCT']
     risk_usd = s4_params['RISK_USD']
@@ -2976,8 +2999,11 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     ideal_qty = risk_usd / price_distance_for_sizing if price_distance_for_sizing > 0 else 0.0
 
     # --- New Robust Quantity Calculation ---
-    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
-    qty_for_min_notional = min_notional / current_price if current_price > 0 else 0.0
+    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
+    if full_test:
+        log.info(f"S4 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+
+    qty_for_min_notional = min_notional / price_for_order if price_for_order > 0 else 0.0
     
     qty = max(ideal_qty, qty_for_min_notional)
 
@@ -2996,7 +3022,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         return
         
     # --- Recalculate final risk and leverage ---
-    notional = qty * current_price
+    notional = qty * current_price # Notional for leverage is based on real price
     balance = await asyncio.to_thread(get_account_balance_usdt)
     actual_risk_usdt = qty * price_distance_for_sizing
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
@@ -3007,7 +3033,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     # 6. Place Orders
     if test_signal:
         # --- TEST MODE LOGIC ---
-        limit_price = current_price * 0.5 if side == 'BUY' else current_price * 1.5
+        limit_price = price_for_order # Use the already-calculated far price
         sl_price = limit_price * (1 - stop_pct) if side == 'BUY' else limit_price * (1 + stop_pct)
         log.info(f"S4 TEST MODE: Placing {'full' if full_test else 'simple'} test order for {symbol} at far-limit price {limit_price:.4f}")
 
