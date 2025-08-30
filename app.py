@@ -184,6 +184,7 @@ CONFIG = {
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
     "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "2")),
+    "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
@@ -3830,9 +3831,36 @@ async def scanning_loop():
                 if isinstance(result, Exception):
                     log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
             
-            cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
-            log.info(f"Scan cycle complete. Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
-            await asyncio.sleep(cooldown_seconds)
+            log.info("Scan cycle complete.")
+
+            # --- New: Candle-synchronized sleep ---
+            timeframe_str = CONFIG["TIMEFRAME"]
+            timeframe_delta = timeframe_to_timedelta(timeframe_str)
+
+            if not timeframe_delta:
+                # Fallback to old logic if timeframe is invalid
+                log.warning(f"Invalid timeframe '{timeframe_str}', falling back to fixed cooldown.")
+                cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
+                log.info(f"Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
+                await asyncio.sleep(cooldown_seconds)
+            else:
+                # Calculate the timestamp of the next candle close
+                now = datetime.now(timezone.utc)
+                timeframe_seconds = timeframe_delta.total_seconds()
+                last_close_timestamp = (now.timestamp() // timeframe_seconds) * timeframe_seconds
+                last_close_dt = datetime.fromtimestamp(last_close_timestamp, tz=timezone.utc)
+                next_close_dt = last_close_dt + timeframe_delta
+
+                # Add the configured buffer
+                buffer_seconds = CONFIG.get("CANDLE_SYNC_BUFFER_SEC", 10)
+                wait_until_dt = next_close_dt + timedelta(seconds=buffer_seconds)
+
+                # Calculate how long to sleep
+                sleep_duration_seconds = (wait_until_dt - now).total_seconds()
+                sleep_duration_seconds = max(1.0, sleep_duration_seconds) # Ensure we sleep for at least 1s
+
+                log.info(f"Synchronizing with next {timeframe_str} candle. Waiting for {sleep_duration_seconds:.2f} seconds.")
+                await asyncio.sleep(sleep_duration_seconds)
 
         except asyncio.CancelledError:
             log.info("Scanning loop cancelled.")
