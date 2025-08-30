@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 from collections import deque
-from decimal import Decimal, ROUND_DOWN, getcontext
+from decimal import Decimal, ROUND_DOWN, getcontext, ROUND_CEILING
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -2369,25 +2369,37 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
     price_distance = abs(limit_price - stop_price)
     balance = await asyncio.to_thread(get_account_balance_usdt)
     risk_usdt = calculate_risk_amount(balance, strategy_id=1)
-    qty = risk_usdt / price_distance
+    qty = risk_usdt / price_distance if price_distance > 0 else 0.0
     
+    # --- Min Notional Boost Logic (preserved) ---
     notional = qty * limit_price
     min_notional = CONFIG["MIN_NOTIONAL_USDT"]
     if notional < min_notional:
-        # This logic to boost risk is preserved from the original function
         required_qty = min_notional / limit_price
         new_risk = required_qty * price_distance
         if new_risk > balance:
             _record_rejection(symbol, "Notional too small, cannot boost risk", {'notional': notional, 'required_risk': new_risk, 'balance': balance})
             return
-        risk_usdt, qty, notional = new_risk, required_qty, min_notional
+        # Update risk_usdt and qty for this trade
+        risk_usdt, qty = new_risk, required_qty
+        log.info(f"S1: Boosted risk for {symbol} to meet min notional. New risk: ${risk_usdt:.2f}, New Qty: {qty}")
 
-    qty = await asyncio.to_thread(round_qty, symbol, qty)
+    # --- Final Quantity Adjustment (round UP to step size) ---
+    step_size = await asyncio.to_thread(get_step_size, symbol)
+    if step_size is not None and step_size > 0:
+        qty_dec = Decimal(str(qty))
+        step_dec = Decimal(str(step_size))
+        
+        num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
+        final_qty_dec = num_steps * step_dec
+        qty = float(final_qty_dec)
+
     if qty <= 0:
-        _record_rejection(symbol, "Quantity rounded to zero", {'risk_usdt': risk_usdt, 'price_dist': price_distance})
+        _record_rejection(symbol, "S1-Quantity is zero after adjustments", {'risk_usdt': risk_usdt, 'price_dist': price_distance})
         return
 
-    # Leverage calculation
+    # --- Recalculate final notional and leverage ---
+    notional = qty * limit_price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
@@ -2525,21 +2537,31 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
     else:  # 55-64%
         size_multiplier = 0.7
     
-    qty = base_qty * size_multiplier
+    ideal_qty = base_qty * size_multiplier
     
-    # 8. Validate quantity and notional value
-    notional = qty * limit_price
-    if notional < CONFIG["MIN_NOTIONAL_USDT"]:
-        _record_rejection(symbol, "S2-Notional value too small", {'notional': notional, 'min_notional': CONFIG["MIN_NOTIONAL_USDT"]})
-        return
+    # --- New Robust Quantity Calculation ---
+    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+    qty_for_min_notional = min_notional / limit_price if limit_price > 0 else 0.0
+    
+    qty = max(ideal_qty, qty_for_min_notional)
 
-    qty = await asyncio.to_thread(round_qty, symbol, qty)
+    # Round up to the nearest step size
+    step_size = await asyncio.to_thread(get_step_size, symbol)
+    if step_size is not None and step_size > 0:
+        qty_dec = Decimal(str(qty))
+        step_dec = Decimal(str(step_size))
+        
+        num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
+        final_qty_dec = num_steps * step_dec
+        qty = float(final_qty_dec)
+
     if qty <= 0:
-        _record_rejection(symbol, "S2-Quantity rounded to zero", {'original_qty': base_qty * size_multiplier})
+        _record_rejection(symbol, "S2-Quantity is zero after adjustments", {'ideal_qty': ideal_qty})
         return
 
-    # 9. Calculate Leverage
+    # --- Recalculate final risk and leverage ---
     actual_risk_usdt = price_distance * qty
+    notional = qty * limit_price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
@@ -2682,19 +2704,31 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
         _record_rejection(symbol, "S3-Invalid price distance for sizing", {'dist': price_distance})
         return
 
-    qty = max_loss_usd / price_distance
-    notional = qty * entry_price
+    ideal_qty = max_loss_usd / price_distance if price_distance > 0 else 0.0
     
-    if notional < CONFIG["MIN_NOTIONAL_USDT"]:
-        _record_rejection(symbol, "S3-Notional value too small", {'notional': notional, 'min': CONFIG["MIN_NOTIONAL_USDT"]})
-        return
+    # --- New Robust Quantity Calculation ---
+    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+    qty_for_min_notional = min_notional / entry_price if entry_price > 0 else 0.0
+    
+    qty = max(ideal_qty, qty_for_min_notional)
 
-    qty = await asyncio.to_thread(round_qty, symbol, qty)
+    # Round up to the nearest step size
+    step_size = await asyncio.to_thread(get_step_size, symbol)
+    if step_size is not None and step_size > 0:
+        qty_dec = Decimal(str(qty))
+        step_dec = Decimal(str(step_size))
+        
+        num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
+        final_qty_dec = num_steps * step_dec
+        qty = float(final_qty_dec)
+
     if qty <= 0:
-        _record_rejection(symbol, "S3-Qty rounded to zero", {'original_qty': max_loss_usd / price_distance})
+        _record_rejection(symbol, "S3-Quantity is zero after adjustments", {'ideal_qty': ideal_qty})
         return
         
+    # --- Recalculate final risk and leverage ---
     actual_risk_usdt = qty * price_distance
+    notional = qty * entry_price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
@@ -2831,19 +2865,30 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
         _record_rejection(symbol, "S4-Invalid price distance for sizing", {'dist': price_distance_for_sizing})
         return
 
-    qty = risk_usd / price_distance_for_sizing
-    notional = qty * current_price
-    
-    if notional < CONFIG["MIN_NOTIONAL_USDT"]:
-        _record_rejection(symbol, "S4-Notional value too small", {'notional': notional, 'min': CONFIG["MIN_NOTIONAL_USDT"]})
-        return
+    ideal_qty = risk_usd / price_distance_for_sizing if price_distance_for_sizing > 0 else 0.0
 
-    qty = await asyncio.to_thread(round_qty, symbol, qty)
+    # --- New Robust Quantity Calculation ---
+    min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+    qty_for_min_notional = min_notional / current_price if current_price > 0 else 0.0
+    
+    qty = max(ideal_qty, qty_for_min_notional)
+
+    # Round up to the nearest step size
+    step_size = await asyncio.to_thread(get_step_size, symbol)
+    if step_size is not None and step_size > 0:
+        qty_dec = Decimal(str(qty))
+        step_dec = Decimal(str(step_size))
+        
+        num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
+        final_qty_dec = num_steps * step_dec
+        qty = float(final_qty_dec)
+
     if qty <= 0:
-        _record_rejection(symbol, "S4-Qty rounded to zero", {'original_qty': risk_usd / price_distance_for_sizing})
+        _record_rejection(symbol, "S4-Quantity is zero after adjustments", {'ideal_qty': ideal_qty})
         return
         
-    # Leverage calculation
+    # --- Recalculate final risk and leverage ---
+    notional = qty * current_price
     balance = await asyncio.to_thread(get_account_balance_usdt)
     actual_risk_usdt = qty * price_distance_for_sizing
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
@@ -3631,9 +3676,9 @@ def daily_pnl_monitor_thread_func():
                 log.info(f"Daily PnL check: {daily_pnl:.2f} USDT vs Loss Limit {CONFIG['MAX_DAILY_LOSS']:.2f}")
                 if daily_pnl <= CONFIG["MAX_DAILY_LOSS"]:
                     log.warning(f"MAX DAILY LOSS LIMIT HIT! PnL: {daily_pnl:.2f}, Limit: {CONFIG['MAX_DAILY_LOSS']:.2f}")
-                    running = False
+                    frozen = True
                     daily_loss_limit_hit = True
-                    send_telegram(f"🚨 MAX DAILY LOSS LIMIT HIT! 🚨\nToday's PnL: {daily_pnl:.2f} USDT\nLimit: {CONFIG['MAX_DAILY_LOSS']:.2f} USDT\nBot is now PAUSED until the next UTC day.")
+                    send_telegram(f"🚨 MAX DAILY LOSS LIMIT HIT! 🚨\nToday's PnL: {daily_pnl:.2f} USDT\nLimit: {CONFIG['MAX_DAILY_LOSS']:.2f} USDT\nBot is now FROZEN. Use /unfreeze to resume trading.")
             
             # Profit Limit Check
             if not daily_profit_limit_hit and CONFIG["MAX_DAILY_PROFIT"] > 0:
