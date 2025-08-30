@@ -183,7 +183,7 @@ CONFIG = {
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
-    "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "5")),
+    "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "2")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
 
