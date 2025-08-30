@@ -2445,7 +2445,18 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optio
         try:
             log.info(f"S1 FULL TEST: Placing batch order: {order_batch}")
             await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
-            await asyncio.to_thread(send_telegram, f"✅ S1 Full Test: Placed batch order for {symbol} (Far Limit + SL/TP).")
+            test_msg = (
+                f"🧪 *S1 Full Test Order Executed*\n\n"
+                f"**Symbol:** `{symbol}`\n"
+                f"**Side:** `{side}`\n"
+                f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
+                f"**Qty:** `{qty}`\n"
+                f"**Stop Loss:** `{round_price(symbol, stop_price)}`\n"
+                f"**Take Profit:** `{round_price(symbol, take_price)}`\n"
+                f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+                f"**Leverage:** `{leverage}x`"
+            )
+            await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"S1 Full Test order failed for {symbol}", e)
     else:
@@ -2477,7 +2488,19 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optio
                     log.exception(f"Failed to save pending order {pending_order_id} to Firebase: {e}")
 
         log.info(f"Placed pending limit order (S1-BB): {pending_meta}")
-        await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S1-BB) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}")
+        title = "⏳ *New Pending Order: S1-BB*"
+        if test_signal:
+            title = f"🧪 *TEST: {title[2:]}" # Keep the emoji, replace the text
+        new_order_msg = (
+            f"{title}\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Price:** `{limit_price:.4f}`\n"
+            f"**Qty:** `{qty}`\n"
+            f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
 
 async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
@@ -2653,7 +2676,18 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         try:
             log.info(f"S2 FULL TEST: Placing batch order: {order_batch}")
             await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
-            await asyncio.to_thread(send_telegram, f"✅ S2 Full Test: Placed batch order for {symbol} (Far Limit + SL/TP).")
+            test_msg = (
+                f"🧪 *S2 Full Test Order Executed*\n\n"
+                f"**Symbol:** `{symbol}`\n"
+                f"**Side:** `{side}`\n"
+                f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
+                f"**Qty:** `{qty}`\n"
+                f"**Stop Loss:** `{round_price(symbol, stop_price)}`\n"
+                f"**Take Profit:** `{round_price(symbol, take_price)}`\n"
+                f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                f"**Leverage:** `{leverage}x`"
+            )
+            await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"S2 Full Test order failed for {symbol}", e)
     else:
@@ -2689,7 +2723,20 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
                     log.exception(f"Failed to save S2 pending order {pending_order_id} to Firebase: {e}")
 
         log.info(f"Placed pending limit order (S2-SuperTrend): {pending_meta}")
-        await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S2-ST) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}, Conf: {confidence:.1f}%")
+        title = "⏳ *New Pending Order: S2-ST*"
+        if test_signal:
+            title = f"🧪 *TEST: {title[2:]}" # Keep the emoji, replace the text
+        new_order_msg = (
+            f"{title}\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Price:** `{limit_price:.4f}`\n"
+            f"**Qty:** `{qty}`\n"
+            f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`\n"
+            f"**Confidence:** `{confidence:.1f}%`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
 
 async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
@@ -2853,14 +2900,33 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
             try:
                 log.info(f"S3 FULL TEST: Placing batch order: {order_batch}")
                 await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
-                await asyncio.to_thread(send_telegram, f"✅ S3 Full Test: Placed batch order for {symbol} (Far Limit + SL).")
+                test_msg = (
+                    f"🧪 *S3 Full Test Order Executed*\n\n"
+                    f"**Symbol:** `{symbol}`\n"
+                    f"**Side:** `{side}`\n"
+                    f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
+                    f"**Qty:** `{qty}`\n"
+                    f"**Stop Loss:** `{round_price(symbol, sl_price)}`\n"
+                    f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                    f"**Leverage:** `{leverage}x`"
+                )
+                await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
             except Exception as e:
                 await asyncio.to_thread(log_and_send_error, f"S3 Full Test order failed for {symbol}", e)
         else:
             # Simple test: just place the far limit order
             try:
                 await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
-                await asyncio.to_thread(send_telegram, f"✅ S3 Test: Placed far limit order for {symbol}.")
+                test_msg = (
+                    f"🧪 *S3 Simple Test Order Executed*\n\n"
+                    f"**Symbol:** `{symbol}`\n"
+                    f"**Side:** `{side}`\n"
+                    f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
+                    f"**Qty:** `{qty}`\n"
+                    f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
+                    f"**Leverage (for sizing):** `{leverage}x`"
+                )
+                await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
             except Exception as e:
                 await asyncio.to_thread(log_and_send_error, f"S3 Test order failed for {symbol}", e)
     else:
@@ -2903,7 +2969,16 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
             if firebase_db:
                  await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
 
-            await asyncio.to_thread(send_telegram, f"✅ New S3 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Initial SL: {sl_price:.4f}")
+            new_trade_msg = (
+                f"✅ *New Trade Opened: S3*\n\n"
+                f"**Symbol:** `{symbol}`\n"
+                f"**Side:** `{side}`\n"
+                f"**Entry:** `{actual_entry_price:.4f}`\n"
+                f"**Stop Loss:** `{sl_price:.4f}`\n"
+                f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                f"**Leverage:** `{leverage}x`"
+            )
+            await asyncio.to_thread(send_telegram, new_trade_msg, parse_mode='Markdown')
 
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to execute S3 trade for {symbol}", e)
@@ -3054,13 +3129,32 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             try:
                 log.info(f"S4 FULL TEST: Placing batch order: {order_batch}")
                 await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
-                await asyncio.to_thread(send_telegram, f"✅ S4 Full Test: Placed batch order for {symbol} (Far Limit + SL).")
+                test_msg = (
+                    f"🧪 *S4 Full Test Order Executed*\n\n"
+                    f"**Symbol:** `{symbol}`\n"
+                    f"**Side:** `{side}`\n"
+                    f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
+                    f"**Qty:** `{qty}`\n"
+                    f"**Stop Loss:** `{round_price(symbol, sl_price)}`\n"
+                    f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                    f"**Leverage:** `{leverage}x`"
+                )
+                await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
             except Exception as e:
                 await asyncio.to_thread(log_and_send_error, f"S4 Full Test order failed for {symbol}", e)
         else:
             try:
                 await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
-                await asyncio.to_thread(send_telegram, f"✅ S4 Test: Placed far limit order for {symbol}.")
+                test_msg = (
+                    f"🧪 *S4 Simple Test Order Executed*\n\n"
+                    f"**Symbol:** `{symbol}`\n"
+                    f"**Side:** `{side}`\n"
+                    f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
+                    f"**Qty:** `{qty}`\n"
+                    f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
+                    f"**Leverage (for sizing):** `{leverage}x`"
+                )
+                await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
             except Exception as e:
                 await asyncio.to_thread(log_and_send_error, f"S4 Test order failed for {symbol}", e)
     else:
@@ -3104,7 +3198,17 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
                 log.info(f"S4: Successfully saved trade {trade_id} to Firebase.")
 
-            await asyncio.to_thread(send_telegram, f"✅ New S4 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Hard SL: {sl_price:.4f}, Initial Trail: {initial_trail_stop:.4f}")
+            new_trade_msg = (
+                f"✅ *New Trade Opened: S4*\n\n"
+                f"**Symbol:** `{symbol}`\n"
+                f"**Side:** `{side}`\n"
+                f"**Entry:** `{actual_entry_price:.4f}`\n"
+                f"**Hard SL:** `{sl_price:.4f}`\n"
+                f"**Initial Trail:** `{initial_trail_stop:.4f}`\n"
+                f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                f"**Leverage:** `{leverage}x`"
+            )
+            await asyncio.to_thread(send_telegram, new_trade_msg, parse_mode='Markdown')
 
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
@@ -3231,7 +3335,19 @@ def monitor_thread_func():
                                 except Exception as e:
                                     log.exception(f"Failed to save new managed trade {trade_id} to Firebase: {e}")
                             
-                            send_telegram(f"✅ Limit Order Filled & Trade Opened for {p_meta['symbol']} | Side: {p_meta['side']}, Entry: {actual_entry_price:.4f}, SL: {stop_price:.4f}, TP: {take_price:.4f}")
+                            strategy_id_str = f"S{p_meta.get('strategy_id', 'N/A')}"
+                            trade_type_str = "BB" if strategy_id_str == "S1" else "ST"
+                            
+                            filled_order_msg = (
+                                f"✅ *Trade Opened: {strategy_id_str}-{trade_type_str}*\n\n"
+                                f"**Symbol:** `{p_meta['symbol']}`\n"
+                                f"**Side:** `{p_meta['side']}`\n"
+                                f"**Entry:** `{actual_entry_price:.4f}`\n"
+                                f"**Stop Loss:** `{stop_price:.4f}`\n"
+                                f"**Risk:** `{p_meta.get('risk_usdt', 0.0):.2f} USDT`\n"
+                                f"**Leverage:** `{p_meta.get('leverage', 0)}x`"
+                            )
+                            send_telegram(filled_order_msg, parse_mode='Markdown')
                             to_remove_pending.append(p_id)
 
                         elif order_status in ['CANCELED', 'EXPIRED', 'REJECTED']:
