@@ -2287,58 +2287,57 @@ async def evaluate_and_enter(symbol: str):
         await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
 
-async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
+async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the original Bollinger Band strategy.
     """
     global managed_trades, pending_limit_orders
     
-    # Most of the logic from the old evaluate_and_enter function is moved here.
     # The dataframe `df` is passed in with 'atr' already calculated.
-
-    # 1. Calculate BB-specific indicators
     bb_settings = CONFIG['STRATEGY_1']
     df['BBU'], df['BBL'] = bollinger_bands(df['close'], bb_settings['BB_LENGTH'], bb_settings['BB_STD'])
-    
-    # Use the most recently closed candle for the signal.
     signal_candle = df.iloc[-2]
-
-    # --- ADX Trend Filter (as it was in the original strategy) ---
-    if CONFIG.get("ADX_FILTER_ENABLED", True):
-        df['adx'] = adx(df, period=CONFIG.get("ADX_PERIOD", 14))
-        adx_value = df['adx'].iloc[-2]
-        if not pd.isna(adx_value) and adx_value > CONFIG.get("ADX_THRESHOLD", 25.0):
-            reason = "ADX > threshold (trending market)"
-            details = {'adx': f"{adx_value:.2f}", 'threshold': CONFIG.get("ADX_THRESHOLD", 25.0)}
-            _record_rejection(symbol, reason, details)
-            return
-
-    # --- Fast Move Filter (as it was in the original strategy) ---
-    if CONFIG.get("FAST_MOVE_FILTER_ENABLED", False):
-        candle_size = signal_candle['high'] - signal_candle['low']
-        atr_threshold = signal_candle['atr'] * CONFIG.get("FAST_MOVE_ATR_MULT", 2.0)
-        if candle_size > atr_threshold:
-            _record_rejection(symbol, "Candle size > ATR threshold", {'candle_size': candle_size, 'atr_threshold': atr_threshold})
-            return
-        
-        df['avg_volume'] = df['volume'].rolling(window=bb_settings['BB_LENGTH']).mean()
-        signal_candle_avg_vol = df['avg_volume'].iloc[-2]
-        if signal_candle_avg_vol > 0:
-            vol_threshold = signal_candle_avg_vol * CONFIG.get("FAST_MOVE_VOL_MULT", 2.0)
-            if signal_candle['volume'] > vol_threshold:
-                _record_rejection(symbol, "Volume spike", {'volume': signal_candle['volume'], 'avg_vol': signal_candle_avg_vol})
+    
+    side = None
+    if test_signal:
+        side = test_signal
+        log.info(f"S1 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
+    else:
+        # --- ADX Trend Filter (as it was in the original strategy) ---
+        if CONFIG.get("ADX_FILTER_ENABLED", True):
+            df['adx'] = adx(df, period=CONFIG.get("ADX_PERIOD", 14))
+            adx_value = df['adx'].iloc[-2]
+            if not pd.isna(adx_value) and adx_value > CONFIG.get("ADX_THRESHOLD", 25.0):
+                reason = "ADX > threshold (trending market)"
+                details = {'adx': f"{adx_value:.2f}", 'threshold': CONFIG.get("ADX_THRESHOLD", 25.0)}
+                _record_rejection(symbol, reason, details)
                 return
 
-    # 2. Check for entry signal
-    side = None
-    if signal_candle['close'] <= signal_candle['BBL']:
-        side = 'BUY'
-    elif signal_candle['close'] >= signal_candle['BBU']:
-        side = 'SELL'
-    
-    if not side:
-        _record_rejection(symbol, "No BB entry signal", {'price': signal_candle['close'], 'BBU': signal_candle['BBU'], 'BBL': signal_candle['BBL']})
-        return
+        # --- Fast Move Filter (as it was in the original strategy) ---
+        if CONFIG.get("FAST_MOVE_FILTER_ENABLED", False):
+            candle_size = signal_candle['high'] - signal_candle['low']
+            atr_threshold = signal_candle['atr'] * CONFIG.get("FAST_MOVE_ATR_MULT", 2.0)
+            if candle_size > atr_threshold:
+                _record_rejection(symbol, "Candle size > ATR threshold", {'candle_size': candle_size, 'atr_threshold': atr_threshold})
+                return
+            
+            df['avg_volume'] = df['volume'].rolling(window=bb_settings['BB_LENGTH']).mean()
+            signal_candle_avg_vol = df['avg_volume'].iloc[-2]
+            if signal_candle_avg_vol > 0:
+                vol_threshold = signal_candle_avg_vol * CONFIG.get("FAST_MOVE_VOL_MULT", 2.0)
+                if signal_candle['volume'] > vol_threshold:
+                    _record_rejection(symbol, "Volume spike", {'volume': signal_candle['volume'], 'avg_vol': signal_candle_avg_vol})
+                    return
+
+        # 2. Check for entry signal
+        if signal_candle['close'] <= signal_candle['BBL']:
+            side = 'BUY'
+        elif signal_candle['close'] >= signal_candle['BBU']:
+            side = 'SELL'
+        
+        if not side:
+            _record_rejection(symbol, "No BB entry signal", {'price': signal_candle['close'], 'BBU': signal_candle['BBU'], 'BBL': signal_candle['BBL']})
+            return
 
     # 3. Pre-trade checks
     async with managed_trades_lock, pending_limit_orders_lock:
@@ -2355,6 +2354,13 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
     # 4. Calculate order parameters
     offset = CONFIG["ORDER_LIMIT_OFFSET_PCT"]
     limit_price = signal_candle['close'] * (1 - offset) if side == 'BUY' else signal_candle['close'] * (1 + offset)
+
+    # --- Test Mode Price Adjustment ---
+    if test_signal:
+        current_price = df['close'].iloc[-1]
+        # Place order far away from market price to prevent execution
+        limit_price = current_price * 0.5 if side == 'BUY' else current_price * 1.5
+        log.info(f"S1 TEST MODE: Adjusted limit price to {limit_price:.4f} for non-execution.")
 
     atr_now = signal_candle['atr']
     if atr_now <= 0:
@@ -2405,38 +2411,70 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
     
-    # 6. Place Limit Order
-    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
-    order_id = str(limit_order_resp.get('orderId'))
-    pending_order_id = f"{symbol}_{order_id}"
+    # 6. Place Order
+    if full_test:
+        log.info(f"S1 FULL TEST MODE: Placing batch order for {symbol} with SL/TP.")
+        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+        close_side = 'SELL' if side == 'BUY' else 'BUY'
 
-    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
-    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
-    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+        limit_entry_order = {
+            'symbol': symbol, 'side': side, 'type': 'LIMIT',
+            'quantity': str(qty), 'price': round_price(symbol, limit_price),
+            'timeInForce': 'GTC'
+        }
+        if IS_HEDGE_MODE: limit_entry_order['positionSide'] = position_side
 
-    pending_meta = {
-        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
-        "side": side, "qty": qty, "limit_price": limit_price,
-        "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
-        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
-        "expiry_time": expiry_time.isoformat(),
-        "strategy_id": 1,  # Tagging the order with its strategy
-        "atr_at_entry": atr_now
-    }
-    
-    async with pending_limit_orders_lock:
-        pending_limit_orders[pending_order_id] = pending_meta
-        if firebase_db:
-            try:
-                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
-            except Exception as e:
-                log.exception(f"Failed to save pending order {pending_order_id} to Firebase: {e}")
+        base_close_order = { 'symbol': symbol, 'side': close_side, 'quantity': str(qty) }
+        if IS_HEDGE_MODE: base_close_order['positionSide'] = position_side
+        else: base_close_order['reduceOnly'] = 'true'
 
-    log.info(f"Placed pending limit order (S1-BB): {pending_meta}")
-    await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S1-BB) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}")
+        sl_order = base_close_order.copy()
+        sl_order.update({'type': 'STOP_MARKET', 'stopPrice': round_price(symbol, stop_price)})
+
+        tp_order = base_close_order.copy()
+        tp_order.update({'type': 'TAKE_PROFIT_MARKET', 'stopPrice': round_price(symbol, take_price)})
+        
+        order_batch = [limit_entry_order, sl_order, tp_order]
+        
+        try:
+            log.info(f"S1 FULL TEST: Placing batch order: {order_batch}")
+            await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
+            await asyncio.to_thread(send_telegram, f"✅ S1 Full Test: Placed batch order for {symbol} (Far Limit + SL/TP).")
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"S1 Full Test order failed for {symbol}", e)
+    else:
+        # Original logic for simple test or real trade
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+        expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": qty, "limit_price": limit_price,
+            "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
+            "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 1,
+            "atr_at_entry": atr_now
+        }
+        
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            if firebase_db:
+                try:
+                    await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
+                except Exception as e:
+                    log.exception(f"Failed to save pending order {pending_order_id} to Firebase: {e}")
+
+        log.info(f"Placed pending limit order (S1-BB): {pending_meta}")
+        await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S1-BB) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}")
 
 
-async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
+async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the new SuperTrend strategy.
     """
@@ -2449,52 +2487,57 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
     df['RSI'] = rsi(df['close'], length=CONFIG['RSI_LEN'])
     macd(df)
     
-    # 2. Check for signal (SuperTrend direction change)
-    if len(df) < 3:
-        log.warning(f"Not enough data for SuperTrend signal on {symbol}")
-        return
-        
-    prev_candle = df.iloc[-3]
     signal_candle = df.iloc[-2]
-    
     side = None
-    if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
-        side = 'BUY'
-    elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
-        side = 'SELL'
+
+    if test_signal:
+        side = test_signal
+        log.info(f"S2 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
+        # In test mode, we need to mock confidence scores as they are used in sizing
+        confidence, scores = 100.0, {'primary': 40.0, 'adx': 25.0, 'rsi': 20.0, 'macd': 15.0}
+    else:
+        # 2. Check for signal (SuperTrend direction change)
+        if len(df) < 3:
+            log.warning(f"Not enough data for SuperTrend signal on {symbol}")
+            return
+            
+        prev_candle = df.iloc[-3]
         
-    if not side:
-        log.debug(f"No SuperTrend signal for {symbol}")
-        return
+        if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
+            side = 'BUY'
+        elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
+            side = 'SELL'
+            
+        if not side:
+            log.debug(f"No SuperTrend signal for {symbol}")
+            return
 
-    # --- Volatility Range Filter ---
-    volatility_ratio = signal_candle['atr'] / signal_candle['close'] if signal_candle['close'] > 0 else 0
-    min_vol = st_settings.get('MIN_VOLATILITY_FOR_ENTRY', 0.003)
-    max_vol = st_settings.get('MAX_VOLATILITY_FOR_ENTRY', 0.035)
-    if not (min_vol <= volatility_ratio <= max_vol):
-        _record_rejection(symbol, "S2-Outside volatility range", {'vol_ratio': f"{volatility_ratio:.4f}", 'range': f"[{min_vol}, {max_vol}]"})
-        return
+        # --- Volatility Range Filter ---
+        volatility_ratio = signal_candle['atr'] / signal_candle['close'] if signal_candle['close'] > 0 else 0
+        min_vol = st_settings.get('MIN_VOLATILITY_FOR_ENTRY', 0.003)
+        max_vol = st_settings.get('MAX_VOLATILITY_FOR_ENTRY', 0.035)
+        if not (min_vol <= volatility_ratio <= max_vol):
+            _record_rejection(symbol, "S2-Outside volatility range", {'vol_ratio': f"{volatility_ratio:.4f}", 'range': f"[{min_vol}, {max_vol}]"})
+            return
 
-    # 3. Calculate signal confidence
-    confidence, scores = calculate_signal_confidence(signal_candle, side)
-    log.info(f"SuperTrend signal for {symbol} ({side}). Confidence: {confidence:.2f}%. Scores: {scores}")
+        # 3. Calculate signal confidence
+        confidence, scores = calculate_signal_confidence(signal_candle, side)
+        log.info(f"SuperTrend signal for {symbol} ({side}). Confidence: {confidence:.2f}%. Scores: {scores}")
 
-    # 4. Check adaptive confidence threshold
-    required_confidence = st_settings.get('BASE_CONFIDENCE_THRESHOLD', 55.0)
-    
-    # Adjust for low volatility
-    if volatility_ratio < st_settings.get('LOW_VOL_CONF_THRESHOLD', 0.005):
-        required_confidence = st_settings.get('LOW_VOL_CONF_LEVEL', 50.0)
-    
-    # Adjust for high volatility
-    if volatility_ratio > st_settings.get('HIGH_VOL_CONF_THRESHOLD', 0.01):
-        required_confidence -= st_settings.get('HIGH_VOL_CONF_ADJUSTMENT', 5.0)
+        # 4. Check adaptive confidence threshold
+        required_confidence = st_settings.get('BASE_CONFIDENCE_THRESHOLD', 55.0)
         
-    log.info(f"Adaptive confidence check for {symbol}: Required={required_confidence:.2f}%, Actual={confidence:.2f}% (Vol Ratio: {volatility_ratio:.4f})")
+        if volatility_ratio < st_settings.get('LOW_VOL_CONF_THRESHOLD', 0.005):
+            required_confidence = st_settings.get('LOW_VOL_CONF_LEVEL', 50.0)
+        
+        if volatility_ratio > st_settings.get('HIGH_VOL_CONF_THRESHOLD', 0.01):
+            required_confidence -= st_settings.get('HIGH_VOL_CONF_ADJUSTMENT', 5.0)
+            
+        log.info(f"Adaptive confidence check for {symbol}: Required={required_confidence:.2f}%, Actual={confidence:.2f}% (Vol Ratio: {volatility_ratio:.4f})")
 
-    if confidence < required_confidence:
-        _record_rejection(symbol, "S2-Confidence too low", {'score': f"{confidence:.2f}", 'threshold': f"{required_confidence:.2f}"})
-        return
+        if confidence < required_confidence:
+            _record_rejection(symbol, "S2-Confidence too low", {'score': f"{confidence:.2f}", 'threshold': f"{required_confidence:.2f}"})
+            return
         
     # 5. Pre-trade checks
     async with managed_trades_lock, pending_limit_orders_lock:
@@ -2511,6 +2554,13 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
     # 6. Calculate order parameters
     offset = CONFIG["ORDER_LIMIT_OFFSET_PCT"]
     limit_price = signal_candle['close'] * (1 - offset) if side == 'BUY' else signal_candle['close'] * (1 + offset)
+    
+    # --- Test Mode Price Adjustment ---
+    if test_signal:
+        current_price = df['close'].iloc[-1]
+        limit_price = current_price * 0.5 if side == 'BUY' else current_price * 1.5
+        log.info(f"S2 TEST MODE: Adjusted limit price to {limit_price:.4f} for non-execution.")
+
     stop_price = signal_candle['supertrend']
 
     if abs(limit_price - stop_price) <= 1e-8:
@@ -2567,58 +2617,86 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
     
-    # 10. Place Limit Order
-    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
-    order_id = str(limit_order_resp.get('orderId'))
-    pending_order_id = f"{symbol}_{order_id}"
+    # 10. Place Order
+    if full_test:
+        log.info(f"S2 FULL TEST MODE: Placing batch order for {symbol} with SL/TP.")
+        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+        close_side = 'SELL' if side == 'BUY' else 'BUY'
 
-    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
-    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
-    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+        limit_entry_order = {
+            'symbol': symbol, 'side': side, 'type': 'LIMIT',
+            'quantity': str(qty), 'price': round_price(symbol, limit_price),
+            'timeInForce': 'GTC'
+        }
+        if IS_HEDGE_MODE: limit_entry_order['positionSide'] = position_side
 
-    pending_meta = {
-        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
-        "side": side, "qty": qty, "limit_price": limit_price,
-        "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
-        "risk_usdt": actual_risk_usdt,
-        "place_time": datetime.utcnow().isoformat(),
-        "expiry_time": expiry_time.isoformat(),
-        "strategy_id": 2,
-        "atr_at_entry": atr_now,
-        "signal_confidence": confidence,
-        "adx_confirmation": scores['adx'],
-        "rsi_confirmation": scores['rsi'],
-        "macd_confirmation": scores['macd']
-    }
-    
-    async with pending_limit_orders_lock:
-        pending_limit_orders[pending_order_id] = pending_meta
-        if firebase_db:
-            try:
-                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
-            except Exception as e:
-                log.exception(f"Failed to save S2 pending order {pending_order_id} to Firebase: {e}")
+        base_close_order = { 'symbol': symbol, 'side': close_side, 'quantity': str(qty) }
+        if IS_HEDGE_MODE: base_close_order['positionSide'] = position_side
+        else: base_close_order['reduceOnly'] = 'true'
 
-    log.info(f"Placed pending limit order (S2-SuperTrend): {pending_meta}")
-    await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S2-ST) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}, Conf: {confidence:.1f}%")
+        sl_order = base_close_order.copy()
+        sl_order.update({'type': 'STOP_MARKET', 'stopPrice': round_price(symbol, stop_price)})
+
+        tp_order = base_close_order.copy()
+        tp_order.update({'type': 'TAKE_PROFIT_MARKET', 'stopPrice': round_price(symbol, take_price)})
+        
+        order_batch = [limit_entry_order, sl_order, tp_order]
+        
+        try:
+            log.info(f"S2 FULL TEST: Placing batch order: {order_batch}")
+            await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
+            await asyncio.to_thread(send_telegram, f"✅ S2 Full Test: Placed batch order for {symbol} (Far Limit + SL/TP).")
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"S2 Full Test order failed for {symbol}", e)
+    else:
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+        expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": qty, "limit_price": limit_price,
+            "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt,
+            "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 2,
+            "atr_at_entry": atr_now,
+            "signal_confidence": confidence,
+            "adx_confirmation": scores['adx'],
+            "rsi_confirmation": scores['rsi'],
+            "macd_confirmation": scores['macd']
+        }
+        
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            if firebase_db:
+                try:
+                    await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
+                except Exception as e:
+                    log.exception(f"Failed to save S2 pending order {pending_order_id} to Firebase: {e}")
+
+        log.info(f"Placed pending limit order (S2-SuperTrend): {pending_meta}")
+        await asyncio.to_thread(send_telegram, f"⏳ New Limit Order (S2-ST) for {symbol} | Side: {side}, Qty: {qty}, Price: {limit_price:.4f}, Conf: {confidence:.1f}%")
 
 
-async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
+async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the Advanced SuperTrend strategy (S3).
     """
     global managed_trades
     s3_params = CONFIG['STRATEGY_3']
-
-    # --- New: Liquidity Grab Check ---
-    if check_for_liquidity_grab(df, symbol):
-        return
-
+    
     # 1. Pre-trade checks (is a trade already open?)
-    async with managed_trades_lock:
-        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
-            # S3 uses market orders, so no pending order check is needed here.
-            # _record_rejection(symbol, "S3-Trade exists and hedging is disabled", {})
+    if not test_signal: # In test mode, we bypass this check to allow placing orders
+        async with managed_trades_lock:
+            if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+                return
+        if check_for_liquidity_grab(df, symbol):
             return
 
     # 2. Calculate Indicators
@@ -2629,64 +2707,62 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
 
     df['atr20'] = atr_wilder(df, length=s3_params['SUPERTREND_ATR_PERIOD'])
     df['atr2'] = atr_wilder(df, length=s3_params['TRAILING_ATR_PERIOD'])
-    
-    supertrend(df, period=s3_params['SUPERTREND_ATR_PERIOD'], 
-               multiplier=s3_params['SUPERTREND_MULTIPLIER'], 
-               atr_series=df['atr20'])
-    
+    supertrend(df, period=s3_params['SUPERTREND_ATR_PERIOD'], multiplier=s3_params['SUPERTREND_MULTIPLIER'], atr_series=df['atr20'])
     df['hhv10'] = hhv(df['high'], length=s3_params['TRAILING_HHV_PERIOD'])
     df['llv10'] = llv(df['low'], length=s3_params['TRAILING_HHV_PERIOD'])
 
-    # 3. Check for Signal (on the previously closed candle)
-    if len(df) < 3: return
-    
-    prev_candle = df.iloc[-3]
     signal_candle = df.iloc[-2]
-    
     side = None
-    if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
-        side = 'BUY'
-    elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
-        side = 'SELL'
+
+    if test_signal:
+        side = test_signal
+        log.info(f"S3 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
+    else:
+        # 3. Check for Signal (on the previously closed candle)
+        if len(df) < 3: return
         
-    if not side:
-        return # No signal
-
-    # --- New: Signal Expiry Check ---
-    signal_close_time = signal_candle.name.to_pydatetime()
-    time_since_signal = datetime.now(timezone.utc) - signal_close_time
-    if time_since_signal > timedelta(minutes=3):
-        log.info(f"S3 signal for {symbol} is too old ({time_since_signal}). Skipping.")
-        _record_rejection(symbol, "S3 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
-        return
-
-    # 4. Pre-entry Filters
-    # Volatility Filter (ATR20 for signal quality)
-    atr20_pct = (signal_candle['atr20'] / signal_candle['close']) * 100
-    if atr20_pct > s3_params['VOLATILITY_MAX_ATR20_PCT']:
-        _record_rejection(symbol, "S3-Pre-entry ATR(20) volatility too high", {'atr20_pct': atr20_pct})
-        return
+        prev_candle = df.iloc[-3]
         
-    # Volatility Filter (ATR2 for entry risk)
-    atr2_pct = (signal_candle['atr2'] / signal_candle['close']) * 100
-    if atr2_pct > s3_params['VOLATILITY_MAX_ATR2_PCT']:
-        _record_rejection(symbol, "S3-Pre-entry ATR(2) volatility too high", {'atr2_pct': atr2_pct})
-        return
+        if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
+            side = 'BUY'
+        elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
+            side = 'SELL'
+            
+        if not side:
+            return # No signal
 
-    # Alignment Filter
-    trail_distance = s3_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
-    supertrend_band = signal_candle['supertrend']
-    
-    if side == 'BUY':
-        candidate_trail = signal_candle['hhv10'] - trail_distance
-        if candidate_trail >= supertrend_band:
-            _record_rejection(symbol, "S3-Alignment fail (long)", {'trail': candidate_trail, 'st_band': supertrend_band})
+        # --- New: Signal Expiry Check ---
+        signal_close_time = signal_candle.name.to_pydatetime()
+        time_since_signal = datetime.now(timezone.utc) - signal_close_time
+        if time_since_signal > timedelta(minutes=3):
+            log.info(f"S3 signal for {symbol} is too old ({time_since_signal}). Skipping.")
+            _record_rejection(symbol, "S3 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
             return
-    else: # SELL
-        candidate_trail = signal_candle['llv10'] + trail_distance
-        if candidate_trail <= supertrend_band:
-            _record_rejection(symbol, "S3-Alignment fail (short)", {'trail': candidate_trail, 'st_band': supertrend_band})
+
+        # 4. Pre-entry Filters
+        atr20_pct = (signal_candle['atr20'] / signal_candle['close']) * 100
+        if atr20_pct > s3_params['VOLATILITY_MAX_ATR20_PCT']:
+            _record_rejection(symbol, "S3-Pre-entry ATR(20) volatility too high", {'atr20_pct': atr20_pct})
             return
+            
+        atr2_pct = (signal_candle['atr2'] / signal_candle['close']) * 100
+        if atr2_pct > s3_params['VOLATILITY_MAX_ATR2_PCT']:
+            _record_rejection(symbol, "S3-Pre-entry ATR(2) volatility too high", {'atr2_pct': atr2_pct})
+            return
+
+        trail_distance = s3_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
+        supertrend_band = signal_candle['supertrend']
+        
+        if side == 'BUY':
+            candidate_trail = signal_candle['hhv10'] - trail_distance
+            if candidate_trail >= supertrend_band:
+                _record_rejection(symbol, "S3-Alignment fail (long)", {'trail': candidate_trail, 'st_band': supertrend_band})
+                return
+        else: # SELL
+            candidate_trail = signal_candle['llv10'] + trail_distance
+            if candidate_trail <= supertrend_band:
+                _record_rejection(symbol, "S3-Alignment fail (short)", {'trail': candidate_trail, 'st_band': supertrend_band})
+                return
             
     # 5. Passed all checks, prepare to enter trade
     entry_price = df['open'].iloc[-1]
@@ -2735,52 +2811,86 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
     leverage = max(1, min(leverage, max_leverage))
 
     # 7. Place Orders
-    try:
-        log.info(f"S3: Placing MARKET {side} order for {qty} {symbol} at ~{entry_price}")
-        await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
-        
-        time.sleep(2)
-        positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
-        position_side = 'LONG' if side == 'BUY' else 'SHORT'
-        pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
-        
-        if not pos:
-             raise RuntimeError(f"Position for {symbol} not found after market order placement.")
-        
-        actual_entry_price = float(pos['entryPrice'])
-        actual_qty = abs(float(pos['positionAmt']))
-        
-        sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
-        
-        log.info(f"S3: Placing initial SL for {symbol} at {sl_price}")
-        sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
-        
-        # 8. Create and store managed trade metadata
-        trade_id = f"{symbol}_S3_{int(time.time())}"
-        meta = {
-            "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
-            "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
-            "leverage": leverage, "sl": sl_price, "tp": 0,
-            "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
-            "risk_usdt": actual_risk_usdt, "strategy_id": 3,
-            "atr_at_entry": signal_candle['atr2'],
-            "s3_trailing_active": False, "s3_trailing_stop": sl_price,
-        }
+    if test_signal:
+        # --- TEST MODE LOGIC ---
+        limit_price = entry_price * 0.5 if side == 'BUY' else entry_price * 1.5
+        sl_price = limit_price * (1 - stop_pct) if side == 'BUY' else limit_price * (1 + stop_pct)
+        log.info(f"S3 TEST MODE: Placing {'full' if full_test else 'simple'} test order for {symbol} at far-limit price {limit_price:.4f}")
 
-        async with managed_trades_lock:
-            managed_trades[trade_id] = meta
-        
-        await asyncio.to_thread(add_managed_trade_to_db, meta)
-        if firebase_db:
-             await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+        if full_test:
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            close_side = 'SELL' if side == 'BUY' else 'BUY'
+            limit_entry = {'symbol': symbol, 'side': side, 'type': 'LIMIT', 'quantity': str(qty), 'price': round_price(symbol, limit_price), 'timeInForce': 'GTC'}
+            if IS_HEDGE_MODE: limit_entry['positionSide'] = position_side
+            
+            base_close = {'symbol': symbol, 'side': close_side, 'quantity': str(qty)}
+            if IS_HEDGE_MODE: base_close['positionSide'] = position_side
+            else: base_close['reduceOnly'] = 'true'
+            
+            sl_order = base_close.copy()
+            sl_order.update({'type': 'STOP_MARKET', 'stopPrice': round_price(symbol, sl_price)})
+            
+            order_batch = [limit_entry, sl_order]
+            try:
+                log.info(f"S3 FULL TEST: Placing batch order: {order_batch}")
+                await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
+                await asyncio.to_thread(send_telegram, f"✅ S3 Full Test: Placed batch order for {symbol} (Far Limit + SL).")
+            except Exception as e:
+                await asyncio.to_thread(log_and_send_error, f"S3 Full Test order failed for {symbol}", e)
+        else:
+            # Simple test: just place the far limit order
+            try:
+                await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
+                await asyncio.to_thread(send_telegram, f"✅ S3 Test: Placed far limit order for {symbol}.")
+            except Exception as e:
+                await asyncio.to_thread(log_and_send_error, f"S3 Test order failed for {symbol}", e)
+    else:
+        # --- REAL TRADE LOGIC ---
+        try:
+            log.info(f"S3: Placing MARKET {side} order for {qty} {symbol} at ~{entry_price}")
+            await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
+            
+            time.sleep(2)
+            positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+            
+            if not pos:
+                 raise RuntimeError(f"Position for {symbol} not found after market order placement.")
+            
+            actual_entry_price = float(pos['entryPrice'])
+            actual_qty = abs(float(pos['positionAmt']))
+            
+            sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
+            
+            log.info(f"S3: Placing initial SL for {symbol} at {sl_price}")
+            sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
+            
+            trade_id = f"{symbol}_S3_{int(time.time())}"
+            meta = {
+                "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
+                "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
+                "leverage": leverage, "sl": sl_price, "tp": 0,
+                "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
+                "risk_usdt": actual_risk_usdt, "strategy_id": 3,
+                "atr_at_entry": signal_candle['atr2'],
+                "s3_trailing_active": False, "s3_trailing_stop": sl_price,
+            }
 
-        await asyncio.to_thread(send_telegram, f"✅ New S3 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Initial SL: {sl_price:.4f}")
+            async with managed_trades_lock:
+                managed_trades[trade_id] = meta
+            
+            await asyncio.to_thread(add_managed_trade_to_db, meta)
+            if firebase_db:
+                 await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
 
-    except Exception as e:
-        await asyncio.to_thread(log_and_send_error, f"Failed to execute S3 trade for {symbol}", e)
+            await asyncio.to_thread(send_telegram, f"✅ New S3 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Initial SL: {sl_price:.4f}")
+
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to execute S3 trade for {symbol}", e)
 
 
-async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
+async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the Advanced SuperTrend v2 strategy (S4).
     - Candle-body close confirmation for trailing stop.
@@ -2789,14 +2899,12 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
     global managed_trades
     s4_params = CONFIG['STRATEGY_4']
     
-    # --- New: Liquidity Grab Check ---
-    if check_for_liquidity_grab(df, symbol):
-        return
-
-    # 1. Pre-trade checks
-    async with managed_trades_lock:
-        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+    if not test_signal:
+        if check_for_liquidity_grab(df, symbol):
             return
+        async with managed_trades_lock:
+            if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+                return
 
     # 2. Calculate Indicators
     required_len = max(s4_params['TRAILING_HHV_PERIOD'], s4_params['SUPERTREND_PERIOD']) + 5
@@ -2804,62 +2912,60 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
         log.warning(f"Not enough data for S4 on {symbol}, need {required_len} have {len(df)}")
         return
 
-    # Use standard SuperTrend for signals
     supertrend(df, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
-    # Use Wilder's ATR for trailing logic, as it's smoother
     df['atr2'] = atr_wilder(df, length=s4_params['TRAILING_ATR_PERIOD'])
     df['hhv10'] = hhv(df['high'], length=s4_params['TRAILING_HHV_PERIOD'])
     df['llv10'] = llv(df['low'], length=s4_params['TRAILING_HHV_PERIOD'])
 
-    # 3. Check for Signal (on the previously closed candle)
-    if len(df) < 3: return
-    
-    prev_candle = df.iloc[-3]
     signal_candle = df.iloc[-2]
-    current_price = df['open'].iloc[-1] # Entry price is the open of the current candle
-
+    current_price = df['open'].iloc[-1]
     side = None
-    if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
-        side = 'BUY'
-    elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
-        side = 'SELL'
+    initial_trail_stop = 0.0
+
+    if test_signal:
+        side = test_signal
+        log.info(f"S4 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
+        # Use a dummy trail stop for testing
+        trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
+        initial_trail_stop = current_price - trail_distance if side == 'BUY' else current_price + trail_distance
+    else:
+        # 3. Check for Signal
+        if len(df) < 3: return
+        prev_candle = df.iloc[-3]
         
-    if not side:
-        return # No signal
+        if signal_candle['supertrend_direction'] == 1 and prev_candle['supertrend_direction'] == -1:
+            side = 'BUY'
+        elif signal_candle['supertrend_direction'] == -1 and prev_candle['supertrend_direction'] == 1:
+            side = 'SELL'
+        if not side: return
 
-    # --- New: Signal Expiry Check ---
-    signal_close_time = signal_candle.name.to_pydatetime()
-    time_since_signal = datetime.now(timezone.utc) - signal_close_time
-    if time_since_signal > timedelta(minutes=3):
-        log.info(f"S4 signal for {symbol} is too old ({time_since_signal}). Skipping.")
-        _record_rejection(symbol, "S4 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
-        return
+        # Signal Expiry Check
+        signal_close_time = signal_candle.name.to_pydatetime()
+        time_since_signal = datetime.now(timezone.utc) - signal_close_time
+        if time_since_signal > timedelta(minutes=3):
+            _record_rejection(symbol, "S4 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
+            return
 
-    # 4. Pre-entry Alignment Filter (New Rule)
-    trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
-    
-    if side == 'BUY':
-        # Fallback to price_based_trail if HHV is not logical (e.g., during a sharp drop)
-        candidate_trail = signal_candle['hhv10'] - trail_distance
-        price_based_trail = signal_candle['close'] - trail_distance
-        # Use the tighter (higher) of the two candidates, but it must be below the current price
-        initial_trail_stop = max(candidate_trail, price_based_trail)
-        if initial_trail_stop >= current_price:
-            _record_rejection(symbol, "S4-Alignment fail (long)", {'trail': initial_trail_stop, 'price': current_price})
-            return
-    else: # SELL
-        candidate_trail = signal_candle['llv10'] + trail_distance
-        price_based_trail = signal_candle['close'] + trail_distance
-        # Use the tighter (lower) of the two candidates, but it must be above the current price
-        initial_trail_stop = min(candidate_trail, price_based_trail)
-        if initial_trail_stop <= current_price:
-            _record_rejection(symbol, "S4-Alignment fail (short)", {'trail': initial_trail_stop, 'price': current_price})
-            return
+        # 4. Pre-entry Alignment Filter
+        trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['atr2']
+        if side == 'BUY':
+            candidate_trail = signal_candle['hhv10'] - trail_distance
+            price_based_trail = signal_candle['close'] - trail_distance
+            initial_trail_stop = max(candidate_trail, price_based_trail)
+            if initial_trail_stop >= current_price:
+                _record_rejection(symbol, "S4-Alignment fail (long)", {'trail': initial_trail_stop, 'price': current_price})
+                return
+        else: # SELL
+            candidate_trail = signal_candle['llv10'] + trail_distance
+            price_based_trail = signal_candle['close'] + trail_distance
+            initial_trail_stop = min(candidate_trail, price_based_trail)
+            if initial_trail_stop <= current_price:
+                _record_rejection(symbol, "S4-Alignment fail (short)", {'trail': initial_trail_stop, 'price': current_price})
+                return
             
-    # 5. Calculate Position Size (New Rule)
+    # 5. Calculate Position Size
     stop_pct = s4_params['INITIAL_STOP_PCT']
     risk_usd = s4_params['RISK_USD']
-    
     price_distance_for_sizing = current_price * stop_pct
     if price_distance_for_sizing <= 0:
         _record_rejection(symbol, "S4-Invalid price distance for sizing", {'dist': price_distance_for_sizing})
@@ -2897,76 +3003,83 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
     leverage = max(1, min(leverage, max_leverage))
 
     # 6. Place Orders
-    # Wrap the entire trade execution in a single block to catch any failure
-    # and prevent the bot from getting stuck in a bad state.
-    try:
-        # Step 1: Place Market Order
+    if test_signal:
+        # --- TEST MODE LOGIC ---
+        limit_price = current_price * 0.5 if side == 'BUY' else current_price * 1.5
+        sl_price = limit_price * (1 - stop_pct) if side == 'BUY' else limit_price * (1 + stop_pct)
+        log.info(f"S4 TEST MODE: Placing {'full' if full_test else 'simple'} test order for {symbol} at far-limit price {limit_price:.4f}")
+
+        if full_test:
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            close_side = 'SELL' if side == 'BUY' else 'BUY'
+            limit_entry = {'symbol': symbol, 'side': side, 'type': 'LIMIT', 'quantity': str(qty), 'price': round_price(symbol, limit_price), 'timeInForce': 'GTC'}
+            if IS_HEDGE_MODE: limit_entry['positionSide'] = position_side
+            
+            base_close = {'symbol': symbol, 'side': close_side, 'quantity': str(qty)}
+            if IS_HEDGE_MODE: base_close['positionSide'] = position_side
+            else: base_close['reduceOnly'] = 'true'
+            
+            sl_order = base_close.copy()
+            sl_order.update({'type': 'STOP_MARKET', 'stopPrice': round_price(symbol, sl_price)})
+            
+            order_batch = [limit_entry, sl_order]
+            try:
+                log.info(f"S4 FULL TEST: Placing batch order: {order_batch}")
+                await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
+                await asyncio.to_thread(send_telegram, f"✅ S4 Full Test: Placed batch order for {symbol} (Far Limit + SL).")
+            except Exception as e:
+                await asyncio.to_thread(log_and_send_error, f"S4 Full Test order failed for {symbol}", e)
+        else:
+            try:
+                await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
+                await asyncio.to_thread(send_telegram, f"✅ S4 Test: Placed far limit order for {symbol}.")
+            except Exception as e:
+                await asyncio.to_thread(log_and_send_error, f"S4 Test order failed for {symbol}", e)
+    else:
+        # --- REAL TRADE LOGIC ---
         try:
             log.info(f"S4: Placing MARKET {side} order for {qty} {symbol} at ~{current_price}")
             await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
-        except Exception as e:
-            raise RuntimeError(f"S4_FAIL_STEP_1_MARKET_ORDER: {e}")
 
-        # Step 2: Fetch Position Info
-        pos = None
-        try:
-            time.sleep(2) # Allow position to register on the exchange
+            time.sleep(2)
             positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
             position_side = 'LONG' if side == 'BUY' else 'SHORT'
             pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
             if not pos:
                 raise RuntimeError(f"Position for {symbol} not found after S4 market order.")
-        except Exception as e:
-            raise RuntimeError(f"S4_FAIL_STEP_2_FETCH_POS: {e}")
-        
-        actual_entry_price = float(pos['entryPrice'])
-        actual_qty = abs(float(pos['positionAmt']))
-        
-        # Step 3: Place Hard Stop-Loss
-        sltp_orders = {}
-        try:
+            
+            actual_entry_price = float(pos['entryPrice'])
+            actual_qty = abs(float(pos['positionAmt']))
+            
+            sltp_orders = {}
             sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
             log.info(f"S4: Placing initial hard SL for {symbol} at {sl_price}")
             sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
-        except Exception as e:
-            raise RuntimeError(f"S4_FAIL_STEP_3_PLACE_SL: {e}")
 
-        # Step 4: Create and store managed trade metadata
-        trade_id = f"{symbol}_S4_{int(time.time())}"
-        meta = {
-            "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
-            "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
-            "leverage": leverage, "sl": sl_price, "tp": 0, # TP is managed by trailing stop
-            "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
-            "risk_usdt": actual_risk_usdt, "strategy_id": 4,
-            # S4 specific fields for monitoring
-            "s4_trailing_stop": initial_trail_stop,
-            "s4_last_candle_ts": signal_candle.name.isoformat(), # Timestamp of the signal candle
-        }
+            trade_id = f"{symbol}_S4_{int(time.time())}"
+            meta = {
+                "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
+                "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
+                "leverage": leverage, "sl": sl_price, "tp": 0,
+                "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
+                "risk_usdt": actual_risk_usdt, "strategy_id": 4,
+                "s4_trailing_stop": initial_trail_stop,
+                "s4_last_candle_ts": signal_candle.name.isoformat(),
+            }
 
-        # Step 5: Save to local state and SQLite DB
-        try:
             async with managed_trades_lock:
                 managed_trades[trade_id] = meta
             await asyncio.to_thread(add_managed_trade_to_db, meta)
-        except Exception as e:
-            raise RuntimeError(f"S4_FAIL_STEP_5_LOCAL_SAVE: {e}")
 
-        # Step 6: Save to Firebase
-        if firebase_db:
-            try:
+            if firebase_db:
                 log.info(f"S4: Attempting to save trade {trade_id} to Firebase.")
                 await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
                 log.info(f"S4: Successfully saved trade {trade_id} to Firebase.")
-            except Exception as e:
-                raise RuntimeError(f"S4_FAIL_STEP_6_FIREBASE_SAVE: {e}")
 
-        # Step 7: Send Telegram Notification
-        await asyncio.to_thread(send_telegram, f"✅ New S4 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Hard SL: {sl_price:.4f}, Initial Trail: {initial_trail_stop:.4f}")
+            await asyncio.to_thread(send_telegram, f"✅ New S4 Trade Opened for {symbol} | Side: {side}, Entry: {actual_entry_price:.4f}, Hard SL: {sl_price:.4f}, Initial Trail: {initial_trail_stop:.4f}")
 
-    except Exception as e:
-        # The new error messages from the inner blocks will be caught here
-        await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
 
 
 def calculate_trailing_distance(strategy_id: str, volatility_ratio: float, trend_strength: float) -> float:
@@ -4319,6 +4432,41 @@ def handle_callback_query_sync(update, loop):
     except Exception as e:
         log.exception("Error in handle_callback_query_sync")
 
+async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
+    """
+    Dispatcher for test order commands. Fetches data and calls the relevant
+    strategy function with test parameters.
+    """
+    try:
+        # Fetch fresh data to ensure all calculations are based on the latest market state
+        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
+        
+        # We'll use a dummy 'BUY' signal for all tests. The side doesn't matter much,
+        # as we're just testing the calculation pipeline.
+        test_params = {'test_signal': 'BUY', 'full_test': full_test}
+
+        # Dispatch to the correct strategy evaluation function with test parameters
+        if strategy_id == 1:
+            # S1 and S2 are limit order strategies, which are simpler to test.
+            await evaluate_strategy_bb(symbol, df, **test_params)
+        elif strategy_id == 2:
+            await evaluate_strategy_supertrend(symbol, df, **test_params)
+        elif strategy_id == 3:
+            # S3 and S4 are market order strategies, so the test will place a far-limit order instead.
+            await evaluate_strategy_3(symbol, df, **test_params)
+        elif strategy_id == 4:
+            await evaluate_strategy_4(symbol, df, **test_params)
+        else:
+            # This case should ideally not be hit due to checks in the command handler
+            await asyncio.to_thread(send_telegram, f"Invalid strategy ID {strategy_id} for test order.")
+            return
+            
+        await asyncio.to_thread(send_telegram, f"✅ Test order process completed for S{strategy_id} on {symbol}. Check for new orders on the exchange.")
+
+    except Exception as e:
+        log.exception(f"Error during run_test_order for S{strategy_id} on {symbol}")
+        await asyncio.to_thread(send_telegram, f"❌ An error occurred during the test: {e}")
+
 def handle_update_sync(update, loop):
     try:
         if update is None:
@@ -4687,7 +4835,10 @@ def handle_update_sync(update, loop):
                     "- `/ip`: Shows the bot's public server IP address.\n"
                     "- `/usage`: Displays the current CPU and memory usage.\n"
                     "- `/validate`: Performs a sanity check on the configuration.\n"
-                    "- `/help`: Displays this help message."
+                    "- `/help`: Displays this help message.\n\n"
+                    "*Testing*\n"
+                    "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
+                    "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP."
                 )
                 async def _task():
                     await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
@@ -4715,6 +4866,42 @@ def handle_update_sync(update, loop):
                     f"    - Used: {mem_data['used_gb']:.2f} GB"
                 )
                 send_telegram(usage_report, parse_mode='Markdown')
+            elif text.startswith(("/testorder", "/fulltestorder")):
+                import random
+                parts = text.split()
+                if len(parts) < 2:
+                    send_telegram("Usage: /testorder <S1|S2|S3|S4> [SYMBOL]\nExample: /testorder S1 BTCUSDT")
+                    return
+
+                strategy_id_str = parts[1].upper()
+                if strategy_id_str not in ["S1", "S2", "S3", "S4"]:
+                    send_telegram(f"Invalid strategy: {strategy_id_str}. Please use S1, S2, S3, or S4.")
+                    return
+                
+                strategy_id = int(strategy_id_str[1:])
+
+                symbol = None
+                if len(parts) > 2:
+                    symbol = parts[2].upper()
+                    if symbol not in CONFIG["SYMBOLS"]:
+                       send_telegram(f"Symbol {symbol} is not in the bot's symbol list.")
+                       return
+                else:
+                    symbol = random.choice(CONFIG["SYMBOLS"])
+
+                full_test = text.startswith("/fulltestorder")
+                
+                send_telegram(f"🚀 Initiating {'full' if full_test else 'simple'} test order for Strategy {strategy_id} on {symbol}...")
+                
+                async def _task():
+                    await run_test_order(strategy_id, symbol, full_test)
+
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try:
+                    fut.result(timeout=60)
+                except Exception as e:
+                    log.error(f"Failed to execute test order for S{strategy_id} on {symbol}: {e}")
+                    send_telegram(f"❌ Failed to execute test order: {e}")
             elif text.startswith("/scalein"):
                 parts = text.split()
                 if len(parts) < 3:
