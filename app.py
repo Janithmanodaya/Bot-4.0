@@ -183,7 +183,7 @@ CONFIG = {
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
-    "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "2")),
+    "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "3")),
     "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
@@ -290,6 +290,10 @@ notified_rogue_symbols: set[str] = set()
 
 # Flag for one-time startup sync
 initial_sync_complete: bool = False
+
+# Scan cycle state
+scan_cycle_count: int = 0
+next_scan_time: Optional[datetime] = None
 
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
@@ -3812,7 +3816,7 @@ async def manage_session_freeze_state():
 
 
 async def scanning_loop():
-    global initial_sync_complete
+    global initial_sync_complete, scan_cycle_count, next_scan_time
     while True:
         try:
             # --- ONE-TIME INITIAL SYNC ---
@@ -3858,9 +3862,12 @@ async def scanning_loop():
                 if isinstance(result, Exception):
                     log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
             
+            scan_cycle_count += 1
+            
             # Use the simple fixed cooldown for subsequent cycles
             cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
-            log.info(f"Scan cycle complete. Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
+            next_scan_time = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
+            log.info(f"Scan cycle #{scan_cycle_count} complete. Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
             await asyncio.sleep(cooldown_seconds)
 
         except asyncio.CancelledError:
@@ -4345,23 +4352,32 @@ def handle_update_sync(update, loop):
                 status_lines = [f"▶️ Running: *{running}*"]
                 status_lines.append(f"✋ Manual Freeze: *{frozen}*")
                 
-                # Build a more descriptive session freeze status
+                # Session freeze status
                 is_natural_freeze, session_name = get_session_freeze_status(datetime.now(timezone.utc))
                 effective_freeze = frozen or (is_natural_freeze and not session_freeze_override)
-                
                 session_status_text = f"❄️ Effective Freeze: *{effective_freeze}*"
-                details = []
-                if frozen:
-                    details.append("Manual")
-                if is_natural_freeze:
-                    details.append(f"Session: {session_name}")
-                if session_freeze_override:
-                    details.append("Overridden")
-                if details:
-                    session_status_text += f" ({'; '.join(details)})"
-                
+                details = [d for d in [("Manual" if frozen else None), (f"Session: {session_name}" if is_natural_freeze else None), ("Overridden" if session_freeze_override else None)] if d]
+                if details: session_status_text += f" ({'; '.join(details)})"
                 status_lines.append(session_status_text)
+                
                 status_lines.append(f"📈 Managed Trades: *{len(trades)}*")
+                
+                # Scan Cycle Info
+                status_lines.append(f"🔄 Total Scans: *{scan_cycle_count}*")
+                if next_scan_time and running:
+                    time_until_next_scan = next_scan_time - datetime.now(timezone.utc)
+                    if time_until_next_scan.total_seconds() > 0:
+                        status_lines.append(f"⏳ Next Scan In: *{format_timedelta(time_until_next_scan)}*")
+
+                # Next Candle Info
+                timeframe_str = CONFIG["TIMEFRAME"]
+                timeframe_delta = timeframe_to_timedelta(timeframe_str)
+                if timeframe_delta:
+                    now = datetime.now(timezone.utc)
+                    timeframe_seconds = timeframe_delta.total_seconds()
+                    last_close_timestamp = (now.timestamp() // timeframe_seconds) * timeframe_seconds
+                    next_candle_open_dt = datetime.fromtimestamp(last_close_timestamp + timeframe_seconds, tz=timezone.utc)
+                    status_lines.append(f"🕯️ Next {timeframe_str} Candle: *{next_candle_open_dt.strftime('%H:%M:%S')} UTC*")
 
                 # Combine sections
                 txt = (
