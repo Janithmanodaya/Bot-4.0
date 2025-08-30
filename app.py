@@ -123,7 +123,7 @@ CONFIG = {
     },
     "STRATEGY_4": { # Advanced SuperTrend v2 strategy
         "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "7")), # Uses a standard ST for signals
-        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "2.0")),
+        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "3.0")),
         "TRAILING_ATR_PERIOD": int(os.getenv("S4_TRAIL_ATR_PERIOD", "2")),
         "TRAILING_HHV_PERIOD": int(os.getenv("S4_TRAIL_HHV_PERIOD", "10")),
         "TRAILING_ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")),
