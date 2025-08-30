@@ -123,7 +123,7 @@ CONFIG = {
     },
     "STRATEGY_4": { # Advanced SuperTrend v2 strategy
         "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "7")), # Uses a standard ST for signals
-        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "3.0")),
+        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "2.0")),
         "TRAILING_ATR_PERIOD": int(os.getenv("S4_TRAIL_ATR_PERIOD", "2")),
         "TRAILING_HHV_PERIOD": int(os.getenv("S4_TRAIL_HHV_PERIOD", "10")),
         "TRAILING_ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")),
@@ -854,8 +854,8 @@ def _record_rejection(symbol: str, reason: str, details: dict):
         "details": formatted_details
     }
     rejected_trades.append(record)
-    # Use debug level for rejection logs to avoid spamming the main log
-    log.debug(f"Rejected trade for {symbol}. Reason: {reason}")
+    # Use info level for rejection logs to make them visible.
+    log.info(f"Rejected trade for {symbol}. Reason: {reason}, Details: {formatted_details}")
 
 
 SESSION_FREEZE_WINDOWS = {
@@ -4075,6 +4075,48 @@ async def generate_and_send_strategy_report():
         await asyncio.to_thread(send_telegram, f"An error occurred while generating the strategy report: {e}")
 
 
+def get_memory_info() -> dict:
+    """
+    Gets memory usage, attempting to be container-aware by checking cgroups.
+    Falls back to system-wide memory if not in a container.
+    """
+    # Default values using psutil for host system
+    mem_info = psutil.virtual_memory()
+    total_mem_gb = mem_info.total / (1024**3)
+    used_mem_gb = mem_info.used / (1024**3)
+    percent_used = mem_info.percent
+    is_container = False
+
+    cgroup_paths = [
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes"  # cgroup v1
+    ]
+
+    for path in cgroup_paths:
+        try:
+            with open(path, "r") as f:
+                limit = int(f.read().strip())
+                # If limit is valid and smaller than host memory, use it
+                if 0 < limit < mem_info.total:
+                    process = psutil.Process(os.getpid())
+                    used_mem_bytes = process.memory_info().rss
+                    
+                    total_mem_gb = limit / (1024**3)
+                    used_mem_gb = used_mem_bytes / (1024**3)
+                    percent_used = (used_mem_bytes / limit) * 100
+                    is_container = True
+                    break # Found a valid cgroup limit, no need to check further
+        except (IOError, ValueError):
+            continue # Try next path or fallback to host metrics
+            
+    return {
+        "percent": percent_used,
+        "total_gb": total_mem_gb,
+        "used_gb": used_mem_gb,
+        "is_container": is_container
+    }
+
+
 async def generate_and_send_report():
     """
     Fetches all trade data, calculates analytics, generates a PnL chart,
@@ -4611,15 +4653,21 @@ def handle_update_sync(update, loop):
                     log.error("Failed to execute /help action: %s", e)
             elif text.startswith("/usage"):
                 cpu_usage = psutil.cpu_percent(interval=1)
-                memory_info = psutil.virtual_memory()
+                mem_data = get_memory_info()
                 
                 usage_report = (
                     f"🖥️ *System Resource Usage*\n\n"
-                    f"  - *CPU Usage:* {cpu_usage}%\n"
-                    f"  - *Memory Usage:* {memory_info.percent}%\n"
-                    f"    - Total: {memory_info.total / (1024**3):.2f} GB\n"
-                    f"    - Used: {memory_info.used / (1024**3):.2f} GB\n"
-                    f"    - Free: {memory_info.free / (1024**3):.2f} GB"
+                    f"  - *CPU Usage:* {cpu_usage:.1f}%\n"
+                    f"  - *Memory Usage:* {mem_data['percent']:.2f}%"
+                )
+                if mem_data['is_container']:
+                    usage_report += " `(Container-aware)`\n"
+                else:
+                    usage_report += "\n"
+
+                usage_report += (
+                    f"    - Total: {mem_data['total_gb']:.2f} GB\n"
+                    f"    - Used: {mem_data['used_gb']:.2f} GB"
                 )
                 send_telegram(usage_report, parse_mode='Markdown')
             elif text.startswith("/scalein"):
