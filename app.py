@@ -2453,7 +2453,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optio
                 f"**Qty:** `{qty}`\n"
                 f"**Stop Loss:** `{round_price(symbol, stop_price)}`\n"
                 f"**Take Profit:** `{round_price(symbol, take_price)}`\n"
-                f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+                f"**Risk (for sizing):** `{risk_usdt:.2f} USDT`\n"
                 f"**Leverage:** `{leverage}x`"
             )
             await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
@@ -2684,7 +2684,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
                 f"**Qty:** `{qty}`\n"
                 f"**Stop Loss:** `{round_price(symbol, stop_price)}`\n"
                 f"**Take Profit:** `{round_price(symbol, take_price)}`\n"
-                f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
                 f"**Leverage:** `{leverage}x`"
             )
             await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
@@ -2907,7 +2907,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
                     f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
                     f"**Qty:** `{qty}`\n"
                     f"**Stop Loss:** `{round_price(symbol, sl_price)}`\n"
-                    f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
                     f"**Leverage:** `{leverage}x`"
                 )
                 await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
@@ -3136,7 +3136,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                     f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
                     f"**Qty:** `{qty}`\n"
                     f"**Stop Loss:** `{round_price(symbol, sl_price)}`\n"
-                    f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+                f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
                     f"**Leverage:** `{leverage}x`"
                 )
                 await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
