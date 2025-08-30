@@ -1494,12 +1494,14 @@ def round_price(symbol: str, price: float) -> str:
                 tick_size_str = f.get('tickSize', '0.00000001')
                 tick_size = Decimal(tick_size_str)
                 
-                # Determine the number of decimal places from the tick_size
+                # Determine the number of decimal places from the tick_size for formatting
                 decimal_places = abs(tick_size.as_tuple().exponent)
 
                 getcontext().prec = 28
                 p = Decimal(str(price))
-                rounded_price = p.quantize(tick_size, rounding=ROUND_DOWN)
+                
+                # Correctly round down to the nearest multiple of tick_size
+                rounded_price = (p / tick_size).to_integral_value(rounding=ROUND_DOWN) * tick_size
                 
                 # Format with the correct number of decimal places to preserve trailing zeros
                 return f"{rounded_price:.{decimal_places}f}"
