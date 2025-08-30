@@ -2381,12 +2381,12 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optio
     
     # --- Min Notional Boost Logic ---
     notional = qty * limit_price
-    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
-    if full_test:
-        log.info(f"S1 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+    min_notional = 100.0 if test_signal else CONFIG["MIN_NOTIONAL_USDT"]
+    if test_signal:
+        log.info(f"S1 TEST MODE: Overriding min notional to ${min_notional:.2f}.")
 
     if notional < min_notional:
-        log.info(f"S1: Boosting quantity for {'full test' if full_test else 'standard'} order to meet min notional of ${min_notional:.2f}.")
+        log.info(f"S1: Boosting quantity for {'test' if test_signal else 'standard'} order to meet min notional of ${min_notional:.2f}.")
         required_qty = min_notional / limit_price
         new_risk = required_qty * price_distance
         if new_risk > balance:
@@ -2596,9 +2596,9 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     ideal_qty = base_qty * size_multiplier
     
     # --- New Robust Quantity Calculation ---
-    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
-    if full_test:
-        log.info(f"S2 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+    min_notional = 100.0 if test_signal else CONFIG["MIN_NOTIONAL_USDT"]
+    if test_signal:
+        log.info(f"S2 TEST MODE: Overriding min notional to ${min_notional:.2f}.")
     qty_for_min_notional = min_notional / limit_price if limit_price > 0 else 0.0
     
     qty = max(ideal_qty, qty_for_min_notional)
@@ -2799,9 +2799,9 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: Option
     ideal_qty = max_loss_usd / price_distance if price_distance > 0 else 0.0
     
     # --- New Robust Quantity Calculation ---
-    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
-    if full_test:
-        log.info(f"S3 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+    min_notional = 100.0 if test_signal else CONFIG["MIN_NOTIONAL_USDT"]
+    if test_signal:
+        log.info(f"S3 TEST MODE: Overriding min notional to ${min_notional:.2f}.")
 
     qty_for_min_notional = min_notional / price_for_order if price_for_order > 0 else 0.0
     
@@ -2999,9 +2999,9 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     ideal_qty = risk_usd / price_distance_for_sizing if price_distance_for_sizing > 0 else 0.0
 
     # --- New Robust Quantity Calculation ---
-    min_notional = 100.0 if full_test else CONFIG["MIN_NOTIONAL_USDT"]
-    if full_test:
-        log.info(f"S4 FULL TEST: Overriding min notional to ${min_notional:.2f}.")
+    min_notional = 100.0 if test_signal else CONFIG["MIN_NOTIONAL_USDT"]
+    if test_signal:
+        log.info(f"S4 TEST MODE: Overriding min notional to ${min_notional:.2f}.")
 
     qty_for_min_notional = min_notional / price_for_order if price_for_order > 0 else 0.0
     
@@ -3321,12 +3321,12 @@ def monitor_thread_func():
                         f"Binance API keys are invalid or the server's IP is not whitelisted.\n\n"
                         f"Error Code: `{e.code}`\n"
                         f"Server IP: `{ip}`\n\n"
-                        f"The bot will now attempt to restart to get a new IP address. Please add the new IP to your Binance whitelist if the error persists."
+                        f"The bot will now trigger a graceful shutdown to get a new IP address. Please add the new IP to your Binance whitelist if the error persists."
                     )
                     send_telegram(error_msg, parse_mode='Markdown')
-                    log.warning(f"IP Whitelist Error (Code: -2015). Server IP: {ip}. Restarting in 60 seconds...")
-                    time.sleep(60)
-                    sys.exit(1) # Exit with error code to trigger platform restart
+                    log.warning(f"IP Whitelist Error (Code: -2015). Server IP: {ip}. Sending SIGTERM to own process to trigger restart in 5 seconds...")
+                    time.sleep(5) # Give telegram a moment to send
+                    os.kill(os.getpid(), signal.SIGTERM) # Send SIGTERM to the whole process
 
                 # Handle other, potentially transient, API errors
                 html_content = None
@@ -5032,18 +5032,6 @@ async def handle_critical_error_async(exc: Exception, context: str = None):
 @app.get("/")
 async def root():
     return {"status": "ok", "running": running, "managed_trades": len(managed_trades)}
-
-def _signal_handler(sig, frame):
-    log.info("Received signal %s, shutting down", sig)
-    monitor_stop_event.set()
-    try:
-        send_telegram(f"Received signal {sig}. Shutting down.")
-    except Exception:
-        pass
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
