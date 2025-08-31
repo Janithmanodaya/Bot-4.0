@@ -3920,7 +3920,7 @@ def monitor_thread_func():
                         # 1. Profit Gate Check to activate trailing
                         if not meta.get('s4_trailing_active'):
                             profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
-                            if profit_pct >= 0.005: # 0.5% profit
+                            if profit_pct >= 0.002: # 0.2% profit
                                 log.info(f"S4: Profit gate hit for {tid}. Activating trailing stop.")
                                 with managed_trades_lock:
                                     if tid in managed_trades:
@@ -4731,10 +4731,9 @@ def build_control_keyboard():
     buttons = [
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
         [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
-        [KeyboardButton("/listorders"), KeyboardButton("/listpending")],
-        [KeyboardButton("/status"), KeyboardButton("/showparams")],
-        [KeyboardButton("/usage"), KeyboardButton("/report"), KeyboardButton("/stratreport")],
-        [KeyboardButton("/rejects"), KeyboardButton("/help")]
+        [KeyboardButton("/listorders"), KeyboardButton("/getids")],
+        [KeyboardButton("/status"), KeyboardButton("/listpending")],
+        [KeyboardButton("/usage"), KeyboardButton("/rejects"), KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -5051,6 +5050,115 @@ def handle_update_sync(update, loop):
                         
                         send_telegram(text, parse_mode='Markdown')
 
+            elif text.startswith("/getids"):
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                trades = {}
+                try:
+                    trades = fut.result(timeout=5)
+                except Exception as e:
+                    log.error("Failed to get managed trades for /getids: %s", e)
+                    send_telegram("Error fetching trade data.")
+                    return
+                
+                if not trades:
+                    send_telegram("No open trades found.")
+                else:
+                    report_lines = ["*Open Trade IDs*"]
+                    for trade_id, v in trades.items():
+                        report_lines.append(f"- `{v['symbol']}`: `{trade_id}`")
+                    
+                    send_telegram("\n".join(report_lines), parse_mode='Markdown')
+
+            elif text.startswith("/starttrail"):
+                parts = text.split()
+                if len(parts) != 2:
+                    send_telegram("Usage: /starttrail <trade_id>")
+                    return
+
+                trade_id = parts[1]
+                
+                async def _task():
+                    async with managed_trades_lock:
+                        if trade_id not in managed_trades:
+                            await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
+                            return
+
+                        trade = managed_trades[trade_id]
+                        strategy_id = trade.get('strategy_id')
+                        
+                        flag_updated = False
+                        if strategy_id == 3:
+                            trade['s3_trailing_active'] = True
+                            flag_updated = True
+                        elif strategy_id == 4:
+                            trade['s4_trailing_active'] = True
+                            flag_updated = True
+                        elif strategy_id in [1, 2]:
+                            trade['trailing_active'] = True
+                            flag_updated = True
+                        
+                        if flag_updated:
+                            await asyncio.to_thread(add_managed_trade_to_db, trade)
+                            if firebase_db:
+                                try:
+                                    await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, trade)
+                                except Exception as e:
+                                    log.exception(f"Firebase update failed for /starttrail {trade_id}: {e}")
+                            await asyncio.to_thread(send_telegram, f"✅ Trailing has been manually **STARTED** for trade `{trade_id}`.", parse_mode='Markdown')
+                        else:
+                            await asyncio.to_thread(send_telegram, f"⚠️ Trade `{trade_id}` (Strategy S{strategy_id}) does not support manual trailing.", parse_mode='Markdown')
+
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try: fut.result(timeout=15)
+                except Exception as e:
+                    log.error(f"Failed to execute /starttrail: {e}")
+                    send_telegram("An error occurred processing /starttrail.")
+
+            elif text.startswith("/stoptrail"):
+                parts = text.split()
+                if len(parts) != 2:
+                    send_telegram("Usage: /stoptrail <trade_id>")
+                    return
+
+                trade_id = parts[1]
+                
+                async def _task():
+                    async with managed_trades_lock:
+                        if trade_id not in managed_trades:
+                            await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
+                            return
+
+                        trade = managed_trades[trade_id]
+                        strategy_id = trade.get('strategy_id')
+                        
+                        flag_updated = False
+                        if strategy_id == 3:
+                            trade['s3_trailing_active'] = False
+                            flag_updated = True
+                        elif strategy_id == 4:
+                            trade['s4_trailing_active'] = False
+                            flag_updated = True
+                        elif strategy_id in [1, 2]:
+                            trade['trailing_active'] = False
+                            flag_updated = True
+                        
+                        if flag_updated:
+                            await asyncio.to_thread(add_managed_trade_to_db, trade)
+                            if firebase_db:
+                                try:
+                                    await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, trade)
+                                except Exception as e:
+                                    log.exception(f"Firebase update failed for /stoptrail {trade_id}: {e}")
+                            await asyncio.to_thread(send_telegram, f"✅ Trailing has been manually **STOPPED** for trade `{trade_id}`.", parse_mode='Markdown')
+                        else:
+                            await asyncio.to_thread(send_telegram, f"⚠️ Trade `{trade_id}` (Strategy S{strategy_id}) does not support manual trailing.", parse_mode='Markdown')
+
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try: fut.result(timeout=15)
+                except Exception as e:
+                    log.error(f"Failed to execute /stoptrail: {e}")
+                    send_telegram("An error occurred processing /stoptrail.")
+
             elif text.startswith("/sessions"):
                 send_telegram("Checking session status...")
                 now_utc = datetime.now(timezone.utc)
@@ -5173,32 +5281,38 @@ def handle_update_sync(update, loop):
             elif text.startswith("/help"):
                 help_text = (
                     "*KAMA Bot Commands*\n\n"
-                    "*Trading Control*\n"
-                    "- `/startbot`: Starts the bot (resumes scanning for trades).\n"
-                    "- `/stopbot`: Stops the bot (pauses scanning for trades).\n"
-                    "- `/freeze`: Manually freezes the bot, preventing all new trades.\n"
-                    "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n"
-                    "- `/forcetrade <S1-S4> <SYMBOL> <buy|sell>`: Forces an immediate market trade.\n\n"
-                    "*Information & Reports*\n"
-                    "- `/status`: Shows a detailed status of the bot.\n"
-                    "- `/listorders`: Lists all currently open trades with details.\n"
-                    "- `/listpending`: Lists all pending limit orders that have not been filled.\n"
-                    "- `/sessions`: Reports the current session freeze status.\n"
-                    "- `/rejects`: Shows a report of the last 5 rejected trade opportunities.\n"
-                    "- `/report`: Generates an overall performance report.\n"
-                    "- `/stratreport`: Generates a side-by-side strategy performance report.\n"
-                    "- `/chart <SYMBOL>`: Generates a detailed chart for a symbol.\n\n"
-                    "*Configuration*\n"
-                    "- `/showparams`: Displays all configurable bot parameters.\n"
-                    "- `<KEY> = <VALUE>`: Sets a parameter (e.g., `MAX_CONCURRENT_TRADES = 4`).\n\n"
-                    "*Utilities*\n"
-                    "- `/ip`: Shows the bot's public server IP address.\n"
-                    "- `/usage`: Displays the current CPU and memory usage.\n"
-                    "- `/validate`: Performs a sanity check on the configuration.\n"
-                    "- `/help`: Displays this help message.\n\n"
-                    "*Testing*\n"
-                    "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
-                    "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP."
+                    "**--- Core Controls ---**\n"
+                    "`/startbot`: Resumes scanning for new trades.\n"
+                    "`/stopbot`: Pauses scanning for new trades.\n"
+                    "`/freeze`: Freezes the bot (no new entries).\n"
+                    "`/unfreeze`: Unfreezes the bot & overrides session freeze.\n\n"
+
+                    "**--- Trade Management ---**\n"
+                    "`/listorders`: Lists all currently open trades.\n"
+                    "`/getids`: Lists open trades with symbols and IDs.\n"
+                    "`/starttrail <id>`: Manually starts trailing for a trade.\n"
+                    "`/stoptrail <id>`: Manually stops trailing for a trade.\n"
+                    "`/forcetrade <S> <SYM> <side>`: Forces market entry (e.g., `/forcetrade S4 BTCUSDT buy`).\n"
+                    "`/listpending`: Lists all pending limit orders.\n\n"
+
+                    "**--- Info & Reports ---**\n"
+                    "`/status`: Shows a detailed status of the bot.\n"
+                    "`/sessions`: Reports the session freeze status.\n"
+                    "`/rejects`: Shows the last 5 rejected trades.\n"
+                    "`/report`: Generates an overall performance report.\n"
+                    "`/stratreport`: Generates a strategy comparison report.\n"
+                    "`/chart <SYMBOL>`: Generates a detailed chart.\n\n"
+
+                    "**--- Configuration ---**\n"
+                    "`/showparams`: Displays all bot parameters.\n"
+                    "`<KEY> = <VALUE>`: Sets a parameter (e.g., `MAX_CONCURRENT_TRADES = 5`).\n\n"
+
+                    "**--- Utilities & Testing ---**\n"
+                    "`/ip`: Shows the bot's public IP address.\n"
+                    "`/usage`: Displays current CPU and memory usage.\n"
+                    "`/validate`: Performs a configuration sanity check.\n"
+                    "`/testorder <S> [SYM]`: Places a non-executing test order.\n"
+                    "`/help`: Displays this help message."
                 )
                 async def _task():
                     await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
