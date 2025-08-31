@@ -376,7 +376,8 @@ async def reconcile_open_trades():
                     "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
                     "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
                     "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
-                    "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0 # Risk is unknown for imported trades
+                    "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0, # Risk is unknown for imported trades
+                    "strategy_id": 1 # Default to S1 for generic trailing
                 }
 
                 # Add to managed trades and save to DB
@@ -385,6 +386,9 @@ async def reconcile_open_trades():
                 if firebase_db:
                     try:
                         await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+                    except firebase_admin.exceptions.NotFoundError:
+                        log.error(f"Firebase save failed for {trade_id}: 'managed_trades' path not found. Please ensure your Realtime Database is set up correctly.")
+                        # Do not send a telegram message here to avoid spamming on repeated startup failures.
                     except Exception as e:
                         log.exception(f"Failed to save imported trade {trade_id} to Firebase: {e}")
 
@@ -478,7 +482,8 @@ async def check_and_import_rogue_trades():
                     "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
                     "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
                     "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
-                    "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0
+                    "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0,
+                    "strategy_id": 1 # Default to S1 for generic trailing
                 }
 
                 # Cancel any existing SL/TP orders for this symbol before placing new ones
@@ -494,6 +499,8 @@ async def check_and_import_rogue_trades():
                 if firebase_db:
                     try:
                         await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+                    except firebase_admin.exceptions.NotFoundError:
+                        log.error(f"Firebase save failed for {trade_id}: 'managed_trades' path not found. Please ensure your Realtime Database is set up correctly.")
                     except Exception as e:
                         log.exception(f"Failed to save imported trade {trade_id} to Firebase: {e}")
 
@@ -826,18 +833,15 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     else:
         error_details = "N/A"
 
-    # Sanitize the context message for MarkdownV1
-    escape_chars = r'_*`['
-    safe_context = re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', context_msg)
     exc_type_name = type(exc).__name__ if exc else 'N/A'
 
-    # Format a user-friendly message. Use a pre-formatted code block for details
-    # to avoid any markdown parsing issues with the exception content.
+    # Format a user-friendly message. Use a pre-formatted code block for all
+    # dynamic content to avoid any markdown parsing issues.
     # Use MarkdownV1 syntax (* for bold).
     telegram_msg = (
         f"🚨 *Bot Error* 🚨\n\n"
-        f"*Context:* {safe_context}\n"
-        f"*Error Type:* {exc_type_name}\n"
+        f"*Context:*\n`{context_msg}`\n\n"
+        f"*Error Type:*\n`{exc_type_name}`\n\n"
         f"*Details:*\n"
         f"```\n"
         f"{error_details}\n"
@@ -1922,7 +1926,7 @@ def cancel_trade_sltp_orders_sync(trade_meta: Dict[str, Any]):
     try:
         log.info(f"Cancelling {len(order_ids_to_cancel)} specific orders for trade {trade_meta.get('id')} on {symbol}.")
         str_order_ids = [str(oid) for oid in order_ids_to_cancel]
-        client.futures_cancel_batch_order(symbol=symbol, orderIdList=str_order_ids)
+        client.futures_cancel_orders(symbol=symbol, orderIdList=str_order_ids)
         
         time.sleep(0.5)
         log.info(f"Cancellation request sent for trade {trade_meta.get('id')}.")
@@ -1956,7 +1960,7 @@ def cancel_close_orders_sync(symbol: str):
             return
 
         log.info(f"Cancelling batch of {len(order_ids_to_cancel)} orders for {symbol}.")
-        client.futures_cancel_batch_order(symbol=symbol, orderIdList=order_ids_to_cancel)
+        client.futures_cancel_orders(symbol=symbol, orderIdList=order_ids_to_cancel)
         
         # Add a short delay to allow the exchange to process the cancellation
         time.sleep(1)
@@ -2392,7 +2396,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: Optio
         _record_rejection(symbol, "Invalid ATR value", {'atr': atr_now})
         return
 
-    sl_distance_atr = CONFIG["SL_TP_ATR_MULT"] * atr_now
+    sl_distance_atr = CONFIG["STRATEGY_EXIT_PARAMS"]['1']["ATR_MULTIPLIER"] * atr_now
     stop_price = limit_price - sl_distance_atr if side == 'BUY' else limit_price + sl_distance_atr
     take_price = limit_price + (2 * sl_distance_atr) if side == 'BUY' else limit_price - (2 * sl_distance_atr)
 
@@ -2623,7 +2627,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     if atr_now <= 0:
         _record_rejection(symbol, "S2-Invalid ATR value", {'atr': atr_now})
         return
-    tp_distance = atr_now * CONFIG["SL_TP_ATR_MULT"] * 1.5
+    tp_distance = atr_now * CONFIG["STRATEGY_EXIT_PARAMS"]['2']["ATR_MULTIPLIER"] * 1.5
     take_price = limit_price + tp_distance if side == 'BUY' else limit_price - tp_distance
 
     # 7. Calculate position size with confidence scaling
@@ -4739,9 +4743,8 @@ def build_control_keyboard():
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
         [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
         [KeyboardButton("/listorders"), KeyboardButton("/getids")],
-        [KeyboardButton("/starttrail"), KeyboardButton("/stoptrail")],
-        [KeyboardButton("/status"), KeyboardButton("/listpending")],
-        [KeyboardButton("/usage"), KeyboardButton("/rejects"), KeyboardButton("/help")]
+        [KeyboardButton("/status"), KeyboardButton("/rejects")],
+        [KeyboardButton("/usage"), KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -5101,7 +5104,7 @@ def handle_update_sync(update, loop):
                         elif strategy_id == 4:
                             trade['s4_trailing_active'] = True
                             flag_updated = True
-                        elif strategy_id in [1, 2]:
+                        elif strategy_id in [1, 2, None]: # Handle generic and imported trades
                             trade['trailing_active'] = True
                             flag_updated = True
                         
@@ -5146,7 +5149,7 @@ def handle_update_sync(update, loop):
                         elif strategy_id == 4:
                             trade['s4_trailing_active'] = False
                             flag_updated = True
-                        elif strategy_id in [1, 2]:
+                        elif strategy_id in [1, 2, None]: # Handle generic and imported trades
                             trade['trailing_active'] = False
                             flag_updated = True
                         
