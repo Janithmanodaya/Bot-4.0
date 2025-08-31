@@ -3231,6 +3231,184 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
 
 
+async def force_trade_entry(strategy_id: int, symbol: str, side: str):
+    """
+    Forces an immediate market entry for a given strategy, symbol, and side,
+    bypassing normal signal checks but using the strategy's risk and SL logic.
+    """
+    log.info(f"--- FORCE TRADE INITIATED: S{strategy_id} {symbol} {side} ---")
+    
+    # Pre-trade check: is a trade already open for this symbol?
+    async with managed_trades_lock:
+        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+            await asyncio.to_thread(send_telegram, f"❌ Cannot force trade. A trade for `{symbol}` already exists and hedging is disabled.", parse_mode='Markdown')
+            return
+
+    try:
+        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
+        current_price = df['close'].iloc[-1]
+        
+        # --- Strategy-Specific Parameter Calculation ---
+        sl_price = 0.0
+        risk_usdt = 0.0
+        qty = 0.0
+        leverage = 0
+        trade_meta_extra = {}
+
+        if strategy_id == 1:
+            s_params = CONFIG['STRATEGY_1']
+            df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
+            atr_now = df['atr'].iloc[-1]
+            sl_distance = CONFIG["STRATEGY_EXIT_PARAMS"]['1']["ATR_MULTIPLIER"] * atr_now
+            sl_price = current_price - sl_distance if side == 'BUY' else current_price + sl_distance
+            
+            price_distance = abs(current_price - sl_price)
+            balance = await asyncio.to_thread(get_account_balance_usdt)
+            risk_usdt = calculate_risk_amount(balance, strategy_id=1)
+            qty = risk_usdt / price_distance if price_distance > 0 else 0.0
+            trade_meta_extra = {"atr_at_entry": atr_now}
+
+        elif strategy_id == 2:
+            s_params = CONFIG['STRATEGY_2']
+            supertrend(df, period=s_params['SUPERTREND_PERIOD'], multiplier=s_params['SUPERTREND_MULTIPLIER'])
+            sl_price = df['supertrend'].iloc[-1]
+            
+            price_distance = abs(current_price - sl_price)
+            balance = await asyncio.to_thread(get_account_balance_usdt)
+            risk_usdt = calculate_risk_amount(balance, strategy_id=2)
+            # For forced trades, we use full risk, no confidence scaling
+            qty = risk_usdt / price_distance if price_distance > 0 else 0.0
+            trade_meta_extra = {"atr_at_entry": atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]}
+
+        elif strategy_id == 3:
+            s_params = CONFIG['STRATEGY_3']
+            stop_pct = s_params['INITIAL_STOP_PCT']
+            sl_price = current_price * (1 - stop_pct) if side == 'BUY' else current_price * (1 + stop_pct)
+            
+            balance = await asyncio.to_thread(get_account_balance_usdt)
+            risk_usdt = s_params['MAX_LOSS_USD_SMALL_BALANCE'] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else s_params['MAX_LOSS_USD_LARGE_BALANCE']
+            price_distance = abs(current_price - sl_price)
+            qty = risk_usdt / price_distance if price_distance > 0 else 0.0
+            
+            df['atr2'] = atr_wilder(df, length=s_params['TRAILING_ATR_PERIOD'])
+            trade_meta_extra = {
+                "atr_at_entry": df['atr2'].iloc[-1],
+                "s3_trailing_active": False,
+                "s3_trailing_stop": sl_price,
+            }
+
+        elif strategy_id == 4:
+            s_params = CONFIG['STRATEGY_4']
+            stop_pct = s_params['INITIAL_STOP_PCT']
+            sl_price = current_price * (1 - stop_pct) if side == 'BUY' else current_price * (1 + stop_pct)
+            
+            risk_usdt = s_params['RISK_USD']
+            price_distance = abs(current_price - sl_price)
+            qty = risk_usdt / price_distance if price_distance > 0 else 0.0
+            
+            df['atr2'] = atr_wilder(df, length=s_params['TRAILING_ATR_PERIOD'])
+            df['hhv10'] = hhv(df['high'], length=s_params['TRAILING_HHV_PERIOD'])
+            df['llv10'] = llv(df['low'], length=s_params['TRAILING_HHV_PERIOD'])
+            trail_dist = s_params['TRAILING_ATR_MULTIPLIER'] * df['atr2'].iloc[-1]
+            if side == 'BUY':
+                initial_trail_stop = max(df['hhv10'].iloc[-1] - trail_dist, current_price - trail_dist)
+            else:
+                initial_trail_stop = min(df['llv10'].iloc[-1] + trail_dist, current_price + trail_dist)
+
+            trade_meta_extra = {
+                "s4_trailing_stop": initial_trail_stop,
+                "s4_last_candle_ts": df.index[-1].isoformat(),
+                "s4_trailing_active": False,
+            }
+        
+        else:
+            await asyncio.to_thread(send_telegram, f"❌ Invalid strategy ID `{strategy_id}` for force trade.", parse_mode='Markdown')
+            return
+
+        # --- Common Sizing & Leverage Calculation ---
+        min_notional = CONFIG["MIN_NOTIONAL_USDT"]
+        notional_val = qty * current_price
+        if notional_val < min_notional:
+            qty = min_notional / current_price if current_price > 0 else 0.0
+        
+        qty = await asyncio.to_thread(round_qty, symbol, qty)
+
+        if qty <= 0:
+            await asyncio.to_thread(send_telegram, f"❌ Calculated quantity for force trade is zero. Aborting.", parse_mode='Markdown')
+            return
+            
+        actual_risk_usdt = abs(current_price - sl_price) * qty
+        notional = qty * current_price
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(leverage, max_leverage))
+        
+        # --- Execute Trade ---
+        log.info(f"FORCE TRADE: Placing MARKET {side} order for {qty} {symbol} with {leverage}x leverage.")
+        await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
+        
+        # Give exchange time to update position
+        time.sleep(2) 
+        positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+        position_side = 'LONG' if side == 'BUY' else 'SHORT'
+        pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+        
+        if not pos:
+             raise RuntimeError(f"Position for {symbol} not found after forced market order.")
+        
+        actual_entry_price = float(pos['entryPrice'])
+        actual_qty = abs(float(pos['positionAmt']))
+
+        # Recalculate SL based on actual entry price for accuracy
+        if strategy_id in [1, 2]:
+            # ATR/Supertrend based SLs don't change with entry price
+            pass 
+        elif strategy_id == 3:
+            sl_price = actual_entry_price * (1 - CONFIG['STRATEGY_3']['INITIAL_STOP_PCT']) if side == 'BUY' else actual_entry_price * (1 + CONFIG['STRATEGY_3']['INITIAL_STOP_PCT'])
+        elif strategy_id == 4:
+            sl_price = actual_entry_price * (1 - CONFIG['STRATEGY_4']['INITIAL_STOP_PCT']) if side == 'BUY' else actual_entry_price * (1 + CONFIG['STRATEGY_4']['INITIAL_STOP_PCT'])
+
+        log.info(f"FORCE TRADE: Placing SL for {symbol} at {sl_price}")
+        sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
+        
+        # --- Create and Store Trade Metadata ---
+        trade_id = f"{symbol}_S{strategy_id}_FORCED_{int(time.time())}"
+        meta = {
+            "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
+            "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
+            "leverage": leverage, "sl": sl_price, "tp": 0, # Forced trades have no TP
+            "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
+            "risk_usdt": actual_risk_usdt, "strategy_id": strategy_id,
+            "entry_reason": "FORCED_MANUAL",
+            "be_moved": False, # Ensure this is set for new trades
+            "trailing_active": False,
+        }
+        meta.update(trade_meta_extra)
+
+        async with managed_trades_lock:
+            managed_trades[trade_id] = meta
+        
+        await asyncio.to_thread(add_managed_trade_to_db, meta)
+        if firebase_db:
+             await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
+
+        msg = (
+            f"✅ *Forced Trade Executed: S{strategy_id}*\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Entry:** `{actual_entry_price:.4f}`\n"
+            f"**Stop Loss:** `{sl_price:.4f}`\n"
+            f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"Failed to execute force trade for S{strategy_id} on {symbol}", e)
+
+
 def calculate_trailing_distance(strategy_id: str, volatility_ratio: float, trend_strength: float) -> float:
     """Calculate dynamic trailing distance based on multiple factors."""
     # Ensure strategy_id is a valid key
@@ -4991,7 +5169,8 @@ def handle_update_sync(update, loop):
                     "- `/startbot`: Starts the bot (resumes scanning for trades).\n"
                     "- `/stopbot`: Stops the bot (pauses scanning for trades).\n"
                     "- `/freeze`: Manually freezes the bot, preventing all new trades.\n"
-                    "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n\n"
+                    "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n"
+                    "- `/forcetrade <S1-S4> <SYMBOL> <buy|sell>`: Forces an immediate market trade.\n\n"
                     "*Information & Reports*\n"
                     "- `/status`: Shows a detailed status of the bot.\n"
                     "- `/listorders`: Lists all currently open trades with details.\n"
@@ -5075,6 +5254,43 @@ def handle_update_sync(update, loop):
                 except Exception as e:
                     log.error(f"Failed to execute test order for S{strategy_id} on {symbol}: {e}")
                     send_telegram(f"❌ Failed to execute test order: {e}")
+            elif text.startswith("/forcetrade"):
+                parts = text.split()
+                if len(parts) != 4:
+                    send_telegram("Usage: /forcetrade <S1|S2|S3|S4> <SYMBOL> <buy|sell>")
+                    return
+
+                strategy_id_str = parts[1].upper()
+                symbol = parts[2].upper()
+                side_str = parts[3].lower()
+
+                if strategy_id_str not in ["S1", "S2", "S3", "S4"]:
+                    send_telegram(f"Invalid strategy: {strategy_id_str}. Please use S1, S2, S3, or S4.")
+                    return
+                
+                strategy_id = int(strategy_id_str[1:])
+                
+                if symbol not in CONFIG["SYMBOLS"]:
+                   send_telegram(f"Symbol {symbol} is not in the bot's symbol list. Add it via config if you want to trade it.")
+                   return
+
+                if side_str not in ['buy', 'sell']:
+                    send_telegram(f"Invalid side: `{side_str}`. Must be 'buy' or 'sell'.", parse_mode='Markdown')
+                    return
+                
+                side = 'BUY' if side_str == 'buy' else 'SELL'
+                
+                send_telegram(f"🚀 Initiating force trade for S{strategy_id} on {symbol} ({side})...")
+                
+                async def _task():
+                    await force_trade_entry(strategy_id, symbol, side)
+
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try:
+                    fut.result(timeout=60) # Give it a long timeout for the trade execution
+                except Exception as e:
+                    log.error(f"Failed to execute force trade for S{strategy_id} on {symbol}: {e}")
+                    send_telegram(f"❌ Failed to execute force trade: {e}")
             elif text.startswith("/scalein"):
                 parts = text.split()
                 if len(parts) < 3:
