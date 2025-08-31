@@ -3331,7 +3331,15 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
         if notional_val < min_notional:
             qty = min_notional / current_price if current_price > 0 else 0.0
         
-        qty = await asyncio.to_thread(round_qty, symbol, qty)
+        # Round up to the nearest step size
+        step_size = await asyncio.to_thread(get_step_size, symbol)
+        if step_size is not None and step_size > 0:
+            qty_dec = Decimal(str(qty))
+            step_dec = Decimal(str(step_size))
+            
+            num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
+            final_qty_dec = num_steps * step_dec
+            qty = float(final_qty_dec)
 
         if qty <= 0:
             await asyncio.to_thread(send_telegram, f"❌ Calculated quantity for force trade is zero. Aborting.", parse_mode='Markdown')
