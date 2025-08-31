@@ -363,7 +363,7 @@ async def reconcile_open_trades():
                 # Calculate a default SL/TP based on current ATR
                 df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
                 atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
+                sl_distance = CONFIG['STRATEGY_EXIT_PARAMS']['1']['ATR_MULTIPLIER'] * atr_now
                 
                 stop_price = entry_price - sl_distance if side == 'BUY' else entry_price + sl_distance
                 take_price = entry_price + sl_distance if side == 'BUY' else entry_price - sl_distance
@@ -466,7 +466,7 @@ async def check_and_import_rogue_trades():
 
                 df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 200)
                 atr_now = atr(df, CONFIG["ATR_LENGTH"]).iloc[-1]
-                sl_distance = CONFIG["SL_TP_ATR_MULT"] * atr_now
+                sl_distance = CONFIG['STRATEGY_EXIT_PARAMS']['1']['ATR_MULTIPLIER'] * atr_now
                 
                 stop_price = entry_price - sl_distance if side == 'BUY' else entry_price + sl_distance
                 take_price = entry_price + sl_distance if side == 'BUY' else entry_price - sl_distance
@@ -820,21 +820,28 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
 
     # For Binance API exceptions, extract more details
     if exc and isinstance(exc, BinanceAPIException):
-        error_details = f"Code: `{exc.code}`, Message: `{exc.message}`"
+        error_details = f"Code: {exc.code}, Message: {exc.message}"
     elif exc:
         error_details = str(exc)
     else:
         error_details = "N/A"
 
-    # Sanitize the error details for Telegram's Markdown
-    error_details = error_details.replace('`', "'")
+    # Sanitize the context message for MarkdownV1
+    escape_chars = r'_*`['
+    safe_context = re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', context_msg)
+    exc_type_name = type(exc).__name__ if exc else 'N/A'
 
-    # Format a user-friendly message
+    # Format a user-friendly message. Use a pre-formatted code block for details
+    # to avoid any markdown parsing issues with the exception content.
+    # Use MarkdownV1 syntax (* for bold).
     telegram_msg = (
-        f"🚨 **Bot Error** 🚨\n\n"
-        f"**Context:** {context_msg}\n"
-        f"**Error Type:** `{type(exc).__name__ if exc else 'N/A'}`\n"
-        f"**Details:** {error_details}\n\n"
+        f"🚨 *Bot Error* 🚨\n\n"
+        f"*Context:* {safe_context}\n"
+        f"*Error Type:* {exc_type_name}\n"
+        f"*Details:*\n"
+        f"```\n"
+        f"{error_details}\n"
+        f"```\n\n"
         f"Check the logs for the full traceback if available."
     )
     
@@ -4732,6 +4739,7 @@ def build_control_keyboard():
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
         [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
         [KeyboardButton("/listorders"), KeyboardButton("/getids")],
+        [KeyboardButton("/starttrail"), KeyboardButton("/stoptrail")],
         [KeyboardButton("/status"), KeyboardButton("/listpending")],
         [KeyboardButton("/usage"), KeyboardButton("/rejects"), KeyboardButton("/help")]
     ]
