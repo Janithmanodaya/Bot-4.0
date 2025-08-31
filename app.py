@@ -122,8 +122,8 @@ CONFIG = {
         "MAX_LOSS_USD_LARGE_BALANCE": float(os.getenv("S3_MAX_LOSS_LARGE", "1.00")),
     },
     "STRATEGY_4": { # Advanced SuperTrend v2 strategy
-        "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "7")), # Uses a standard ST for signals
-        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "2.0")),
+        "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "20")), # Uses a standard ST for signals
+        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "3.0")),
         "TRAILING_ATR_PERIOD": int(os.getenv("S4_TRAIL_ATR_PERIOD", "2")),
         "TRAILING_HHV_PERIOD": int(os.getenv("S4_TRAIL_HHV_PERIOD", "10")),
         "TRAILING_ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")),
@@ -1065,6 +1065,9 @@ def init_db():
     try:
         cur.execute("ALTER TABLE managed_trades ADD COLUMN s4_last_candle_ts TEXT")
     except sqlite3.OperationalError: pass
+    try:
+        cur.execute("ALTER TABLE managed_trades ADD COLUMN s4_trailing_active INTEGER")
+    except sqlite3.OperationalError: pass
 
     conn.commit()
     conn.close()
@@ -1109,15 +1112,17 @@ def add_managed_trade_to_db(rec: Dict[str, Any]):
         rec.get('s3_trailing_stop'),
         # S4 specific fields
         rec.get('s4_trailing_stop'),
-        rec.get('s4_last_candle_ts')
+        rec.get('s4_last_candle_ts'),
+        int(rec.get('s4_trailing_active', False))
     )
     cur.execute("""
     INSERT OR REPLACE INTO managed_trades (
         id, symbol, side, entry_price, initial_qty, qty, notional,
         leverage, sl, tp, open_time, sltp_orders, trailing, dyn_sltp,
         tp1, tp2, tp3, trade_phase, be_moved, risk_usdt, strategy_id, atr_at_entry,
-        s3_trailing_active, s3_trailing_stop, s4_trailing_stop, s4_last_candle_ts
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        s3_trailing_active, s3_trailing_stop, s4_trailing_stop, s4_last_candle_ts,
+        s4_trailing_active
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, values)
     conn.commit()
     conn.close()
@@ -1172,6 +1177,7 @@ def load_managed_trades_from_db() -> Dict[str, Dict[str, Any]]:
         rec['dyn_sltp'] = bool(rec.get('dyn_sltp'))
         rec['be_moved'] = bool(rec.get('be_moved'))
         rec['s3_trailing_active'] = bool(rec.get('s3_trailing_active'))
+        rec['s4_trailing_active'] = bool(rec.get('s4_trailing_active'))
         trades[rec['id']] = rec
     return trades
 
@@ -3187,6 +3193,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 "risk_usdt": actual_risk_usdt, "strategy_id": 4,
                 "s4_trailing_stop": initial_trail_stop,
                 "s4_last_candle_ts": signal_candle.name.isoformat(),
+                "s4_trailing_active": False,
             }
 
             async with managed_trades_lock:
@@ -3711,81 +3718,92 @@ def monitor_thread_func():
                     elif strategy_id == '4':
                         # --- Advanced SuperTrend v2 (S4) Exit & Management Logic ---
                         s4_params = CONFIG['STRATEGY_4']
+                        current_price = df_monitor['close'].iloc[-1]
+                        entry_price = meta['entry_price']
                         
-                        # Get the latest closed candle from the pre-fetched data
-                        latest_candle = df_monitor.iloc[-1]
-                        last_checked_ts_str = meta.get('s4_last_candle_ts')
+                        # 1. Profit Gate Check to activate trailing
+                        if not meta.get('s4_trailing_active'):
+                            profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
+                            if profit_pct >= 0.005: # 0.5% profit
+                                log.info(f"S4: Profit gate hit for {tid}. Activating trailing stop.")
+                                with managed_trades_lock:
+                                    if tid in managed_trades:
+                                        managed_trades[tid]['s4_trailing_active'] = True
+                                        add_managed_trade_to_db(managed_trades[tid])
+                                send_telegram(f"📈 Trailing stop activated for S4 trade on {sym} at {profit_pct:.2f}% profit.")
+                                meta['s4_trailing_active'] = True # Update meta for the current loop iteration
                         
-                        if not last_checked_ts_str:
-                            log.warning(f"S4 trade {tid} is missing s4_last_candle_ts. Skipping.")
-                            continue
+                        # 2. Main Trailing Logic (only runs if active and on new candle)
+                        if meta.get('s4_trailing_active'):
+                            latest_candle = df_monitor.iloc[-1]
+                            last_checked_ts_str = meta.get('s4_last_candle_ts')
                             
-                        last_checked_ts = datetime.fromisoformat(last_checked_ts_str).astimezone(timezone.utc)
-                        latest_candle_ts = latest_candle.name.to_pydatetime().astimezone(timezone.utc)
-
-                        if latest_candle_ts > last_checked_ts:
-                            log.info(f"S4: New candle detected for {tid}. Time: {latest_candle_ts}, Last: {last_checked_ts}")
-                            
-                            # Recalculate all indicators on the fresh dataframe
-                            df_monitor['atr2'] = atr_wilder(df_monitor, length=s4_params['TRAILING_ATR_PERIOD'])
-                            df_monitor['hhv10'] = hhv(df_monitor['high'], length=s4_params['TRAILING_HHV_PERIOD'])
-                            df_monitor['llv10'] = llv(df_monitor['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-                            supertrend(df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
-                            newly_closed_candle = df_monitor.loc[latest_candle_ts]
-
-                            # SuperTrend Flip Exit Check
-                            st_direction = newly_closed_candle['supertrend_direction']
-                            if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
-                                log.info(f"S4 SuperTrend Flip Exit for {tid}.")
-                                cancel_trade_sltp_orders_sync(meta)
-                                close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid]['exit_reason'] = 'S4_SUPERTREND_FLIP'
+                            if not last_checked_ts_str:
+                                log.warning(f"S4 trade {tid} is missing s4_last_candle_ts. Skipping trailing logic.")
                                 continue
+                                
+                            last_checked_ts = datetime.fromisoformat(last_checked_ts_str).astimezone(timezone.utc)
+                            latest_candle_ts = latest_candle.name.to_pydatetime().astimezone(timezone.utc)
 
-                            # Trailing Stop Update (tighten-only)
-                            current_trailing_stop = meta.get('s4_trailing_stop', meta['sl'])
-                            trail_dist = s4_params['TRAILING_ATR_MULTIPLIER'] * newly_closed_candle['atr2']
-                            new_sl_candidate = None
-                            
-                            if side == 'BUY':
-                                candidate = newly_closed_candle['hhv10'] - trail_dist
-                                price_based = newly_closed_candle['close'] - trail_dist
-                                effective_candidate = max(candidate, price_based)
-                                if effective_candidate > current_trailing_stop:
-                                    new_sl_candidate = effective_candidate
-                            else: # SELL
-                                candidate = newly_closed_candle['llv10'] + trail_dist
-                                price_based = newly_closed_candle['close'] + trail_dist
-                                effective_candidate = min(candidate, price_based)
-                                if effective_candidate < current_trailing_stop:
-                                    new_sl_candidate = effective_candidate
-                            
-                            if new_sl_candidate:
-                                log.info(f"S4 Trailing SL update for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl_candidate:.4f}")
-                                current_trailing_stop = new_sl_candidate
+                            if latest_candle_ts > last_checked_ts:
+                                log.info(f"S4: New candle detected for active trail on {tid}.")
+                                
+                                df_monitor['atr2'] = atr_wilder(df_monitor, length=s4_params['TRAILING_ATR_PERIOD'])
+                                df_monitor['hhv10'] = hhv(df_monitor['high'], length=s4_params['TRAILING_HHV_PERIOD'])
+                                df_monitor['llv10'] = llv(df_monitor['low'], length=s4_params['TRAILING_HHV_PERIOD'])
+                                supertrend(df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
+                                newly_closed_candle = df_monitor.loc[latest_candle_ts]
+
+                                # SuperTrend Flip Exit Check
+                                st_direction = newly_closed_candle['supertrend_direction']
+                                if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
+                                    log.info(f"S4 SuperTrend Flip Exit for {tid}.")
+                                    cancel_trade_sltp_orders_sync(meta)
+                                    close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
+                                    with managed_trades_lock:
+                                        if tid in managed_trades:
+                                            managed_trades[tid]['exit_reason'] = 'S4_SUPERTREND_FLIP'
+                                    continue
+
+                                # Trailing Stop Update
+                                current_trailing_stop = meta.get('s4_trailing_stop', meta['sl'])
+                                trail_dist = s4_params['TRAILING_ATR_MULTIPLIER'] * newly_closed_candle['atr2']
+                                new_sl_candidate = None
+                                if side == 'BUY':
+                                    candidate = newly_closed_candle['hhv10'] - trail_dist
+                                    price_based = newly_closed_candle['close'] - trail_dist
+                                    effective_candidate = max(candidate, price_based)
+                                    if effective_candidate > current_trailing_stop:
+                                        new_sl_candidate = effective_candidate
+                                else: # SELL
+                                    candidate = newly_closed_candle['llv10'] + trail_dist
+                                    price_based = newly_closed_candle['close'] + trail_dist
+                                    effective_candidate = min(candidate, price_based)
+                                    if effective_candidate < current_trailing_stop:
+                                        new_sl_candidate = effective_candidate
+                                if new_sl_candidate:
+                                    log.info(f"S4 Trailing SL update for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl_candidate:.4f}")
+                                    current_trailing_stop = new_sl_candidate
+                                    with managed_trades_lock:
+                                        if tid in managed_trades:
+                                            managed_trades[tid]['s4_trailing_stop'] = new_sl_candidate
+
+                                # Candle-Body Close Exit Check
+                                close_price = newly_closed_candle['close']
+                                if (side == 'BUY' and close_price < current_trailing_stop) or (side == 'SELL' and close_price > current_trailing_stop):
+                                    log.info(f"S4 Trailing Stop Body-Close Exit for {tid}. Price: {close_price}, Stop: {current_trailing_stop}")
+                                    cancel_trade_sltp_orders_sync(meta)
+                                    close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
+                                    with managed_trades_lock:
+                                        if tid in managed_trades:
+                                            managed_trades[tid]['exit_reason'] = 'S4_TRAIL_STOP_BODY_CLOSE'
+                                    continue
+                                
+                                # Persist timestamp after processing
                                 with managed_trades_lock:
                                     if tid in managed_trades:
-                                        managed_trades[tid]['s4_trailing_stop'] = new_sl_candidate
-
-                            # Candle-Body Close Exit Check
-                            close_price = newly_closed_candle['close']
-                            if (side == 'BUY' and close_price < current_trailing_stop) or \
-                               (side == 'SELL' and close_price > current_trailing_stop):
-                                log.info(f"S4 Trailing Stop Body-Close Exit for {tid}. Price: {close_price}, Stop: {current_trailing_stop}")
-                                cancel_trade_sltp_orders_sync(meta) # Cancel hard SL
-                                close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid]['exit_reason'] = 'S4_TRAIL_STOP_BODY_CLOSE'
-                                continue
-
-                            # Persist updated state
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid]['s4_last_candle_ts'] = latest_candle_ts.isoformat()
-                                    add_managed_trade_to_db(managed_trades[tid])
+                                        managed_trades[tid]['s4_last_candle_ts'] = latest_candle_ts.isoformat()
+                                        add_managed_trade_to_db(managed_trades[tid])
                         
                         continue # End of S4 logic
 
@@ -4584,6 +4602,7 @@ async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
     try:
         # Fetch fresh data to ensure all calculations are based on the latest market state
         df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
+        df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
         
         # We'll use a dummy 'BUY' signal for all tests. The side doesn't matter much,
         # as we're just testing the calculation pipeline.
