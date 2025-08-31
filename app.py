@@ -2121,13 +2121,13 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     s2_params = CONFIG['STRATEGY_2']
     s3_params = CONFIG['STRATEGY_3']
     
-    volatility_ratio_s1 = last['atr'] / last['close']
+    volatility_ratio_s1 = last['atr'] / last['close'] if last['close'] > 0 else 0
     s1_allowed = volatility_ratio_s1 <= s1_params.get('MAX_VOLATILITY_FOR_ENTRY', 0.03)
     
     adx_value = last['adx']
     s2_allowed = adx_value >= s2_params.get('MIN_ADX_FOR_ENTRY', 15)
 
-    atr20_pct = (last['atr20'] / last['close']) * 100
+    atr20_pct = (last['atr20'] / last['close']) * 100 if last['close'] > 0 else 0
     s3_allowed = atr20_pct <= s3_params.get('VOLATILITY_MAX_ATR20_PCT', 3.0)
     
     # S4 is an evolution of S3, assume it runs under similar volatility conditions.
@@ -2148,33 +2148,43 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     elif mode == 4:
         if s4_allowed: strategy_id = 4
     elif mode == 0:  # Auto-select
-        # Highest priority for S4, then S3, then fallback to S1/S2 logic
-        if s4_allowed:
-            log.info(f"Auto-selecting Strategy 4 for {symbol}.")
-            strategy_id = 4
-        elif s3_allowed:
-            log.info(f"Auto-selecting Strategy 3 for {symbol}.")
-            strategy_id = 3
-        elif s1_allowed and not s2_allowed:
-            log.info(f"Auto-selecting Strategy 1 for {symbol}.")
-            strategy_id = 1
+        # Create a list of potential strategies to try in order of priority
+        potential_strategies = []
+        if s4_allowed: potential_strategies.append(4)
+        if s3_allowed: potential_strategies.append(3)
+        
+        # S1/S2 logic
+        if s1_allowed and not s2_allowed:
+            potential_strategies.append(1)
         elif not s1_allowed and s2_allowed:
-            log.info(f"Auto-selecting Strategy 2 for {symbol}.")
-            strategy_id = 2
+            potential_strategies.append(2)
         elif s1_allowed and s2_allowed:
             if volatility_ratio_s1 > 0.015:
-                log.info(f"High volatility detected for {symbol}, selecting SuperTrend strategy (2).")
-                strategy_id = 2
+                potential_strategies.append(2)
+                potential_strategies.append(1)
             else:
-                log.info(f"Low/Medium volatility detected for {symbol}, selecting BB strategy (1).")
-                strategy_id = 1
-    
+                potential_strategies.append(1)
+                potential_strategies.append(2)
+        
+        # Iterate through potential strategies and find the first one that is not restricted
+        for strat in potential_strategies:
+            if strat in [3, 4]:
+                allowed_symbols = ["BTCUSDT", "ETHUSDT"]
+                if symbol not in allowed_symbols:
+                    log.info(f"Auto-select: Strategy {strat} is restricted for {symbol}. Trying next.")
+                    continue # Try the next strategy in the priority list
+            
+            # If we reach here, the strategy is not restricted (or is S1/S2)
+            strategy_id = strat
+            log.info(f"Auto-selecting Strategy {strategy_id} for {symbol}.")
+            break # Exit the loop once a suitable strategy is found
+
     if not strategy_id:
         log.info(f"No suitable strategy found for {symbol} based on mode {mode} and market conditions.")
         return None
 
-    # --- Symbol Restriction Check ---
-    if strategy_id in [3, 4]:
+    # --- Symbol Restriction Check (for non-auto modes) ---
+    if mode in [3, 4] and strategy_id in [3, 4]:
         allowed_symbols = ["BTCUSDT", "ETHUSDT"]
         if symbol not in allowed_symbols:
             log.info(f"Strategy {strategy_id} is restricted and not allowed for {symbol}. Skipping.")
