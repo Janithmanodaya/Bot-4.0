@@ -5271,26 +5271,24 @@ async def run_full_testnet_test():
     Runs a full, end-to-end integration test on the Binance testnet.
     This function is self-contained and uses its own testnet client.
     """
-    TESTNET_API_KEY = "7fabcde36d70d00d01f9a3d21b38855450aec5c4348d2361fac5c6bd44afd872"
-    TESTNET_API_SECRET = "4c22d3644841e6912dd957a0dfbfd4a6475b7bb6bc3022261173de41f165949c"
+    # Use environment variables for testnet keys, with fallback to the old hardcoded keys
+    TESTNET_API_KEY = os.getenv("TESTNET_API_KEY", "7fabcde36d70d00d01f9a3d21b38855450aec5c4348d2361fac5c6bd44afd872")
+    TESTNET_API_SECRET = os.getenv("TESTNET_API_SECRET", "4c22d3644841e6912dd957a0dfbfd4a6475b7bb6bc3022261173de41f165949c")
     
-    test_client = None
+    temp_client = None
     report_lines = ["*Binance Testnet End-to-End Test Report*"]
     test_symbol = "BTCUSDT"
     test_trade_id = None # Initialize to None
-    
-    original_managed_trades = {}
     
     try:
         # --- Step 1: Initialize Testnet Client ---
         report_lines.append("\n*Step 1: Initialization*")
         await asyncio.to_thread(send_telegram, "1. Initializing testnet client...")
         
-        # Use a temporary client for the test run
+        # Use a temporary client for the test run, correctly enabling testnet mode
         temp_client = await asyncio.to_thread(
-            Client, TESTNET_API_KEY, TESTNET_API_SECRET
+            Client, TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True
         )
-        temp_client.API_URL = "https://testnet.binancefuture.com"
         report_lines.append("✅ Testnet client initialized.")
 
         # --- Step 2: Sanity Checks ---
@@ -5331,11 +5329,26 @@ async def run_full_testnet_test():
         entry_price = float(pos['entryPrice'])
         report_lines.append(f"✅ Position confirmed. Entry Price: `{entry_price}`")
 
+        # Create the mock trade object immediately after position confirmation
+        # This ensures test_trade_id is set before operations that might fail (like placing SL/TP)
+        sl_price = entry_price * 0.98
+        tp_price = entry_price * 1.02
+        test_trade_id = f"test_{int(time.time())}"
+        mock_trade = {
+            "id": test_trade_id, "symbol": test_symbol, "side": "BUY", "entry_price": entry_price,
+            "initial_qty": qty_to_open, "qty": qty_to_open, "notional": qty_to_open * entry_price,
+            "leverage": 10, "sl": sl_price, "tp": tp_price, "open_time": datetime.utcnow().isoformat(),
+            "sltp_orders": {}, "trailing_active": True, "be_moved": True, 'strategy_id': '1'
+        }
+        
+        # Add the mock trade to be managed. The monitor thread can now see it.
+        async with managed_trades_lock:
+            managed_trades[test_trade_id] = mock_trade
+        report_lines.append(f"✅ Mock trade `{test_trade_id}` created and is being monitored.")
+
         # --- Step 5: Place SL/TP ---
         report_lines.append("\n*Step 5: Place SL/TP*")
         await asyncio.to_thread(send_telegram, "5. Placing SL/TP orders...")
-        sl_price = entry_price * 0.98
-        tp_price = entry_price * 1.02
         
         # --- Hedge Mode Aware SL/TP ---
         position_mode = await asyncio.to_thread(temp_client.futures_get_position_mode)
@@ -5347,7 +5360,6 @@ async def run_full_testnet_test():
         tp_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, tp_price)}
         
         if is_hedge_mode:
-            # For a BUY trade, the positionSide is LONG for closing orders
             sl_order['positionSide'] = 'LONG'
             tp_order['positionSide'] = 'LONG'
         else:
@@ -5363,23 +5375,16 @@ async def run_full_testnet_test():
         )
         if any('code' in o for o in sl_tp_orders):
             raise RuntimeError(f"Failed to place SL/TP orders: {sl_tp_orders}. Batch sent: {sl_tp_batch}")
+        
+        # If successful, update the managed trade with the real order IDs
+        async with managed_trades_lock:
+            if test_trade_id in managed_trades:
+                managed_trades[test_trade_id]['sltp_orders'] = sl_tp_orders
         report_lines.append("✅ SL/TP orders placed successfully.")
 
         # --- Step 6: Trailing Stop Check ---
         report_lines.append("\n*Step 6: Trailing Stop Check*")
         await asyncio.to_thread(send_telegram, "6. Waiting 2 minutes to observe trailing stop... (This will depend on market movement)")
-        
-        # Create a mock trade object to be monitored by the real monitor thread
-        test_trade_id = f"test_{int(time.time())}"
-        mock_trade = {
-            "id": test_trade_id, "symbol": test_symbol, "side": "BUY", "entry_price": entry_price,
-            "initial_qty": qty_to_open, "qty": qty_to_open, "notional": qty_to_open * entry_price,
-            "leverage": 10, "sl": sl_price, "tp": tp_price, "open_time": datetime.utcnow().isoformat(),
-            "sltp_orders": sl_tp_orders, "trailing_active": True, "be_moved": True, 'strategy_id': '1'
-        }
-        
-        async with managed_trades_lock:
-            managed_trades[test_trade_id] = mock_trade
             
         await asyncio.sleep(120)
 
