@@ -722,20 +722,22 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
 
     # For Binance API exceptions, extract more details
     if exc and isinstance(exc, BinanceAPIException):
-        # Avoid markdown in the details themselves
         error_details = f"Code: {exc.code}, Message: {exc.message}"
     elif exc:
         error_details = str(exc)
     else:
         error_details = "N/A"
 
-    # Format a user-friendly message, wrapping dynamic content in code blocks
-    # to prevent markdown parsing errors.
+    # Consolidate dynamic content into a single block to avoid parsing errors
+    details_text = (
+        f"Context: {context_msg}\n"
+        f"Error Type: {type(exc).__name__ if exc else 'N/A'}\n"
+        f"Details: {error_details}"
+    )
+
     telegram_msg = (
         f"🚨 **Bot Error** 🚨\n\n"
-        f"**Context:**\n`{context_msg}`\n\n"
-        f"**Error Type:**\n`{type(exc).__name__ if exc else 'N/A'}`\n\n"
-        f"**Details:**\n`{error_details}`\n\n"
+        f"```\n{details_text}\n```\n\n"
         f"Check the logs for the full traceback if available."
     )
     
@@ -2882,15 +2884,28 @@ def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     s4_params = CONFIG['STRATEGY_4']
     required_len = max(s4_params['TRAILING_HHV_PERIOD'], s4_params['SUPERTREND_PERIOD']) + 5
     if len(df) < required_len: return None
+    
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
     side = None
+    
     if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1: side = 'BUY'
     elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1: side = 'SELL'
     if not side: return None
+    
     entry_price = float(signal_candle['close'])
-    stop_pct = s4_params['INITIAL_STOP_PCT']
-    sl_price = entry_price * (1 - stop_pct) if side == 'BUY' else entry_price * (1 + stop_pct)
+    
+    # Calculate the initial trail stop to use as the SL
+    trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['s4_atr2']
+    if side == 'BUY':
+        candidate_trail = signal_candle['s4_hhv10'] - trail_distance
+        price_based_trail = signal_candle['close'] - trail_distance
+        sl_price = max(candidate_trail, price_based_trail)
+    else: # SELL
+        candidate_trail = signal_candle['s4_llv10'] + trail_distance
+        price_based_trail = signal_candle['close'] + trail_distance
+        sl_price = min(candidate_trail, price_based_trail)
+        
     return {"strategy": "S4-AdvST", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": 0, "timestamp": signal_candle.name.isoformat()}
 
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
