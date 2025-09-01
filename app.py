@@ -218,6 +218,7 @@ overload_notified = False
 frozen = False
 daily_loss_limit_hit = False
 daily_profit_limit_hit = False
+ip_whitelist_error = False # Flag to track IP whitelist error
 current_daily_pnl = 0.0
 
 # Session freeze state
@@ -3283,9 +3284,13 @@ def get_account_balance_usdt():
     return 0.0
 
 def monitor_thread_func():
-    global managed_trades, last_trade_close_time, running, overload_notified, symbol_loss_cooldown, last_attention_alert_time
+    global managed_trades, last_trade_close_time, running, overload_notified, symbol_loss_cooldown, last_attention_alert_time, ip_whitelist_error
     log.info("Monitor thread started.")
     while not monitor_stop_event.is_set():
+        if ip_whitelist_error:
+            log.warning("IP whitelist error detected. Monitor thread sleeping for 1 hour.")
+            time.sleep(3600)
+            continue
         try:
             # Check for symbols that require manual attention
             conn = sqlite3.connect(CONFIG["DB_FILE"])
@@ -3475,22 +3480,16 @@ def monitor_thread_func():
                 log.error("Caught BinanceAPIException in monitor thread: %s", e)
                 
                 if e.code == -2015:
-                    # This is a fatal auth/IP error. The hosting platform should restart the service.
                     ip = get_public_ip()
                     error_msg = (
                         f"🚨 **CRITICAL AUTH ERROR** 🚨\n\n"
                         f"Binance API keys are invalid or the server's IP is not whitelisted.\n\n"
                         f"Error Code: `{e.code}`\n"
                         f"Server IP: `{ip}`\n\n"
-                        f"The bot will now trigger a graceful shutdown to get a new IP address. Please add the new IP to your Binance whitelist if the error persists."
+                        f"The bot is now paused. Please add the new IP to your Binance whitelist and use /startbot to resume."
                     )
                     send_telegram(error_msg, parse_mode='Markdown')
-                    # NOTE: Intentional forced-terminate so an external process manager (systemd / Docker) restarts the container
-                    # Make this behavior configurable to avoid killing dev environments.
-                    if CONFIG.get("AUTO_RESTART_ON_IP_ERROR", True):
-                        log.warning(f"IP Whitelist Error (Code: -2015). Server IP: {ip}. Sending SIGTERM to own process to trigger restart in 5 seconds...")
-                        time.sleep(5) # Give telegram a moment to send
-                        os.kill(os.getpid(), signal.SIGTERM)
+                    ip_whitelist_error = True
 
                 # Handle other, potentially transient, API errors
                 html_content = None
@@ -5250,8 +5249,11 @@ def telegram_polling_thread(loop):
             time.sleep(5)
 
 async def _set_running(val: bool):
-    global running
+    global running, ip_whitelist_error
     running = val
+    if val:
+        log.info("Resetting ip_whitelist_error flag.")
+        ip_whitelist_error = False
 
 async def _freeze_command():
     global frozen, session_freeze_override
