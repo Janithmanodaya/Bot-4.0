@@ -81,7 +81,7 @@ firebase_db = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": int(os.getenv("STRATEGY_MODE", "0")),  # 0=all, 1=BB, 2=SuperTrend, 3=AdvSuperTrend, 4=AdvSuperTrendV2
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4,1"),  # 0=all, or comma-separated, e.g., "1,2"
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -212,6 +212,15 @@ CONFIG = {
     "FIREBASE_DATABASE_URL": os.getenv("FIREBASE_DATABASE_URL", "https://techno-a3e6c-default-rtdb.firebaseio.com/"),
     "AUTO_RESTART_ON_IP_ERROR": os.getenv("AUTO_RESTART_ON_IP_ERROR", "true").lower() in ("true", "1", "yes"),
 }
+
+# --- Parse STRATEGY_MODE into a list of ints ---
+try:
+    # This will now be a list of ints, e.g., [1, 2] or [0]
+    CONFIG['STRATEGY_MODE'] = [int(x.strip()) for x in str(CONFIG['STRATEGY_MODE']).split(',')]
+except (ValueError, TypeError):
+    log.error(f"Invalid STRATEGY_MODE: '{CONFIG['STRATEGY_MODE']}'. Must be a comma-separated list of numbers. Defaulting to auto (0).")
+    CONFIG['STRATEGY_MODE'] = [0]
+
 
 running = (CONFIG["START_MODE"] == "running")
 overload_notified = False
@@ -2299,6 +2308,7 @@ indicator_cache = {}
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Pure-like function: accepts df (OHLCV), returns df with added indicator columns.
+    Optimized to only calculate indicators for the selected strategy mode.
     """
     max_lookback = max(
         CONFIG.get("SMA_LEN", 200),
@@ -2314,32 +2324,37 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
 
     out = df.copy()
+    modes = CONFIG["STRATEGY_MODE"] # This is now a list
 
-    # ---- Common Indicators ----
+    # ---- Common Indicators (calculated for most strategies) ----
     out['atr'] = atr(out, CONFIG["ATR_LENGTH"])
     adx(out, period=CONFIG['ADX_PERIOD'])
     out['rsi'] = rsi(out['close'], length=CONFIG['RSI_LEN'])
     macd(out)
 
-    # ---- Strategy 1 (BB) ----
-    s1_params = CONFIG['STRATEGY_1']
-    out['s1_bbu'], out['s1_bbl'] = bollinger_bands(out['close'], s1_params['BB_LENGTH'], s1_params['BB_STD'])
+    if 0 in modes or 1 in modes:
+        # ---- Strategy 1 (BB) ----
+        s1_params = CONFIG['STRATEGY_1']
+        out['s1_bbu'], out['s1_bbl'] = bollinger_bands(out['close'], s1_params['BB_LENGTH'], s1_params['BB_STD'])
     
-    # ---- Strategy 2 (SuperTrend) ----
-    s2_params = CONFIG['STRATEGY_2']
-    out['s2_st'], out['s2_st_dir'] = supertrend(out, period=s2_params['SUPERTREND_PERIOD'], multiplier=s2_params['SUPERTREND_MULTIPLIER'])
+    if 0 in modes or 2 in modes:
+        # ---- Strategy 2 (SuperTrend) ----
+        s2_params = CONFIG['STRATEGY_2']
+        out['s2_st'], out['s2_st_dir'] = supertrend(out, period=s2_params['SUPERTREND_PERIOD'], multiplier=s2_params['SUPERTREND_MULTIPLIER'])
     
-    # ---- Strategy 3 (MA Cross) ----
-    s3_params = CONFIG['STRATEGY_3']
-    out['s3_ma_fast'] = sma(out['close'], s3_params['FAST_MA'])
-    out['s3_ma_slow'] = sma(out['close'], s3_params['SLOW_MA'])
+    if 0 in modes or 3 in modes:
+        # ---- Strategy 3 (MA Cross) ----
+        s3_params = CONFIG['STRATEGY_3']
+        out['s3_ma_fast'] = sma(out['close'], s3_params['FAST_MA'])
+        out['s3_ma_slow'] = sma(out['close'], s3_params['SLOW_MA'])
 
-    # ---- Strategy 4 (Adv SuperTrend V2) ----
-    s4_params = CONFIG['STRATEGY_4']
-    out['s4_atr2'] = atr_wilder(out, length=s4_params['TRAILING_ATR_PERIOD'])
-    out['s4_hhv10'] = hhv(out['high'], length=s4_params['TRAILING_HHV_PERIOD'])
-    out['s4_llv10'] = llv(out['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-    out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
+    if 0 in modes or 4 in modes:
+        # ---- Strategy 4 (Adv SuperTrend V2) ----
+        s4_params = CONFIG['STRATEGY_4']
+        out['s4_atr2'] = atr_wilder(out, length=s4_params['TRAILING_ATR_PERIOD'])
+        out['s4_hhv10'] = hhv(out['high'], length=s4_params['TRAILING_HHV_PERIOD'])
+        out['s4_llv10'] = llv(out['low'], length=s4_params['TRAILING_HHV_PERIOD'])
+        out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
 
     return out
 
@@ -2390,18 +2405,18 @@ async def evaluate_and_enter(symbol: str):
                 indicator_cache.pop(oldest_key)
                 log.info(f"Indicator cache full (size > {MAX_CACHE_SIZE}). Evicted oldest item: {oldest_key}")
         
-        mode = CONFIG["STRATEGY_MODE"]
+        modes = CONFIG["STRATEGY_MODE"]
         
-        if mode in [0, 1]:
+        if 0 in modes or 1 in modes:
             await evaluate_strategy_bb(symbol, df)
         
-        if mode in [0, 2]:
+        if 0 in modes or 2 in modes:
             await evaluate_strategy_supertrend(symbol, df)
 
-        if mode in [0, 3]:
+        if 0 in modes or 3 in modes:
             await evaluate_strategy_3(symbol, df)
 
-        if mode in [0, 4]:
+        if 0 in modes or 4 in modes:
             await evaluate_strategy_4(symbol, df)
 
     except Exception as e:
