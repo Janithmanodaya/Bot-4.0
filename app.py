@@ -5288,8 +5288,9 @@ async def run_full_testnet_test():
         
         # Use a temporary client for the test run
         temp_client = await asyncio.to_thread(
-            Client, TESTNET_API_KEY, TESTNET_API_SECRET, testnet=True
+            Client, TESTNET_API_KEY, TESTNET_API_SECRET
         )
+        temp_client.API_URL = "https://testnet.binancefuture.com"
         report_lines.append("✅ Testnet client initialized.")
 
         # --- Step 2: Sanity Checks ---
