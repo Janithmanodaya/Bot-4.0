@@ -5338,7 +5338,9 @@ async def run_full_testnet_test():
         
         # --- Hedge Mode Aware SL/TP ---
         position_mode = await asyncio.to_thread(temp_client.futures_get_position_mode)
+        log.info(f"Testnet position mode response: {position_mode}")
         is_hedge_mode = position_mode.get('dualSidePosition', False)
+        log.info(f"Testnet is_hedge_mode determined as: {is_hedge_mode}")
         
         sl_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, sl_price)}
         tp_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, tp_price)}
