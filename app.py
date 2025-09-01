@@ -175,8 +175,7 @@ CONFIG = {
     # --- CORE ---
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
-    "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "20")),
-    "SCAN_COOLDOWN_MINUTES": int(os.getenv("SCAN_COOLDOWN_MINUTES", "3")),
+    "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "180")),
     "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
@@ -4261,7 +4260,7 @@ async def scanning_loop():
 
             if await manage_session_freeze_state():
                 log.info("Scan cycle skipped due to session freeze.")
-                cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
+                cooldown_seconds = CONFIG["SCAN_INTERVAL"]
                 await asyncio.sleep(cooldown_seconds)
                 continue
 
@@ -4277,9 +4276,9 @@ async def scanning_loop():
             scan_cycle_count += 1
             
             # Use the simple fixed cooldown for subsequent cycles
-            cooldown_seconds = CONFIG["SCAN_COOLDOWN_MINUTES"] * 60
+            cooldown_seconds = CONFIG["SCAN_INTERVAL"]
             next_scan_time = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
-            log.info(f"Scan cycle #{scan_cycle_count} complete. Cooling down for {CONFIG['SCAN_COOLDOWN_MINUTES']} minutes.")
+            log.info(f"Scan cycle #{scan_cycle_count} complete. Cooling down for {cooldown_seconds} seconds.")
             await asyncio.sleep(cooldown_seconds)
 
         except asyncio.CancelledError:
@@ -4867,6 +4866,7 @@ def handle_update_sync(update, loop):
                     time_until_next_scan = next_scan_time - datetime.now(timezone.utc)
                     if time_until_next_scan.total_seconds() > 0:
                         status_lines.append(f"⏳ Next Scan In: *{format_timedelta(time_until_next_scan)}*")
+                        status_lines.append(f"🗓️ Next Scan At: *{next_scan_time.strftime('%H:%M:%S')} UTC*")
 
                 # Next Candle Info
                 timeframe_str = CONFIG["TIMEFRAME"]
