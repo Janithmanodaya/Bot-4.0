@@ -2100,7 +2100,7 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
     df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
     for c in ['open','high','low','close','volume']:
-        df[c] = df[c].astype(float)
+        df[c] = df[c].astype('float32')
     df.set_index('close_time', inplace=True)
     return df[['open','high','low','close','volume']]
 
@@ -2363,7 +2363,7 @@ async def evaluate_and_enter(symbol: str):
             return
 
     try:
-        df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
+        df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 250)
         if df_raw is None or df_raw.empty:
             log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping evaluation.")
             return
@@ -2380,6 +2380,15 @@ async def evaluate_and_enter(symbol: str):
             log.info(f"Calculating new indicators for {symbol}")
             df = await asyncio.to_thread(calculate_all_indicators, df_raw)
             indicator_cache[cache_key] = {'last_ts': last_ts, 'df': df}
+
+            # --- Cache Management to prevent memory leak ---
+            # A simple cache eviction strategy: if cache grows too large, remove the oldest entry.
+            # Assumes Python 3.7+ where dicts are insertion ordered.
+            MAX_CACHE_SIZE = len(CONFIG.get("SYMBOLS", [])) * 2 + 5 # Buffer
+            if len(indicator_cache) > MAX_CACHE_SIZE:
+                oldest_key = next(iter(indicator_cache))
+                indicator_cache.pop(oldest_key)
+                log.info(f"Indicator cache full (size > {MAX_CACHE_SIZE}). Evicted oldest item: {oldest_key}")
         
         mode = CONFIG["STRATEGY_MODE"]
         
