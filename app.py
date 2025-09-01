@@ -5371,8 +5371,8 @@ async def run_full_testnet_test():
         is_hedge_mode = position_mode.get('dualSidePosition', False)
         log.info(f"Testnet is_hedge_mode determined as: {is_hedge_mode}")
         
-        sl_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, sl_price)}
-        tp_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, tp_price)}
+        sl_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'quantity': str(qty_to_open), 'stopPrice': round_price(test_symbol, sl_price)}
+        tp_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': str(qty_to_open), 'stopPrice': round_price(test_symbol, tp_price)}
         
         if is_hedge_mode:
             sl_order['positionSide'] = 'LONG'
