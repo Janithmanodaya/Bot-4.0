@@ -47,9 +47,6 @@ from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, 
 
 import mplfinance as mpf
 
-import firebase_admin
-from firebase_admin import credentials, db
-
 from dotenv import load_dotenv
 
 # Load .env file into environment (if present)
@@ -74,7 +71,6 @@ log = logging.getLogger("ema-bb-bot")
 client: Optional[Client] = None
 telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
-firebase_db = None
 
 # -------------------------
 # CONFIG (edit values here)
@@ -208,7 +204,6 @@ CONFIG = {
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
     "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
     "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "25")),
-    "FIREBASE_DATABASE_URL": os.getenv("FIREBASE_DATABASE_URL", "https://techno-a3e6c-default-rtdb.firebaseio.com/"),
     "AUTO_RESTART_ON_IP_ERROR": os.getenv("AUTO_RESTART_ON_IP_ERROR", "true").lower() in ("true", "1", "yes"),
 }
 
@@ -335,14 +330,6 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
         }
 
         await asyncio.to_thread(add_managed_trade_to_db, meta)
-        if firebase_db:
-            try:
-                validate_firebase_data(meta)
-                await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
-            except ValueError as e:
-                log.error(f"Firebase validation failed for imported trade {trade_id}: {e}")
-            except Exception as e:
-                log.exception(f"Failed to save imported trade {trade_id} to Firebase: {e}")
 
         await asyncio.to_thread(cancel_close_orders_sync, symbol)
         log.info(f"Attempting to place SL/TP for imported trade {symbol}. SL={stop_price}, TP={take_price}, Qty={qty}")
@@ -365,13 +352,13 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
 
 async def reconcile_open_trades():
     global managed_trades
-    log.info("--- Starting Trade Reconciliation (with Firebase data) ---")
+    log.info("--- Starting Trade Reconciliation (with DB data) ---")
 
-    fb_trades = {}
+    db_trades = {}
     async with managed_trades_lock:
-        fb_trades = dict(managed_trades)
+        db_trades = dict(managed_trades)
     
-    log.info(f"Found {len(fb_trades)} managed trade(s) in Firebase to reconcile.")
+    log.info(f"Found {len(db_trades)} managed trade(s) in DB to reconcile.")
 
     try:
         if client is None:
@@ -393,7 +380,7 @@ async def reconcile_open_trades():
     retained_trades = {}
     
     # 1. Reconcile trades that are already in the database
-    for trade_id, trade_meta in fb_trades.items():
+    for trade_id, trade_meta in db_trades.items():
         symbol = trade_meta['symbol']
         if symbol in open_positions:
             log.info(f"✅ Reconciled DB trade: {trade_id} ({symbol}) is active. Restoring.")
@@ -504,88 +491,30 @@ async def periodic_rogue_check_loop():
             await asyncio.sleep(60)
 
 
-def init_firebase_sync():
+def load_state_from_db_sync():
     """
-    Initializes the Firebase Admin SDK from an environment variable or a file.
-    Returns (ok: bool, error_message: str)
-    """
-    global firebase_db
-    try:
-        # Check for credentials in environment variable first
-        cred_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")
-        if cred_json_str:
-            log.info("Initializing Firebase from environment variable.")
-            cred_dict = json.loads(cred_json_str)
-            cred = credentials.Certificate(cred_dict)
-        else:
-            # Fallback to local file
-            log.info("Initializing Firebase from firebase_credentials.json file.")
-            if not os.path.exists("firebase_credentials.json"):
-                log.error("firebase_credentials.json not found and FIREBASE_CREDENTIALS_JSON env var is not set.")
-                send_telegram("🔥 Firebase Init Failed: Credentials not found.")
-                return False, "Credentials not found"
-            cred = credentials.Certificate("firebase_credentials.json")
-
-        # Check if Firebase app is already initialized
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred, {
-                'databaseURL': CONFIG['FIREBASE_DATABASE_URL']
-            })
-        else:
-            log.warning("Firebase app already initialized. Skipping re-initialization.")
-
-        firebase_db = db.reference()
-        log.info("Firebase connection initialized successfully.")
-        return True, ""
-    except Exception as e:
-        log.exception("Failed to initialize Firebase: %s", e)
-        err = f"Firebase init error: {e}"
-        send_telegram(f"🔥 Firebase Init Failed: {e}\nThe bot cannot persist state and may not function correctly.")
-        return False, err
-
-
-def load_state_from_firebase_sync():
-    """
-    Loads pending orders and managed trades from Firebase into memory on startup.
-    Handles cases where the database paths do not exist.
+    Loads pending orders and managed trades from the SQLite DB into memory on startup.
     """
     global pending_limit_orders, managed_trades
-    if not firebase_db:
-        log.warning("Firebase not initialized, cannot load state from Firebase.")
-        return
+    log.info("--- Loading State from Database ---")
+    
+    # Load managed trades
+    db_trades = load_managed_trades_from_db()
+    if db_trades:
+        with managed_trades_lock:
+            managed_trades.update(db_trades)
+        log.info(f"Loaded {len(db_trades)} managed trade(s) from DB.")
+    else:
+        log.info("No managed trades found in DB.")
 
-    log.info("--- Loading State from Firebase ---")
-    try:
-        # Load pending orders
-        try:
-            pending_data = firebase_db.child("pending_limit_orders").get()
-            if pending_data:
-                with pending_limit_orders_lock:
-                    pending_limit_orders.update(pending_data)
-                log.info(f"Loaded {len(pending_data)} pending order(s) from Firebase.")
-            else:
-                log.info("No pending orders found in Firebase.")
-        except firebase_admin.exceptions.NotFoundError:
-            log.info("'/pending_limit_orders' path not found in Firebase. Assuming no pending orders.")
-            pass # Path doesn't exist, which is fine
-
-        # Load managed trades
-        try:
-            trades_data = firebase_db.child("managed_trades").get()
-            if trades_data:
-                with managed_trades_lock:
-                    managed_trades.update(trades_data)
-                log.info(f"Loaded {len(trades_data)} managed trade(s) from Firebase.")
-            else:
-                log.info("No managed trades found in Firebase.")
-        except firebase_admin.exceptions.NotFoundError:
-            log.info("'/managed_trades' path not found in Firebase. Assuming no managed trades.")
-            pass # Path doesn't exist, which is fine
-
-    except Exception as e:
-        # Catch any other unexpected errors during state loading
-        log.exception("Failed to load state from Firebase: %s", e)
-        send_telegram("⚠️ Failed to load state from Firebase on startup. The bot may not be aware of existing trades.")
+    # Load pending orders
+    db_orders = load_pending_orders_from_db()
+    if db_orders:
+        with pending_limit_orders_lock:
+            pending_limit_orders.update(db_orders)
+        log.info(f"Loaded {len(db_orders)} pending order(s) from DB.")
+    else:
+        log.info("No pending orders found in DB.")
 
 
 # -------------------------
@@ -599,9 +528,7 @@ async def lifespan(app: FastAPI):
     # --- Startup Logic ---
     init_db()
     
-    # New Firebase init
-    await asyncio.to_thread(init_firebase_sync)
-    await asyncio.to_thread(load_state_from_firebase_sync)
+    await asyncio.to_thread(load_state_from_db_sync)
 
     main_loop = asyncio.get_running_loop()
 
@@ -692,22 +619,6 @@ def _shorten_for_telegram(text: str, max_len: int = 3500) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 200] + "\n\n[...] (truncated)\n\n" + text[-200:]
-
-
-def validate_firebase_data(data, path=""):
-    """
-    Recursively checks a dictionary for invalid Firebase values like NaN or Infinity.
-    Raises ValueError if invalid data is found.
-    """
-    if isinstance(data, dict):
-        for k, v in data.items():
-            validate_firebase_data(v, f"{path}/{k}")
-    elif isinstance(data, list):
-        for i, v in enumerate(data):
-            validate_firebase_data(v, f"{path}/{i}")
-    elif isinstance(data, float):
-        if math.isnan(data) or math.isinf(data):
-            raise ValueError(f"Invalid numeric data for Firebase at path '{path}': {data}")
 
 
 def format_timedelta(td) -> str:
@@ -1070,8 +981,69 @@ def init_db():
     )
     """)
 
+    # --- New table for pending limit orders ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pending_limit_orders (
+        id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        qty REAL NOT NULL,
+        limit_price REAL NOT NULL,
+        stop_price REAL NOT NULL,
+        take_price REAL NOT NULL,
+        leverage INTEGER NOT NULL,
+        risk_usdt REAL NOT NULL,
+        place_time TEXT NOT NULL,
+        expiry_time TEXT,
+        strategy_id INTEGER,
+        atr_at_entry REAL,
+        trailing INTEGER
+    )
+    """)
+
     conn.commit()
     conn.close()
+
+def add_pending_order_to_db(rec: Dict[str, Any]):
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    values = (
+        rec.get('id'), rec.get('order_id'), rec.get('symbol'), rec.get('side'),
+        rec.get('qty'), rec.get('limit_price'), rec.get('stop_price'), rec.get('take_price'),
+        rec.get('leverage'), rec.get('risk_usdt'), rec.get('place_time'), rec.get('expiry_time'),
+        rec.get('strategy_id'), rec.get('atr_at_entry'), int(rec.get('trailing', False))
+    )
+    cur.execute("""
+    INSERT OR REPLACE INTO pending_limit_orders (
+        id, order_id, symbol, side, qty, limit_price, stop_price, take_price,
+        leverage, risk_usdt, place_time, expiry_time, strategy_id, atr_at_entry, trailing
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, values)
+    conn.commit()
+    conn.close()
+
+def remove_pending_order_from_db(pending_order_id: str):
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pending_limit_orders WHERE id = ?", (pending_order_id,))
+    conn.commit()
+    conn.close()
+
+def load_pending_orders_from_db() -> Dict[str, Dict[str, Any]]:
+    conn = sqlite3.connect(CONFIG["DB_FILE"])
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM pending_limit_orders")
+    rows = cur.fetchall()
+    conn.close()
+
+    orders = {}
+    for row in rows:
+        rec = dict(row)
+        rec['trailing'] = bool(rec.get('trailing'))
+        orders[rec['id']] = rec
+    return orders
 
 def record_trade(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
@@ -2422,6 +2394,61 @@ async def evaluate_and_enter(symbol: str):
         await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
 
+def simulate_strategy_bb(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Simulation version of the Bollinger Band strategy.
+    Returns signal details if a signal is found, otherwise None.
+    """
+    if df is None or len(df) < 20:
+        return None
+
+    adx_threshold = CONFIG.get("S1_ADX_MAX", 25)
+    atr_mult_for_sl = CONFIG.get("S1_ATR_SL_MULT", 1.5)
+    fallback_sl_pct = CONFIG.get("S1_FALLBACK_SL_PCT", 0.01)
+
+    signal_candle = df.iloc[-2]
+    prev_candle = df.iloc[-3]
+
+    side = None
+    if signal_candle['close'] <= signal_candle['s1_bbl']:
+        side = 'BUY'
+    elif signal_candle['close'] >= signal_candle['s1_bbu']:
+        side = 'SELL'
+    else:
+        return None
+
+    if (side == 'BUY' and prev_candle['close'] <= prev_candle['open']) or \
+       (side == 'SELL' and prev_candle['close'] >= prev_candle['open']):
+        return None
+
+    adx_value = float(signal_candle.get('adx', 0.0))
+    if adx_value >= adx_threshold:
+        return None
+
+    entry_price = float(signal_candle['close'])
+    atr_val = float(signal_candle.get('atr', 0.0))
+    
+    if atr_val > 0:
+        sl_price = entry_price - atr_mult_for_sl * atr_val if side == 'BUY' else entry_price + atr_mult_for_sl * atr_val
+    else:
+        sl_price = entry_price * (1 - fallback_sl_pct) if side == 'BUY' else entry_price * (1 + fallback_sl_pct)
+        
+    distance = abs(entry_price - sl_price)
+    if distance <= 0:
+        return None
+        
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+    
+    return {
+        "strategy": "S1-BB",
+        "side": side,
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": take_price,
+        "timestamp": signal_candle.name.isoformat()
+    }
+
+
 async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
     """
     Simple Bollinger strategy:
@@ -2543,14 +2570,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
     
     async with pending_limit_orders_lock:
         pending_limit_orders[pending_order_id] = pending_meta
-        if firebase_db:
-            try:
-                validate_firebase_data(pending_meta)
-                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
-            except ValueError as e:
-                log.error(f"Firebase validation failed for pending order {pending_order_id}: {e}")
-            except Exception as e:
-                log.exception(f"Failed to save pending order {pending_order_id} to Firebase: {e}")
+        await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
     log.info(f"Placed pending limit order (S1-BB): {pending_meta}")
     title = "⏳ *New Pending Order: S1-BB*"
@@ -2564,6 +2584,29 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
         f"**Leverage:** `{leverage}x`"
     )
     await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+def simulate_strategy_supertrend(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if df is None or len(df) < 30: return None
+    atr_buf = CONFIG.get("S2_ATR_BUFFER_MULT", 0.5)
+    signal_candle = df.iloc[-2]
+    prev_candle = df.iloc[-3]
+    prev_close_vs_st = float(prev_candle['close']) - float(prev_candle['s2_st'])
+    sig_close_vs_st = float(signal_candle['close']) - float(signal_candle['s2_st'])
+    side = None
+    if prev_close_vs_st < 0 and sig_close_vs_st > 0: side = 'BUY'
+    elif prev_close_vs_st > 0 and sig_close_vs_st < 0: side = 'SELL'
+    else: return None
+    if (side == 'BUY' and prev_candle['close'] <= prev_candle['open']) or \
+       (side == 'SELL' and prev_candle['close'] >= prev_candle['open']): return None
+    base_sl = float(signal_candle['s2_st'])
+    atr_val = float(signal_candle.get('atr', 0.0))
+    sl_price = base_sl - atr_buf * atr_val if side == 'BUY' else base_sl + atr_buf * atr_val
+    entry_price = float(signal_candle['close'])
+    distance = abs(entry_price - sl_price)
+    if distance <= 0: return None
+    tp_distance = atr_val * CONFIG["STRATEGY_EXIT_PARAMS"]['2']["ATR_MULTIPLIER"] * 1.5
+    take_price = entry_price + tp_distance if side == 'BUY' else entry_price - tp_distance
+    return {"strategy": "S2-ST", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": take_price, "timestamp": signal_candle.name.isoformat()}
 
 async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
     """
@@ -2675,14 +2718,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     
     async with pending_limit_orders_lock:
         pending_limit_orders[pending_order_id] = pending_meta
-        if firebase_db:
-            try:
-                validate_firebase_data(pending_meta)
-                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
-            except ValueError as e:
-                log.error(f"Firebase validation failed for S2 pending order {pending_order_id}: {e}")
-            except Exception as e:
-                log.exception(f"Failed to save S2 pending order {pending_order_id} to Firebase: {e}")
+        await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
     log.info(f"Placed pending limit order (S2-SuperTrend): {pending_meta}")
     title = "⏳ *New Pending Order: S2-ST*"
@@ -2696,6 +2732,29 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         f"**Leverage:** `{leverage}x`"
     )
     await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+def simulate_strategy_3(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if df is None or len(df) < 50: return None
+    atr_mult = CONFIG.get("S3_ATR_SL_MULT", 1.5)
+    fallback_sl_pct = CONFIG.get("S3_FALLBACK_SL_PCT", 0.015)
+    sig = df.iloc[-2]
+    prev = df.iloc[-3]
+    side = None
+    if prev['s3_ma_fast'] < prev['s3_ma_slow'] and sig['s3_ma_fast'] > sig['s3_ma_slow']: side = 'BUY'
+    elif prev['s3_ma_fast'] > prev['s3_ma_slow'] and sig['s3_ma_fast'] < sig['s3_ma_slow']: side = 'SELL'
+    else: return None
+    if (side == 'BUY' and prev['close'] <= prev['open']) or \
+       (side == 'SELL' and prev['close'] >= prev['open']): return None
+    atr_val = float(sig.get('atr', 0.0))
+    entry_price = float(sig['close'])
+    if atr_val and atr_val > 0:
+        sl_price = entry_price - atr_mult * atr_val if side == 'BUY' else entry_price + atr_mult * atr_val
+    else:
+        sl_price = entry_price * (1 - fallback_sl_pct) if side == 'BUY' else entry_price * (1 + fallback_sl_pct)
+    distance = abs(entry_price - sl_price)
+    if distance <= 0: return None
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+    return {"strategy": "S3-MA", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": take_price, "timestamp": sig.name.isoformat()}
 
 async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
     """
@@ -2803,14 +2862,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
     
     async with pending_limit_orders_lock:
         pending_limit_orders[pending_order_id] = pending_meta
-        if firebase_db:
-            try:
-                validate_firebase_data(pending_meta)
-                await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(pending_order_id).set, pending_meta)
-            except ValueError as e:
-                log.error(f"Firebase validation failed for S3 pending order {pending_order_id}: {e}")
-            except Exception as e:
-                log.exception(f"Failed to save S3 pending order {pending_order_id} to Firebase: {e}")
+        await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
     log.info(f"Placed pending limit order (S3-MA): {pending_meta}")
     title = "⏳ *New Pending Order: S3-MA*"
@@ -2824,6 +2876,21 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
         f"**Leverage:** `{leverage}x`"
     )
     await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    s4_params = CONFIG['STRATEGY_4']
+    required_len = max(s4_params['TRAILING_HHV_PERIOD'], s4_params['SUPERTREND_PERIOD']) + 5
+    if len(df) < required_len: return None
+    signal_candle = df.iloc[-2]
+    prev_candle = df.iloc[-3]
+    side = None
+    if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1: side = 'BUY'
+    elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1: side = 'SELL'
+    if not side: return None
+    entry_price = float(signal_candle['close'])
+    stop_pct = s4_params['INITIAL_STOP_PCT']
+    sl_price = entry_price * (1 - stop_pct) if side == 'BUY' else entry_price * (1 + stop_pct)
+    return {"strategy": "S4-AdvST", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": 0, "timestamp": signal_candle.name.isoformat()}
 
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
@@ -3039,17 +3106,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 managed_trades[trade_id] = meta
             await asyncio.to_thread(add_managed_trade_to_db, meta)
 
-            if firebase_db:
-                try:
-                    validate_firebase_data(meta)
-                    log.info(f"S4: Attempting to save trade {trade_id} to Firebase.")
-                    await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
-                    log.info(f"S4: Successfully saved trade {trade_id} to Firebase.")
-                except ValueError as e:
-                    await asyncio.to_thread(log_and_send_error, f"S4 Trade for {symbol} failed data validation", e)
-                except Exception as e:
-                    await asyncio.to_thread(log_and_send_error, f"Failed to save S4 trade {trade_id} to Firebase", e)
-
             new_trade_msg = (
                 f"✅ *New Trade Opened: S4*\n\n"
                 f"**Symbol:** `{symbol}`\n"
@@ -3244,13 +3300,6 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             managed_trades[trade_id] = meta
         
         await asyncio.to_thread(add_managed_trade_to_db, meta)
-        if firebase_db:
-            try:
-                validate_firebase_data(meta)
-                await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
-            except Exception as e:
-                log.exception(f"Failed to save forced trade {trade_id} to Firebase. The trade is open but state might be inconsistent.")
-                await asyncio.to_thread(send_telegram, f"⚠️ WARNING: Trade {trade_id} opened successfully but failed to save to Firebase. Please check the bot's state. Error: {type(e).__name__}")
 
         msg = (
             f"✅ *Forced Trade Executed: S{strategy_id}*\n\n"
@@ -3406,14 +3455,6 @@ def monitor_thread_func():
                                 'entry_reason': meta.get('entry_reason'), 'tp1': take_price # Store main TP here for reporting
                             })
                             add_managed_trade_to_db(meta) # Keep for now as backup
-                            if firebase_db:
-                                try:
-                                    validate_firebase_data(meta)
-                                    firebase_db.child("managed_trades").child(trade_id).set(meta)
-                                except ValueError as e:
-                                    log.error(f"Firebase validation failed for filled limit order {trade_id}: {e}")
-                                except Exception as e:
-                                    log.exception(f"Failed to save new managed trade {trade_id} to Firebase: {e}")
                             
                             strategy_id_str = f"S{p_meta.get('strategy_id', 'N/A')}"
                             trade_type_str = "BB" if strategy_id_str == "S1" else "ST"
@@ -3477,11 +3518,7 @@ def monitor_thread_func():
                     with pending_limit_orders_lock:
                         for p_id in to_remove_pending:
                             pending_limit_orders.pop(p_id, None)
-                            if firebase_db:
-                                try:
-                                    firebase_db.child("pending_limit_orders").child(p_id).delete()
-                                except Exception as e:
-                                    log.exception(f"Failed to delete pending order {p_id} from Firebase: {e}")
+                            remove_pending_order_from_db(p_id)
 
             positions = []
             try:
@@ -3617,11 +3654,6 @@ def monitor_thread_func():
                     # so we can just pass the updated record to the function.
                     record_trade(trade_record)
                     remove_managed_trade_from_db(tid) # Keep as backup
-                    if firebase_db:
-                        try:
-                            firebase_db.child("managed_trades").child(tid).delete()
-                        except Exception as e:
-                            log.exception(f"Failed to delete managed trade {tid} from Firebase: {e}")
                     with managed_trades_lock:
                         last_trade_close_time[sym] = close_time
                     
@@ -4642,6 +4674,74 @@ async def get_pending_orders_snapshot():
     async with pending_limit_orders_lock:
         return dict(pending_limit_orders)
 
+async def run_simulation(symbol: str, days: int):
+    """
+    Runs a simulation of the bot's strategies over a historical period.
+    """
+    await asyncio.to_thread(send_telegram, f"🚀 Starting simulation for `{symbol}` over the last `{days}` day(s)...", parse_mode='Markdown')
+    
+    try:
+        timeframe = CONFIG["TIMEFRAME"]
+        tf_delta = timeframe_to_timedelta(timeframe)
+        if not tf_delta:
+            await asyncio.to_thread(send_telegram, f"❌ Invalid timeframe for simulation: {timeframe}")
+            return
+            
+        candles_per_day = int(timedelta(days=1).total_seconds() / tf_delta.total_seconds())
+        num_candles_to_simulate = candles_per_day * days
+        
+        # Fetch extra data for indicator lookback periods
+        lookback_period = 250 
+        total_candles_to_fetch = num_candles_to_simulate + lookback_period
+        
+        await asyncio.to_thread(send_telegram, f"Fetching {total_candles_to_fetch} candles of `{timeframe}` data for `{symbol}`...", parse_mode='Markdown')
+        
+        df_full = await asyncio.to_thread(fetch_klines_sync, symbol, timeframe, total_candles_to_fetch)
+        
+        if df_full is None or len(df_full) < total_candles_to_fetch:
+            await asyncio.to_thread(send_telegram, "❌ Not enough historical data available to run the full simulation.")
+            return
+
+        signal_count = 0
+        
+        # Main simulation loop
+        for i in range(lookback_period, len(df_full)):
+            df_slice = df_full.iloc[:i]
+            
+            # It's more efficient to calculate all indicators once
+            df_with_indicators = calculate_all_indicators(df_slice.copy())
+            
+            # Check all strategies
+            signals = [
+                simulate_strategy_bb(symbol, df_with_indicators),
+                simulate_strategy_supertrend(symbol, df_with_indicators),
+                simulate_strategy_3(symbol, df_with_indicators),
+                simulate_strategy_4(symbol, df_with_indicators)
+            ]
+            
+            for signal in signals:
+                if signal:
+                    signal_count += 1
+                    timestamp_dt = datetime.fromisoformat(signal['timestamp'])
+                    msg = (
+                        f"🔔 *Simulation Signal Found* 🔔\n\n"
+                        f"**Strategy:** `{signal['strategy']}`\n"
+                        f"**Symbol:** `{symbol}`\n"
+                        f"**Side:** `{signal['side']}`\n"
+                        f"**Timestamp:** `{timestamp_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}`\n"
+                        f"**Entry:** `{signal['entry_price']:.4f}`\n"
+                        f"**SL:** `{signal['sl_price']:.4f}`\n"
+                        f"**TP:** `{signal['tp_price']:.4f}`"
+                    )
+                    await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+
+        summary_msg = f"✅ Simulation for `{symbol}` complete. Found `{signal_count}` signal(s)."
+        await asyncio.to_thread(send_telegram, summary_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"An error occurred during simulation for {symbol}", e)
+
+
 def build_control_keyboard():
     buttons = [
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
@@ -4649,7 +4749,7 @@ def build_control_keyboard():
         [KeyboardButton("/listorders"), KeyboardButton("/listpending")],
         [KeyboardButton("/status"), KeyboardButton("/showparams")],
         [KeyboardButton("/usage"), KeyboardButton("/report"), KeyboardButton("/stratreport")],
-        [KeyboardButton("/rejects"), KeyboardButton("/help")]
+        [KeyboardButton("/rejects"), KeyboardButton("/help"), KeyboardButton("/simulate")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -5119,15 +5219,6 @@ def handle_update_sync(update, loop):
                                     # Persist to DB and Firebase
                                     trade_to_update = managed_trades[trade_id]
                                     await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
-                                    if firebase_db:
-                                        try:
-                                            # Update only the 'trailing' field in Firebase for efficiency
-                                            await asyncio.to_thread(
-                                                firebase_db.child("managed_trades").child(trade_id).child("trailing").set,
-                                                new_trailing_state
-                                            )
-                                        except Exception as e:
-                                            log.exception(f"Failed to update trailing status in Firebase for {trade_id}: {e}")
 
                                     status_msg = "ENABLED" if new_trailing_state else "DISABLED"
                                     msg = f"✅ Trailing stop for trade `{trade_id}` has been manually {status_msg}."
@@ -5151,6 +5242,7 @@ def handle_update_sync(update, loop):
                     "- `/freeze`: Manually freezes the bot, preventing all new trades.\n"
                     "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n"
                     "- `/forcetrade <S1-S4> <SYMBOL> <buy|sell>`: Forces an immediate market trade.\n"
+                    "- `/scalein <trade_id> <risk_usd>`: Adds to an existing position by a risk amount.\n"
                     "- `/trail <trade_id> <on|off>`: Manually enable or disable the automatic trailing stop for a trade.\n\n"
                     "*Information & Reports*\n"
                     "- `/status`: Shows a detailed status of the bot.\n"
@@ -5170,8 +5262,10 @@ def handle_update_sync(update, loop):
                     "- `/validate`: Performs a sanity check on the configuration.\n"
                     "- `/help`: Displays this help message.\n\n"
                     "*Testing*\n"
+                    "- `/simulate`: Runs a simulation on historical data to find signals.\n"
                     "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
-                    "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP."
+                    "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP.\n"
+                    "- `/testrun`: Runs a full end-to-end test on the Binance testnet."
                 )
                 async def _task():
                     await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
@@ -5180,6 +5274,18 @@ def handle_update_sync(update, loop):
                     fut.result(timeout=10)
                 except Exception as e:
                     log.error("Failed to execute /help action: %s", e)
+            elif text.startswith("/simulate"):
+                send_telegram("Scheduling simulation task...")
+                # Run the simulation in a coroutine
+                async def _task():
+                    await run_simulation("BTCUSDT", 1)
+                
+                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                try:
+                    # We don't wait for the result here to keep the bot responsive
+                    pass
+                except Exception as e:
+                    log.error(f"Failed to schedule /simulate task: {e}")
             elif text.startswith("/usage"):
                 cpu_usage = psutil.cpu_percent(interval=1)
                 mem_data = get_memory_info()
