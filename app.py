@@ -189,7 +189,7 @@ CONFIG = {
     "RISK_SMALL_BALANCE_THRESHOLD": float(os.getenv("RISK_SMALL_BALANCE_THRESHOLD", "50.0")),
     "RISK_SMALL_FIXED_USDT": float(os.getenv("RISK_SMALL_FIXED_USDT", "0.5")),
     "RISK_SMALL_FIXED_USDT_STRATEGY_2": float(os.getenv("RISK_SMALL_FIXED_S2", "0.6")),
-    "MARGIN_USDT_SMALL_BALANCE": float(os.getenv("MARGIN_USDT_SMALL_BALANCE", "2.0")),
+    "MARGIN_USDT_SMALL_BALANCE": float(os.getenv("MARGIN_USDT_SMALL_BALANCE", "1.0")),
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
     "RISK_PCT_STRATEGY_2": float(os.getenv("RISK_PCT_S2", "0.025")),
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
@@ -5336,15 +5336,30 @@ async def run_full_testnet_test():
         sl_price = entry_price * 0.98
         tp_price = entry_price * 1.02
         
+        # --- Hedge Mode Aware SL/TP ---
+        position_mode = await asyncio.to_thread(temp_client.futures_get_position_mode)
+        is_hedge_mode = position_mode.get('dualSidePosition', False)
+        
+        sl_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, sl_price)}
+        tp_order = {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, tp_price)}
+        
+        if is_hedge_mode:
+            # For a BUY trade, the positionSide is LONG for closing orders
+            sl_order['positionSide'] = 'LONG'
+            tp_order['positionSide'] = 'LONG'
+        else:
+            sl_order['reduceOnly'] = True
+            tp_order['reduceOnly'] = True
+
+        sl_tp_batch = [sl_order, tp_order]
+        # --- End Hedge Mode Aware ---
+
         sl_tp_orders = await asyncio.to_thread(
             temp_client.futures_place_batch_order,
-            batchOrders=[
-                {'symbol': test_symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, sl_price), 'reduceOnly': True},
-                {'symbol': test_symbol, 'side': 'SELL', 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty_to_open, 'stopPrice': round_price(test_symbol, tp_price), 'reduceOnly': True}
-            ]
+            batchOrders=sl_tp_batch
         )
         if any('code' in o for o in sl_tp_orders):
-            raise RuntimeError(f"Failed to place SL/TP orders: {sl_tp_orders}")
+            raise RuntimeError(f"Failed to place SL/TP orders: {sl_tp_orders}. Batch sent: {sl_tp_batch}")
         report_lines.append("✅ SL/TP orders placed successfully.")
 
         # --- Step 6: Trailing Stop Check ---
