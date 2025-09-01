@@ -3489,11 +3489,11 @@ def monitor_thread_func():
                 retry_delay = 10  # seconds
                 for attempt in range(max_retries):
                     try:
-                        log.info(f"Monitor thread: fetching positions (attempt {attempt + 1}/{max_retries})...")
+                        log.debug(f"Monitor thread: fetching positions (attempt {attempt + 1}/{max_retries})...")
                         positions_fetch_start = time.time()
                         positions = client.futures_position_information()
                         positions_fetch_duration = time.time() - positions_fetch_start
-                        log.info(f"Monitor thread: fetching positions took {positions_fetch_duration:.2f}s.")
+                        log.debug(f"Monitor thread: fetching positions took {positions_fetch_duration:.2f}s.")
                         break  # Success
                     except BinanceAPIException as e:
                         if e.code == -1007 and attempt < max_retries - 1:
@@ -3545,14 +3545,14 @@ def monitor_thread_func():
                 continue
             
             # --- Position monitoring logic (from original code) ---
-            log.info("Monitor thread: attempting to acquire lock...")
+            log.debug("Monitor thread: attempting to acquire lock...")
             managed_trades_lock.acquire()
-            log.info("Monitor thread: lock acquired.")
+            log.debug("Monitor thread: lock acquired.")
             try:
                 trades_snapshot = dict(managed_trades)
             finally:
                 managed_trades_lock.release()
-                log.info("Monitor thread: lock released.")
+                log.debug("Monitor thread: lock released.")
             
             # --- Pre-fetch kline data for all active symbols to reduce API calls ---
             active_symbols = {meta['symbol'] for meta in trades_snapshot.values()}
@@ -3973,7 +3973,7 @@ def monitor_thread_func():
             
             # The loop should sleep for at least a little bit, but subtract processing time
             # to keep the cycle time relatively constant.
-            log.info(f"Monitor thread loop finished. Total duration: {duration:.2f}s.")
+            log.debug(f"Monitor thread loop finished. Total duration: {duration:.2f}s.")
             sleep_duration = max(0.1, 5 - duration)
             time.sleep(sleep_duration)
 
@@ -4287,6 +4287,10 @@ async def scanning_loop():
             
             scan_cycle_count += 1
             
+            # --- NEW: Clear indicator cache to free memory ---
+            log.info("Clearing indicator cache to conserve memory.")
+            indicator_cache.clear()
+
             # Use the simple fixed cooldown for subsequent cycles
             cooldown_seconds = CONFIG["SCAN_INTERVAL"]
             next_scan_time = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
@@ -4627,11 +4631,11 @@ def generate_adv_chart_sync(symbol: str):
         return f"Error generating chart for {symbol}: {e}", None
 
 async def get_managed_trades_snapshot():
-    log.info("Attempting to acquire managed_trades_lock in get_managed_trades_snapshot...")
+    log.debug("Attempting to acquire managed_trades_lock in get_managed_trades_snapshot...")
     async with managed_trades_lock:
-        log.info("Acquired managed_trades_lock in get_managed_trades_snapshot.")
+        log.debug("Acquired managed_trades_lock in get_managed_trades_snapshot.")
         snapshot = dict(managed_trades)
-    log.info("Released managed_trades_lock in get_managed_trades_snapshot.")
+    log.debug("Released managed_trades_lock in get_managed_trades_snapshot.")
     return snapshot
 
 async def get_pending_orders_snapshot():
