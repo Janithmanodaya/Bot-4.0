@@ -17,7 +17,6 @@ import asyncio
 import threading
 import json
 import logging
-import json
 import signal
 import sqlite3
 import io
@@ -5325,7 +5324,7 @@ async def run_full_testnet_test():
         # Manually construct and send the order using the temporary client
         market_order = await asyncio.to_thread(
             temp_client.futures_create_order,
-            symbol=test_symbol, side='BUY', type='MARKET', quantity=qty_to_open
+            symbol=test_symbol, side='BUY', type='MARKET', quantity=qty_to_open, positionSide='LONG'
         )
         report_lines.append(f"✅ Market order placed. Order ID: `{market_order['orderId']}`")
         
@@ -5436,7 +5435,7 @@ async def run_full_testnet_test():
                     close_qty = abs(float(pos['positionAmt']))
                     await asyncio.to_thread(
                         temp_client.futures_create_order,
-                        symbol=test_symbol, side='SELL', type='MARKET', quantity=close_qty
+                        symbol=test_symbol, side='SELL', type='MARKET', quantity=close_qty, positionSide='LONG'
                     )
                     report_lines.append("✅ Closed open position on testnet.")
                 else:
