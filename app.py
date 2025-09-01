@@ -3311,6 +3311,7 @@ def monitor_thread_func():
             log.exception(f"Failed to check for attention_required symbols: {e}")
 
         loop_start_time = time.time()
+        log.info("Monitor thread loop started.")
         try:
             if client is None:
                 time.sleep(5)
@@ -3459,7 +3460,11 @@ def monitor_thread_func():
                 retry_delay = 10  # seconds
                 for attempt in range(max_retries):
                     try:
+                        log.info(f"Monitor thread: fetching positions (attempt {attempt + 1}/{max_retries})...")
+                        positions_fetch_start = time.time()
                         positions = client.futures_position_information()
+                        positions_fetch_duration = time.time() - positions_fetch_start
+                        log.info(f"Monitor thread: fetching positions took {positions_fetch_duration:.2f}s.")
                         break  # Success
                     except BinanceAPIException as e:
                         if e.code == -1007 and attempt < max_retries - 1:
@@ -3511,11 +3516,14 @@ def monitor_thread_func():
                 continue
             
             # --- Position monitoring logic (from original code) ---
+            log.info("Monitor thread: attempting to acquire lock...")
             managed_trades_lock.acquire()
+            log.info("Monitor thread: lock acquired.")
             try:
                 trades_snapshot = dict(managed_trades)
             finally:
                 managed_trades_lock.release()
+                log.info("Monitor thread: lock released.")
             
             # --- Pre-fetch kline data for all active symbols to reduce API calls ---
             active_symbols = {meta['symbol'] for meta in trades_snapshot.values()}
@@ -3930,6 +3938,7 @@ def monitor_thread_func():
             
             # The loop should sleep for at least a little bit, but subtract processing time
             # to keep the cycle time relatively constant.
+            log.info(f"Monitor thread loop finished. Total duration: {duration:.2f}s.")
             sleep_duration = max(0.1, 5 - duration)
             time.sleep(sleep_duration)
 
@@ -4583,8 +4592,12 @@ def generate_adv_chart_sync(symbol: str):
         return f"Error generating chart for {symbol}: {e}", None
 
 async def get_managed_trades_snapshot():
+    log.info("Attempting to acquire managed_trades_lock in get_managed_trades_snapshot...")
     async with managed_trades_lock:
-        return dict(managed_trades)
+        log.info("Acquired managed_trades_lock in get_managed_trades_snapshot.")
+        snapshot = dict(managed_trades)
+    log.info("Released managed_trades_lock in get_managed_trades_snapshot.")
+    return snapshot
 
 async def get_pending_orders_snapshot():
     async with pending_limit_orders_lock:
@@ -4787,10 +4800,15 @@ def handle_update_sync(update, loop):
                 except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
                 send_telegram("✅ Bot is now **UNFROZEN**. Active session freeze has been overridden.", parse_mode='Markdown')
             elif text.startswith("/status"):
+                log.info("Received /status command. Scheduling task.")
                 fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
-                try: trades = fut.result(timeout=5)
-                except Exception as e: log.error("Failed to get managed trades for /status: %s", e)
+                try:
+                    log.info("Waiting for /status task future result...")
+                    trades = fut.result(timeout=10) # Increased timeout for debugging
+                    log.info("Got /status task future result.")
+                except Exception as e:
+                    log.error("Failed to get managed trades for /status: %s", e, exc_info=True)
                 
                 unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
                 
@@ -4972,11 +4990,14 @@ def handle_update_sync(update, loop):
             elif text.startswith("/report"):
                 # Handler for the /report command to generate and send the PnL report
                 send_telegram("Generating performance report, please wait...")
+                log.info("Scheduling /report task.")
                 fut = asyncio.run_coroutine_threadsafe(generate_and_send_report(), loop)
                 try:
+                    log.info("Waiting for /report task future...")
                     fut.result(timeout=60) # Give it a long timeout for report generation
+                    log.info("/report task finished.")
                 except Exception as e:
-                    log.error("Failed to execute /report action: %s", e)
+                    log.error("Failed to execute /report action: %s", e, exc_info=True)
                     send_telegram(f"Failed to generate report: {e}")
             elif text.startswith("/stratreport"):
                 send_telegram("Generating strategy performance report, please wait...")
@@ -5030,9 +5051,14 @@ def handle_update_sync(update, loop):
                     
                     await asyncio.to_thread(send_telegram, "\n".join(report_lines), parse_mode='Markdown')
 
+                log.info("Scheduling /rejects task.")
                 fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try: fut.result(timeout=10)
-                except Exception as e: log.error("Failed to execute /rejects action: %s", e)
+                try:
+                    log.info("Waiting for /rejects task future...")
+                    fut.result(timeout=10)
+                    log.info("/rejects task finished waiting for future.")
+                except Exception as e:
+                    log.error("Failed to execute /rejects action: %s", e, exc_info=True)
             elif text.startswith("/help"):
                 help_text = (
                     "*KAMA Bot Commands*\n\n"
