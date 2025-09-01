@@ -5386,7 +5386,7 @@ async def run_full_testnet_test():
 
         sl_tp_orders = await asyncio.to_thread(
             temp_client.futures_place_batch_order,
-            batchOrders=json.dumps(sl_tp_batch)
+            batchOrders=sl_tp_batch
         )
         if any('code' in o for o in sl_tp_orders):
             raise RuntimeError(f"Failed to place SL/TP orders: {sl_tp_orders}. Batch sent: {sl_tp_batch}")
