@@ -2537,7 +2537,8 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
         "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
         "expiry_time": expiry_time.isoformat(),
         "strategy_id": 1,
-        "atr_at_entry": atr_val
+        "atr_at_entry": atr_val,
+        "trailing": CONFIG["TRAILING_ENABLED"]
     }
     
     async with pending_limit_orders_lock:
@@ -2668,7 +2669,8 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         "expiry_time": expiry_time.isoformat(),
         "strategy_id": 2,
         "atr_at_entry": atr_val,
-        "signal_confidence": 100.0 # Placeholder for simple strategy
+        "signal_confidence": 100.0, # Placeholder for simple strategy
+        "trailing": CONFIG["TRAILING_ENABLED"]
     }
     
     async with pending_limit_orders_lock:
@@ -2795,7 +2797,8 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
         "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
         "expiry_time": expiry_time.isoformat(),
         "strategy_id": 3,
-        "atr_at_entry": atr_val
+        "atr_at_entry": atr_val,
+        "trailing": CONFIG["TRAILING_ENABLED"]
     }
     
     async with pending_limit_orders_lock:
@@ -3029,6 +3032,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 "s4_trailing_stop": initial_trail_stop,
                 "s4_last_candle_ts": signal_candle.name.isoformat(),
                 "s4_trailing_active": False,
+                "trailing": CONFIG["TRAILING_ENABLED"],
             }
 
             async with managed_trades_lock:
@@ -3232,6 +3236,7 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             "entry_reason": "FORCED_MANUAL",
             "be_moved": False, # Ensure this is set for new trades
             "trailing_active": False,
+            "trailing": CONFIG["TRAILING_ENABLED"],
         }
         meta.update(trade_meta_extra)
 
@@ -3243,8 +3248,9 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             try:
                 validate_firebase_data(meta)
                 await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
-            except ValueError as e:
-                log.error(f"Firebase validation failed for forced trade {symbol}: {e}")
+            except Exception as e:
+                log.exception(f"Failed to save forced trade {trade_id} to Firebase. The trade is open but state might be inconsistent.")
+                await asyncio.to_thread(send_telegram, f"⚠️ WARNING: Trade {trade_id} opened successfully but failed to save to Firebase. Please check the bot's state. Error: {type(e).__name__}")
 
         msg = (
             f"✅ *Forced Trade Executed: S{strategy_id}*\n\n"
@@ -3704,6 +3710,9 @@ def monitor_thread_func():
                     
                     elif strategy_id == '3':
                         # --- Advanced SuperTrend (S3) Exit & Management Logic ---
+                        if not meta.get('trailing', True):
+                            continue # Skip if trailing is manually disabled
+
                         s3_params = CONFIG['STRATEGY_3']
                         
                         # Calculate indicators needed for S3 logic
@@ -3788,6 +3797,9 @@ def monitor_thread_func():
                     
                     elif strategy_id == '4':
                         # --- Advanced SuperTrend v2 (S4) Exit & Management Logic ---
+                        if not meta.get('trailing', True):
+                            continue # Skip if trailing is manually disabled
+                            
                         s4_params = CONFIG['STRATEGY_4']
                         current_price = safe_last(df_monitor['close'])
                         entry_price = meta['entry_price']
@@ -3822,7 +3834,7 @@ def monitor_thread_func():
                                 df_monitor['atr2'] = atr_wilder(df_monitor, length=s4_params['TRAILING_ATR_PERIOD'])
                                 df_monitor['hhv10'] = hhv(df_monitor['high'], length=s4_params['TRAILING_HHV_PERIOD'])
                                 df_monitor['llv10'] = llv(df_monitor['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-                                supertrend(df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
+                                df_monitor['supertrend'], df_monitor['supertrend_direction'] = supertrend(df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
                                 newly_closed_candle = df_monitor.loc[latest_candle_ts]
 
                                 # SuperTrend Flip Exit Check
@@ -3897,7 +3909,7 @@ def monitor_thread_func():
                             continue
 
                     # Trailing Stop (For S1 after BE, and for S2 after TP2)
-                    if meta.get('trailing_active'):
+                    if meta.get('trailing_active') and meta.get('trailing', True):
                         atr_now = safe_latest_atr_from_df(df_monitor)
                         
                         volatility_ratio = atr_now / current_price if current_price > 0 else 0
@@ -5083,6 +5095,49 @@ def handle_update_sync(update, loop):
                     log.info("/rejects task finished waiting for future.")
                 except Exception as e:
                     log.error("Failed to execute /rejects action: %s", e, exc_info=True)
+            elif text.startswith("/trail"):
+                parts = text.split()
+                if len(parts) != 3:
+                    send_telegram("Usage: /trail <trade_id> <on|off>")
+                else:
+                    trade_id, state = parts[1], parts[2].lower()
+                    if state not in ['on', 'off']:
+                        send_telegram("Invalid state. Use 'on' or 'off'.")
+                    else:
+                        new_trailing_state = (state == 'on')
+                        
+                        async def _task():
+                            async with managed_trades_lock:
+                                if trade_id in managed_trades:
+                                    # Update in-memory state first
+                                    managed_trades[trade_id]['trailing'] = new_trailing_state
+                                    
+                                    # Persist to DB and Firebase
+                                    trade_to_update = managed_trades[trade_id]
+                                    await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
+                                    if firebase_db:
+                                        try:
+                                            # Update only the 'trailing' field in Firebase for efficiency
+                                            await asyncio.to_thread(
+                                                firebase_db.child("managed_trades").child(trade_id).child("trailing").set,
+                                                new_trailing_state
+                                            )
+                                        except Exception as e:
+                                            log.exception(f"Failed to update trailing status in Firebase for {trade_id}: {e}")
+
+                                    status_msg = "ENABLED" if new_trailing_state else "DISABLED"
+                                    msg = f"✅ Trailing stop for trade `{trade_id}` has been manually {status_msg}."
+                                    await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+                                else:
+                                    await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
+
+                        fut = asyncio.run_coroutine_threadsafe(_task(), loop)
+                        try:
+                            fut.result(timeout=10)
+                        except Exception as e:
+                            log.error(f"Failed to execute /trail command: {e}")
+                            send_telegram(f"An error occurred while processing the /trail command: {e}")
+
             elif text.startswith("/help"):
                 help_text = (
                     "*KAMA Bot Commands*\n\n"
@@ -5091,7 +5146,8 @@ def handle_update_sync(update, loop):
                     "- `/stopbot`: Stops the bot (pauses scanning for trades).\n"
                     "- `/freeze`: Manually freezes the bot, preventing all new trades.\n"
                     "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n"
-                    "- `/forcetrade <S1-S4> <SYMBOL> <buy|sell>`: Forces an immediate market trade.\n\n"
+                    "- `/forcetrade <S1-S4> <SYMBOL> <buy|sell>`: Forces an immediate market trade.\n"
+                    "- `/trail <trade_id> <on|off>`: Manually enable or disable the automatic trailing stop for a trade.\n\n"
                     "*Information & Reports*\n"
                     "- `/status`: Shows a detailed status of the bot.\n"
                     "- `/listorders`: Lists all currently open trades with details.\n"
