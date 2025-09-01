@@ -722,21 +722,20 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
 
     # For Binance API exceptions, extract more details
     if exc and isinstance(exc, BinanceAPIException):
-        error_details = f"Code: `{exc.code}`, Message: `{exc.message}`"
+        # Avoid markdown in the details themselves
+        error_details = f"Code: {exc.code}, Message: {exc.message}"
     elif exc:
         error_details = str(exc)
     else:
         error_details = "N/A"
 
-    # Sanitize the error details for Telegram's Markdown
-    error_details = error_details.replace('`', "'")
-
-    # Format a user-friendly message
+    # Format a user-friendly message, wrapping dynamic content in code blocks
+    # to prevent markdown parsing errors.
     telegram_msg = (
         f"🚨 **Bot Error** 🚨\n\n"
-        f"**Context:** {context_msg}\n"
-        f"**Error Type:** `{type(exc).__name__ if exc else 'N/A'}`\n"
-        f"**Details:** {error_details}\n\n"
+        f"**Context:**\n`{context_msg}`\n\n"
+        f"**Error Type:**\n`{type(exc).__name__ if exc else 'N/A'}`\n\n"
+        f"**Details:**\n`{error_details}`\n\n"
         f"Check the logs for the full traceback if available."
     )
     
@@ -4674,13 +4673,20 @@ async def get_pending_orders_snapshot():
     async with pending_limit_orders_lock:
         return dict(pending_limit_orders)
 
-async def run_simulation(symbol: str, days: int):
+async def run_simulation(strategy_to_run: str, symbol: str, days: int):
     """
     Runs a simulation of the bot's strategies over a historical period.
     """
-    await asyncio.to_thread(send_telegram, f"🚀 Starting simulation for `{symbol}` over the last `{days}` day(s)...", parse_mode='Markdown')
+    await asyncio.to_thread(send_telegram, f"🚀 Starting simulation for strategy `{strategy_to_run}` on `{symbol}` over the last `{days}` day(s)...", parse_mode='Markdown')
     
+    original_strat_mode = CONFIG["STRATEGY_MODE"]
     try:
+        # Temporarily override strategy mode for simulation
+        if strategy_to_run == "ALL":
+            CONFIG["STRATEGY_MODE"] = [0] # Auto mode calculates all
+        else:
+            CONFIG["STRATEGY_MODE"] = [int(strategy_to_run[1:])]
+
         timeframe = CONFIG["TIMEFRAME"]
         tf_delta = timeframe_to_timedelta(timeframe)
         if not tf_delta:
@@ -4712,13 +4718,21 @@ async def run_simulation(symbol: str, days: int):
             df_with_indicators = calculate_all_indicators(df_slice.copy())
             
             # Check all strategies
-            signals = [
-                simulate_strategy_bb(symbol, df_with_indicators),
-                simulate_strategy_supertrend(symbol, df_with_indicators),
-                simulate_strategy_3(symbol, df_with_indicators),
-                simulate_strategy_4(symbol, df_with_indicators)
-            ]
-            
+            signals = []
+            if strategy_to_run == "S1":
+                signals.append(simulate_strategy_bb(symbol, df_with_indicators))
+            elif strategy_to_run == "S2":
+                signals.append(simulate_strategy_supertrend(symbol, df_with_indicators))
+            elif strategy_to_run == "S3":
+                signals.append(simulate_strategy_3(symbol, df_with_indicators))
+            elif strategy_to_run == "S4":
+                signals.append(simulate_strategy_4(symbol, df_with_indicators))
+            elif strategy_to_run == "ALL":
+                signals.append(simulate_strategy_bb(symbol, df_with_indicators))
+                signals.append(simulate_strategy_supertrend(symbol, df_with_indicators))
+                signals.append(simulate_strategy_3(symbol, df_with_indicators))
+                signals.append(simulate_strategy_4(symbol, df_with_indicators))
+
             for signal in signals:
                 if signal:
                     signal_count += 1
@@ -4740,6 +4754,9 @@ async def run_simulation(symbol: str, days: int):
 
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"An error occurred during simulation for {symbol}", e)
+    finally:
+        # Restore original strategy mode
+        CONFIG["STRATEGY_MODE"] = original_strat_mode
 
 
 def build_control_keyboard():
@@ -5262,7 +5279,7 @@ def handle_update_sync(update, loop):
                     "- `/validate`: Performs a sanity check on the configuration.\n"
                     "- `/help`: Displays this help message.\n\n"
                     "*Testing*\n"
-                    "- `/simulate`: Runs a simulation on historical data to find signals.\n"
+                    "- `/simulate [S1-S4|ALL] [SYM] [DAYS]`: Runs a simulation.\n"
                     "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
                     "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP.\n"
                     "- `/testrun`: Runs a full end-to-end test on the Binance testnet."
@@ -5275,10 +5292,33 @@ def handle_update_sync(update, loop):
                 except Exception as e:
                     log.error("Failed to execute /help action: %s", e)
             elif text.startswith("/simulate"):
+                parts = text.split()
+                # Defaults
+                strategy_to_run = "ALL"
+                symbol = "BTCUSDT"
+                days = 1
+                
+                # Parse arguments
+                if len(parts) > 1:
+                    strategy_to_run = parts[1].upper()
+                if len(parts) > 2:
+                    symbol = parts[2].upper()
+                if len(parts) > 3:
+                    try:
+                        days = int(parts[3])
+                    except ValueError:
+                        send_telegram("Invalid number of days. Using default of 1.")
+                        days = 1
+
+                valid_strategies = ["S1", "S2", "S3", "S4", "ALL"]
+                if strategy_to_run not in valid_strategies:
+                    send_telegram(f"Invalid strategy specified. Please use one of: {', '.join(valid_strategies)}")
+                    return
+
                 send_telegram("Scheduling simulation task...")
                 # Run the simulation in a coroutine
                 async def _task():
-                    await run_simulation("BTCUSDT", 1)
+                    await run_simulation(strategy_to_run, symbol, days)
                 
                 fut = asyncio.run_coroutine_threadsafe(_task(), loop)
                 try:
