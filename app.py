@@ -15,6 +15,7 @@ import time
 import math
 import asyncio
 import threading
+import json
 import logging
 import json
 import signal
@@ -5291,6 +5292,19 @@ async def run_full_testnet_test():
         )
         report_lines.append("✅ Testnet client initialized.")
 
+        # Set Hedge Mode
+        try:
+            await asyncio.to_thread(temp_client.futures_change_position_mode, dualSidePosition=True)
+            report_lines.append("✅ Hedge mode enabled successfully.")
+            log.info("Testnet client set to Hedge Mode.")
+        except BinanceAPIException as e:
+            # Error code for "No need to change position side"
+            if e.code == -4059:
+                report_lines.append("ℹ️ Hedge mode was already enabled.")
+                log.info("Testnet client was already in Hedge Mode.")
+            else:
+                raise # Re-raise other exceptions
+
         # --- Step 2: Sanity Checks ---
         report_lines.append("\n*Step 2: Sanity Checks*")
         await asyncio.to_thread(send_telegram, "2. Pinging testnet server...")
@@ -5371,7 +5385,7 @@ async def run_full_testnet_test():
 
         sl_tp_orders = await asyncio.to_thread(
             temp_client.futures_place_batch_order,
-            batchOrders=sl_tp_batch
+            batchOrders=json.dumps(sl_tp_batch)
         )
         if any('code' in o for o in sl_tp_orders):
             raise RuntimeError(f"Failed to place SL/TP orders: {sl_tp_orders}. Batch sent: {sl_tp_batch}")
