@@ -1282,7 +1282,7 @@ def adx(df: pd.DataFrame, period: int = 14):
     df['adx'] = dx.ewm(alpha=alpha, adjust=False).mean()
 
 
-def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_series: Optional[pd.Series] = None) -> tuple[pd.Series, pd.Series]:
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_series: Optional[pd.Series] = None, source: Optional[pd.Series] = None) -> tuple[pd.Series, pd.Series]:
     """
     Calculates the SuperTrend indicator.
     Returns two series: supertrend and supertrend_direction.
@@ -1295,10 +1295,12 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_
     if atr_series is None:
         atr_series = atr(df, period)
 
-    # Basic upper and lower bands
-    hl2 = (high + low) / 2
-    upperband = hl2 + multiplier * atr_series
-    lowerband = hl2 - multiplier * atr_series
+    # If no source is provided, default to hl2
+    if source is None:
+        source = (high + low) / 2
+    
+    upperband = source + multiplier * atr_series
+    lowerband = source - multiplier * atr_series
     
     # Initialize supertrend direction
     in_uptrend = pd.Series(True, index=df.index)
@@ -2324,7 +2326,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out['s4_atr2'] = atr_wilder(out, length=s4_params['TRAILING_ATR_PERIOD'])
         out['s4_hhv10'] = hhv(out['high'], length=s4_params['TRAILING_HHV_PERIOD'])
         out['s4_llv10'] = llv(out['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-        out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
+        out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'], source=out['close'])
 
     return out
 
