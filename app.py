@@ -279,12 +279,12 @@ symbol_regimes_lock = threading.Lock()
 
 last_trade_close_time: Dict[str, datetime] = {}
 
-telegram_thread: Optional[threading.Thread] = None
-monitor_thread_obj: Optional[threading.Thread] = None
-pnl_monitor_thread_obj: Optional[threading.Thread] = None
-maintenance_thread_obj: Optional[threading.Thread] = None
-alerter_thread_obj: Optional[threading.Thread] = None
-monitor_stop_event = threading.Event()
+# --- Async Tasks ---
+scan_task: Optional[asyncio.Task] = None
+background_services_task: Optional[asyncio.Task] = None
+monitor_task: Optional[asyncio.Task] = None # New task for the monitor
+rogue_check_task: Optional[asyncio.Task] = None
+notified_rogue_symbols: set[str] = set()
 
 # Thread failure counters
 pnl_monitor_consecutive_failures = 0
@@ -292,7 +292,9 @@ alerter_consecutive_failures = 0
 
 last_maintenance_month = "" # YYYY-MM format
 
+# --- Async Tasks ---
 scan_task: Optional[asyncio.Task] = None
+background_services_task: Optional[asyncio.Task] = None
 rogue_check_task: Optional[asyncio.Task] = None
 notified_rogue_symbols: set[str] = set()
 
@@ -588,23 +590,53 @@ def load_state_from_firebase_sync():
         send_telegram("⚠️ Failed to load state from Firebase on startup. The bot may not be aware of existing trades.")
 
 
+async def manage_background_services():
+    """
+    A single task to manage all background services like PnL monitoring,
+    maintenance, alerting, and Telegram polling.
+    """
+    log.info("Starting consolidated background services management.")
+    
+    tasks_to_run = []
+    if client is not None:
+        tasks_to_run.extend([
+            daily_pnl_monitor_async(),
+            monthly_maintenance_async(),
+            performance_alerter_async(),
+        ])
+    
+    if telegram_bot:
+        tasks_to_run.append(telegram_polling_async())
+
+    if not tasks_to_run:
+        log.warning("No background services to run.")
+        return
+
+    try:
+        await asyncio.gather(*tasks_to_run)
+    except asyncio.CancelledError:
+        log.info("Background services manager task cancelled.")
+    except Exception:
+        log.exception("A critical error occurred in the background services manager.")
+        # This will bring down the whole gather, which is probably what we want
+        # so the main application can handle the failure.
+
 # -------------------------
 # App Lifespan Manager
 # -------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scan_task, telegram_thread, monitor_thread_obj, pnl_monitor_thread_obj, client, monitor_stop_event, main_loop
+    global client, main_loop
+    global scan_task, background_services_task, monitor_task, rogue_check_task
     log.info("EMA/BB Strategy Bot starting up...")
     
     # --- Startup Logic ---
     init_db()
     
-    # New Firebase init
     await asyncio.to_thread(init_firebase_sync)
     await asyncio.to_thread(load_state_from_firebase_sync)
 
     main_loop = asyncio.get_running_loop()
-
     ok, err = await asyncio.to_thread(init_binance_client_sync)
     
     if ok:
@@ -613,33 +645,14 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(validate_and_sanity_check_sync, True)
 
     if client is not None:
+        # Start all async tasks
         scan_task = main_loop.create_task(scanning_loop())
-        monitor_stop_event.clear()
-        monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
-        monitor_thread_obj.start()
-        log.info("Started monitor thread.")
-
-        pnl_monitor_thread_obj = threading.Thread(target=daily_pnl_monitor_thread_func, daemon=True)
-        pnl_monitor_thread_obj.start()
-        log.info("Started daily PnL monitor thread.")
-
-        maintenance_thread_obj = threading.Thread(target=monthly_maintenance_thread_func, daemon=True)
-        maintenance_thread_obj.start()
-        log.info("Started monthly maintenance thread.")
-
-        alerter_thread_obj = threading.Thread(target=performance_alerter_thread_func, daemon=True)
-        alerter_thread_obj.start()
-        log.info("Started performance alerter thread.")
+        background_services_task = main_loop.create_task(manage_background_services())
+        monitor_task = main_loop.create_task(monitor_async())
+        log.info("Scheduled main async tasks (scan, background, monitor).")
     else:
-        log.warning("Binance client not initialized -> scanning and monitor threads not started.")
+        log.warning("Binance client not initialized -> main tasks not started.")
 
-    if telegram_bot:
-        telegram_thread = threading.Thread(target=telegram_polling_thread, args=(main_loop,), daemon=True)
-        telegram_thread.start()
-        log.info("Started telegram polling thread.")
-    else:
-        log.info("Telegram not configured; telegram thread not started.")
-    
     try:
         await asyncio.to_thread(send_telegram, "EMA/BB Strategy Bot started. Running={}".format(running))
     except Exception:
@@ -649,30 +662,17 @@ async def lifespan(app: FastAPI):
 
     # --- Shutdown Logic ---
     log.info("EMA/BB Strategy Bot shutting down...")
-    if scan_task:
-        scan_task.cancel()
-        try:
-            await scan_task
-        except asyncio.CancelledError:
-            log.info("Scanning loop task cancelled successfully.")
-
-    if rogue_check_task:
-        rogue_check_task.cancel()
-        try:
-            await rogue_check_task
-        except asyncio.CancelledError:
-            log.info("Rogue position checker task cancelled successfully.")
-
-    monitor_stop_event.set()
-    if monitor_thread_obj and monitor_thread_obj.is_alive():
-        monitor_thread_obj.join(timeout=5)
-    if pnl_monitor_thread_obj and pnl_monitor_thread_obj.is_alive():
-        pnl_monitor_thread_obj.join(timeout=5)
     
-    if telegram_thread and telegram_thread.is_alive():
-        # The telegram thread is daemon, so it will exit automatically.
-        # We already set the monitor_stop_event which the telegram thread also checks.
-        pass
+    tasks_to_cancel = [
+        scan_task, background_services_task, monitor_task, rogue_check_task
+    ]
+    for task in tasks_to_cancel:
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                log.info(f"Task {getattr(task, 'get_name', lambda: 'N/A')()} cancelled successfully.")
 
     try:
         await asyncio.to_thread(send_telegram, "EMA/BB Strategy Bot shut down.")
@@ -3312,63 +3312,69 @@ def get_account_balance_usdt():
         log.exception("Failed to fetch account balance")
     return 0.0
 
-def monitor_thread_func():
+def _check_attention_required_sync():
+    """Synchronous helper to check for symbols needing attention."""
+    global last_attention_alert_time
+    try:
+        conn = sqlite3.connect(CONFIG["DB_FILE"])
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM attention_required")
+        attention_needed = cur.fetchall()
+        conn.close()
+
+        for row in attention_needed:
+            symbol, reason, details, ts = row
+            now = datetime.utcnow()
+            last_alert = last_attention_alert_time.get(symbol)
+            # Alert every 5 minutes
+            if last_alert is None or (now - last_alert).total_seconds() > 300:
+                send_telegram(f"🚨 ATTENTION REQUIRED on {symbol} 🚨\nReason: {reason}\nDetails: {details}\nTimestamp: {ts}", parse_mode='Markdown')
+                last_attention_alert_time[symbol] = now
+    except Exception as e:
+        log.exception(f"Failed to check for attention_required symbols: {e}")
+
+
+async def monitor_async():
+    """
+    Async task that monitors trades, manages SL/TP, and handles pending orders.
+    """
     global managed_trades, last_trade_close_time, running, overload_notified, symbol_loss_cooldown, last_attention_alert_time, ip_whitelist_error
-    log.info("Monitor thread started.")
-    while not monitor_stop_event.is_set():
-        if ip_whitelist_error:
-            log.warning("IP whitelist error detected. Monitor thread sleeping for 1 hour.")
-            time.sleep(3600)
-            continue
+    log.info("Async monitor task started.")
+    while True:
         try:
-            # Check for symbols that require manual attention
-            conn = sqlite3.connect(CONFIG["DB_FILE"])
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM attention_required")
-            attention_needed = cur.fetchall()
-            conn.close()
+            if ip_whitelist_error:
+                log.warning("IP whitelist error detected. Monitor task sleeping for 1 hour.")
+                await asyncio.sleep(3600)
+                continue
 
-            for row in attention_needed:
-                symbol, reason, details, ts = row
-                now = datetime.utcnow()
-                last_alert = last_attention_alert_time.get(symbol)
-                # Alert every 5 minutes
-                if last_alert is None or (now - last_alert).total_seconds() > 300:
-                    send_telegram(f"🚨 ATTENTION REQUIRED on {symbol} 🚨\nReason: {reason}\nDetails: {details}\nTimestamp: {ts}", parse_mode='Markdown')
-                    last_attention_alert_time[symbol] = now
-        except Exception as e:
-            log.exception(f"Failed to check for attention_required symbols: {e}")
+            await asyncio.to_thread(_check_attention_required_sync)
 
-        loop_start_time = time.time()
-        log.info("Monitor thread loop started.")
-        try:
+            loop_start_time = time.time()
+            log.info("Monitor task loop started.")
+            
             if client is None:
-                time.sleep(5)
+                await asyncio.sleep(5)
                 continue
 
             # --- Process Pending Limit Orders ---
-            with pending_limit_orders_lock:
+            async with pending_limit_orders_lock:
                 pending_snapshot = dict(pending_limit_orders)
 
             if pending_snapshot:
                 to_remove_pending = []
-                # Check status of all pending orders
                 for p_id, p_meta in pending_snapshot.items():
                     try:
-                        order_info = client.futures_get_order(symbol=p_meta['symbol'], orderId=p_meta['order_id'])
+                        order_info = await asyncio.to_thread(client.futures_get_order, symbol=p_meta['symbol'], orderId=p_meta['order_id'])
                         order_status = order_info['status']
                         
                         if order_status == 'FILLED':
                             log.info(f"✅ Limit order {p_id} for {p_meta['symbol']} has been filled!")
                             
                             actual_entry_price = float(order_info.get('avgPrice', p_meta['limit_price']))
-                            
-                            # The stop_price and take_price are now passed directly from the pending order metadata
                             stop_price = p_meta['stop_price']
-                            take_price = p_meta['take_price'] # This is for internal monitoring
+                            take_price = p_meta['take_price']
 
-                            # Place SL and TP orders together after the limit order is filled.
-                            sltp_orders = place_batch_sl_tp_sync(
+                            sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync,
                                 symbol=p_meta['symbol'], side=p_meta['side'],
                                 sl_price=stop_price, tp_price=take_price, qty=p_meta['qty']
                             )
@@ -3379,14 +3385,13 @@ def monitor_thread_func():
                                 "initial_qty": p_meta['qty'], "qty": p_meta['qty'], "notional": p_meta['qty'] * actual_entry_price,
                                 "leverage": p_meta['leverage'],
                                 "sl": stop_price,
-                                "tp": take_price, # The internally monitored TP level
+                                "tp": take_price,
                                 "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
                                 "be_moved": False,
                                 "trailing_active": False,
                                 "tp_hit": False,
                                 "risk_usdt": p_meta['risk_usdt'],
                                 "entry_reason": "LIMIT_FILL",
-                                # --- Carry over strategy metadata from pending order ---
                                 "strategy_id": p_meta.get('strategy_id', 1),
                                 "signal_confidence": p_meta.get('signal_confidence'),
                                 "adx_confirmation": p_meta.get('adx_confirmation'),
@@ -3395,25 +3400,23 @@ def monitor_thread_func():
                                 "atr_at_entry": p_meta.get('atr_at_entry')
                             }
 
-                            with managed_trades_lock:
+                            async with managed_trades_lock:
                                 managed_trades[trade_id] = meta
                             
-                            # Use a simplified record_trade call, as many fields are for the new management style
-                            record_trade({
+                            trade_record_data = {
                                 'id': trade_id, 'symbol': meta['symbol'], 'side': meta['side'], 'entry_price': meta['entry_price'],
                                 'exit_price': None, 'qty': meta['qty'], 'notional': meta['notional'], 'pnl': None,
                                 'open_time': meta['open_time'], 'close_time': None, 'risk_usdt': meta['risk_usdt'],
-                                'entry_reason': meta.get('entry_reason'), 'tp1': take_price # Store main TP here for reporting
-                            })
-                            add_managed_trade_to_db(meta) # Keep for now as backup
+                                'entry_reason': meta.get('entry_reason'), 'tp1': take_price
+                            }
+                            await asyncio.to_thread(record_trade, trade_record_data)
+                            await asyncio.to_thread(add_managed_trade_to_db, meta)
                             if firebase_db:
                                 try:
-                                    validate_firebase_data(meta)
-                                    firebase_db.child("managed_trades").child(trade_id).set(meta)
-                                except ValueError as e:
-                                    log.error(f"Firebase validation failed for filled limit order {trade_id}: {e}")
+                                    await asyncio.to_thread(validate_firebase_data, meta)
+                                    await asyncio.to_thread(firebase_db.child("managed_trades").child(trade_id).set, meta)
                                 except Exception as e:
-                                    log.exception(f"Failed to save new managed trade {trade_id} to Firebase: {e}")
+                                    log.error(f"Firebase validation or save failed for filled limit order {trade_id}: {e}")
                             
                             strategy_id_str = f"S{p_meta.get('strategy_id', 'N/A')}"
                             trade_type_str = "BB" if strategy_id_str == "S1" else "ST"
@@ -3427,140 +3430,65 @@ def monitor_thread_func():
                                 f"**Risk:** `{p_meta.get('risk_usdt', 0.0):.2f} USDT`\n"
                                 f"**Leverage:** `{p_meta.get('leverage', 0)}x`"
                             )
-                            send_telegram(filled_order_msg, parse_mode='Markdown')
+                            await asyncio.to_thread(send_telegram, filled_order_msg, parse_mode='Markdown')
                             to_remove_pending.append(p_id)
 
                         elif order_status in ['CANCELED', 'EXPIRED', 'REJECTED']:
                             log.info(f"Pending order {p_id} was {order_status}. Removing from tracking.")
-                            send_telegram(f"❌ Limit Order {order_status} for {p_meta['symbol']}.")
+                            await asyncio.to_thread(send_telegram, f"❌ Limit Order {order_status} for {p_meta['symbol']}.")
                             to_remove_pending.append(p_id)
 
-                        else: # Still NEW or PARTIALLY_FILLED, check for expiry
+                        else:
                             expiry_time_str = p_meta.get('expiry_time')
                             if expiry_time_str:
-                                # New logic: expire at the end of the candle
                                 expiry_time = datetime.fromisoformat(expiry_time_str)
                                 if datetime.now(timezone.utc) > expiry_time:
-                                    log.warning(f"Pending order {p_id} for {p_meta['symbol']} has expired at candle close. Cancelling.")
+                                    log.warning(f"Pending order {p_id} for {p_meta['symbol']} has expired. Cancelling.")
                                     try:
-                                        client.futures_cancel_order(symbol=p_meta['symbol'], orderId=p_meta['order_id'])
-                                        send_telegram(f"⌛️ Limit Order for {p_meta['symbol']} expired at candle close and was cancelled.")
+                                        await asyncio.to_thread(client.futures_cancel_order, symbol=p_meta['symbol'], orderId=p_meta['order_id'])
+                                        await asyncio.to_thread(send_telegram, f"⌛️ Limit Order for {p_meta['symbol']} expired and was cancelled.")
                                     except Exception as e:
-                                        log_and_send_error(f"Failed to cancel expired order {p_id}", e)
+                                        await asyncio.to_thread(log_and_send_error, f"Failed to cancel expired order {p_id}", e)
                                     to_remove_pending.append(p_id)
-                            else:
-                                # Fallback to old logic for orders created before this change
-                                timeout_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME']) * CONFIG['ORDER_ENTRY_TIMEOUT']
-                                if timeout_duration:
-                                    placed_time = datetime.fromisoformat(p_meta['place_time'])
-                                    if datetime.utcnow() - placed_time > timeout_duration:
-                                        log.warning(f"Pending order {p_id} for {p_meta['symbol']} has timed out (legacy). Cancelling.")
-                                        try:
-                                            client.futures_cancel_order(symbol=p_meta['symbol'], orderId=p_meta['order_id'])
-                                            send_telegram(f"⌛️ Limit Order for {p_meta['symbol']} timed out and was cancelled.")
-                                        except Exception as e:
-                                            log_and_send_error(f"Failed to cancel timed-out order {p_id}", e)
-                                        to_remove_pending.append(p_id)
+
                     except BinanceAPIException as e:
-                        if e.code == -2013: # Order does not exist
-                            log.warning(f"Pending order {p_id} not found on exchange. Assuming it was filled/canceled and removing.", e)
+                        if e.code == -2013:
+                            log.warning(f"Pending order {p_id} not found on exchange. Assuming it was filled/canceled and removing.", exc_info=True)
                             to_remove_pending.append(p_id)
-                            continue
                         else:
-                            log_and_send_error(f"API Error processing pending order {p_id}", e)
-                            to_remove_pending.append(p_id) # Remove to prevent error loops
+                            await asyncio.to_thread(log_and_send_error, f"API Error processing pending order {p_id}", e)
+                            to_remove_pending.append(p_id)
                     except Exception as e:
-                        log_and_send_error(f"Error processing pending order {p_id}", e)
+                        await asyncio.to_thread(log_and_send_error, f"Error processing pending order {p_id}", e)
                         to_remove_pending.append(p_id)
 
                 if to_remove_pending:
-                    with pending_limit_orders_lock:
+                    async with pending_limit_orders_lock:
                         for p_id in to_remove_pending:
                             pending_limit_orders.pop(p_id, None)
                             if firebase_db:
                                 try:
-                                    firebase_db.child("pending_limit_orders").child(p_id).delete()
+                                    await asyncio.to_thread(firebase_db.child("pending_limit_orders").child(p_id).delete)
                                 except Exception as e:
                                     log.exception(f"Failed to delete pending order {p_id} from Firebase: {e}")
 
+            # --- Position Monitoring ---
             positions = []
             try:
-                max_retries = 3
-                retry_delay = 10  # seconds
-                for attempt in range(max_retries):
-                    try:
-                        log.debug(f"Monitor thread: fetching positions (attempt {attempt + 1}/{max_retries})...")
-                        positions_fetch_start = time.time()
-                        positions = client.futures_position_information()
-                        positions_fetch_duration = time.time() - positions_fetch_start
-                        log.debug(f"Monitor thread: fetching positions took {positions_fetch_duration:.2f}s.")
-                        break  # Success
-                    except BinanceAPIException as e:
-                        if e.code == -1007 and attempt < max_retries - 1:
-                            log.warning(f"Timeout fetching positions (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay}s...")
-                            send_telegram(f"⚠️ Binance API timeout, retrying... ({attempt + 1}/{max_retries})")
-                            time.sleep(retry_delay)
-                            continue
-                        raise  # Re-raise the exception if it's not a retryable timeout or the last attempt
-                    except requests.exceptions.ReadTimeout as e:
-                        if attempt < max_retries - 1:
-                            log.warning(f"Read timeout fetching positions (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay}s: {e}")
-                            send_telegram(f"⚠️ Binance API read timeout, retrying... ({attempt + 1}/{max_retries})")
-                            time.sleep(retry_delay)
-                            continue
-                        log.error(f"Final attempt to fetch positions failed due to ReadTimeout: {e}")
-                        raise # Re-raise on last attempt
-            except BinanceAPIException as e:
-                log.error("Caught BinanceAPIException in monitor thread: %s", e)
-                
-                if e.code == -2015:
-                    ip = get_public_ip()
-                    error_msg = (
-                        f"🚨 **CRITICAL AUTH ERROR** 🚨\n\n"
-                        f"Binance API keys are invalid or the server's IP is not whitelisted.\n\n"
-                        f"Error Code: `{e.code}`\n"
-                        f"Server IP: `{ip}`\n\n"
-                        f"The bot is now paused. Please add the new IP to your Binance whitelist and use /startbot to resume."
-                    )
-                    send_telegram(error_msg, parse_mode='Markdown')
-                    ip_whitelist_error = True
-
-                # Handle other, potentially transient, API errors
-                html_content = None
-                if len(e.args) >= 3:
-                    html_content = e.args[2]
-
-                if html_content and isinstance(html_content, str) and html_content.strip().lower().startswith('<!doctype html>'):
-                    error_msg = f"Binance API returned an HTML error page. This could be an IP ban or server issue.\nServer IP: {get_public_ip()}"
-                    send_telegram(error_msg, document_content=html_content.encode('utf-8'), document_name="binance_error.html")
-                else:
-                    tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-                    safe_tb = _shorten_for_telegram(tb)
-                    error_msg = f"Binance API Error fetching positions: {e}\nTrace:\n{safe_tb}\nServer IP: {get_public_ip()}"
-                    send_telegram(error_msg)
-                
-                running = False
-                log.info("Bot paused due to API error. Waiting 2 minutes before next attempt...")
-                time.sleep(120)
+                positions = await asyncio.to_thread(client.futures_position_information)
+            except Exception as e:
+                await handle_critical_error_async(e, "fetching positions in monitor")
+                await asyncio.sleep(120)
                 continue
-            
-            # --- Position monitoring logic (from original code) ---
-            log.debug("Monitor thread: attempting to acquire lock...")
-            managed_trades_lock.acquire()
-            log.debug("Monitor thread: lock acquired.")
-            try:
+
+            async with managed_trades_lock:
                 trades_snapshot = dict(managed_trades)
-            finally:
-                managed_trades_lock.release()
-                log.debug("Monitor thread: lock released.")
             
-            # --- Pre-fetch kline data for all active symbols to reduce API calls ---
             active_symbols = {meta['symbol'] for meta in trades_snapshot.values()}
             kline_data_cache = {}
             for sym_key in active_symbols:
                 try:
-                    # Fetch enough data for RSI calculation
-                    kline_data_cache[sym_key] = fetch_klines_sync(sym_key, CONFIG["TIMEFRAME"], 50)
+                    kline_data_cache[sym_key] = await asyncio.to_thread(fetch_klines_sync, sym_key, CONFIG["TIMEFRAME"], 50)
                 except Exception as e:
                     log.error(f"Failed to pre-fetch klines for {sym_key} in monitor loop: {e}")
                     kline_data_cache[sym_key] = None
@@ -3569,22 +3497,20 @@ def monitor_thread_func():
             for tid, meta in trades_snapshot.items():
                 sym = meta['symbol']
                 pos = next((p for p in positions if p.get('symbol') == sym), None)
-                if not pos:
-                    continue
+                if not pos: continue
                 
                 pos_amt = float(pos.get('positionAmt') or 0.0)
                 unreal = float(pos.get('unRealizedProfit') or 0.0)
                 
-                with managed_trades_lock:
+                async with managed_trades_lock:
                     if tid in managed_trades:
                         managed_trades[tid]['unreal'] = unreal
 
                 if abs(pos_amt) < 1e-8:
                     close_time = datetime.utcnow().replace(tzinfo=timezone.utc)
                     meta['close_time'] = close_time.isoformat()
-                    exit_reason = meta.get('exit_reason', 'SL/TP') # Default to SL/TP if not set by an early exit
+                    exit_reason = meta.get('exit_reason', 'SL/TP')
                     
-                    # --- Post-Loss Cooldown Logic ---
                     if unreal < 0:
                         strategy_id = meta.get('strategy_id')
                         if strategy_id:
@@ -3592,37 +3518,25 @@ def monitor_thread_func():
                             if sym not in symbol_loss_cooldown:
                                 symbol_loss_cooldown[sym] = {}
                             symbol_loss_cooldown[sym][strategy_id] = cooldown_end_time
-                            log.info(f"Strategy {strategy_id} for {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown (until {cooldown_end_time}). PnL: {unreal:.4f}.")
-                            send_telegram(f"🧊 Strategy {strategy_id} for {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
-                        else:
-                            # Fallback for old trades without a strategy_id
-                            log.warning(f"Could not apply strategy-specific cooldown for {sym} because strategy_id was not found in trade metadata. Applying symbol-wide cooldown as a fallback.")
-                            # This path should not be taken for new trades, but it's here for safety.
-                            # The old check logic is gone, so this won't actually do anything unless we add a default key.
-                            # For now, we just log it. A better fallback might be to cooldown all strategies.
-                            pass
+                            log.info(f"Strategy {strategy_id} for {sym} on cooldown until {cooldown_end_time}. PnL: {unreal:.4f}.")
+                            await asyncio.to_thread(send_telegram, f"🧊 Strategy {strategy_id} for {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
 
-
-                    log.info(f"TRADE_CLOSE_EVENT: ID={tid}, Symbol={sym}, PnL={unreal:.4f}, Reason={exit_reason}. Preparing to record and remove from managed trades.")
+                    log.info(f"TRADE_CLOSE_EVENT: ID={tid}, Symbol={sym}, PnL={unreal:.4f}, Reason={exit_reason}.")
                     
-                    # Prepare the record with all available data, including new strategy fields
                     trade_record = meta.copy()
                     trade_record.update({
                         'exit_price': float(pos.get('entryPrice') or 0.0),
-                        'pnl': unreal,
-                        'close_time': meta['close_time'],
-                        'exit_reason': exit_reason
+                        'pnl': unreal, 'close_time': meta['close_time'], 'exit_reason': exit_reason
                     })
-                    # The 'meta' dictionary already contains all the strategy fields,
-                    # so we can just pass the updated record to the function.
-                    record_trade(trade_record)
-                    remove_managed_trade_from_db(tid) # Keep as backup
+                    await asyncio.to_thread(record_trade, trade_record)
+                    await asyncio.to_thread(remove_managed_trade_from_db, tid)
                     if firebase_db:
                         try:
-                            firebase_db.child("managed_trades").child(tid).delete()
+                            await asyncio.to_thread(firebase_db.child("managed_trades").child(tid).delete)
                         except Exception as e:
                             log.exception(f"Failed to delete managed trade {tid} from Firebase: {e}")
-                    with managed_trades_lock:
+                    
+                    async with managed_trades_lock:
                         last_trade_close_time[sym] = close_time
                     
                     close_msg = (
@@ -3632,7 +3546,7 @@ def monitor_thread_func():
                         f"**Reason:** {exit_reason}\n"
                         f"**PnL:** `{unreal:.4f} USDT`"
                     )
-                    send_telegram(close_msg, parse_mode='Markdown')
+                    await asyncio.to_thread(send_telegram, close_msg, parse_mode='Markdown')
                     to_remove.append(tid)
                     continue
                 
@@ -3641,389 +3555,162 @@ def monitor_thread_func():
                     log.warning(f"Skipping monitoring cycle for {tid} due to missing kline data.")
                     continue
 
-                # --- New In-Trade Management Logic ---
                 try:
                     strategy_id = str(meta.get('strategy_id', 1))
-                    exit_params = CONFIG['STRATEGY_EXIT_PARAMS'].get(strategy_id, CONFIG['STRATEGY_EXIT_PARAMS']['1'])
                     current_price = df_monitor['close'].iloc[-1]
                     entry_price = meta['entry_price']
                     side = meta['side']
 
-                    if strategy_id == '2':
-                        # --- SuperTrend Strategy Exit Logic (Multi-Stage TP) ---
-                        trade_phase = meta.get('trade_phase', 0)
-                        initial_qty = meta['initial_qty']
-                        atr_at_entry = meta.get('atr_at_entry')
-
-                        if not atr_at_entry or atr_at_entry <= 0:
-                            log.warning(f"Skipping ST exit logic for {tid} due to invalid atr_at_entry: {atr_at_entry}")
-                            continue
-
-                        # TP 1: 30% at 1.2x ATR, move SL to BE
-                        if trade_phase == 0:
-                            tp1_price = entry_price + 1.2 * atr_at_entry if side == 'BUY' else entry_price - 1.2 * atr_at_entry
-                            if (side == 'BUY' and current_price >= tp1_price) or (side == 'SELL' and current_price <= tp1_price):
-                                log.info(f"S2-TP1 HIT for {tid}. Closing 30%.")
-                                qty_to_close = round_qty(sym, initial_qty * 0.3)
-                                if qty_to_close > 0:
-                                    close_partial_market_position_sync(sym, side, qty_to_close)
-                                
-                                cancel_trade_sltp_orders_sync(meta)
-                                new_qty = meta['qty'] - qty_to_close
-                                new_sl_price = entry_price # Move to BE
-                                new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
-
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid].update({
-                                            'qty': new_qty, 'sltp_orders': new_orders, 'sl': new_sl_price,
-                                            'trade_phase': 1, 'be_moved': True, 'trailing_active': False # Deactivate normal trailing until final phase
-                                        })
-                                        add_managed_trade_to_db(managed_trades[tid])
-                                send_telegram(f"✅ S2-TP1 Hit for {sym}. Closed 30%, SL moved to BE.")
-                                continue
-                        
-                        # TP 2: 30% at 2.5x ATR, move SL to 1x ATR profit
-                        if trade_phase == 1:
-                            tp2_price = entry_price + 2.5 * atr_at_entry if side == 'BUY' else entry_price - 2.5 * atr_at_entry
-                            if (side == 'BUY' and current_price >= tp2_price) or (side == 'SELL' and current_price <= tp2_price):
-                                log.info(f"S2-TP2 HIT for {tid}. Closing another 30%.")
-                                qty_to_close = round_qty(sym, initial_qty * 0.3)
-                                if qty_to_close > 0:
-                                    close_partial_market_position_sync(sym, side, qty_to_close)
-                                
-                                cancel_trade_sltp_orders_sync(meta)
-                                new_qty = meta['qty'] - qty_to_close
-                                new_sl_price = entry_price + atr_at_entry if side == 'BUY' else entry_price - atr_at_entry # Move SL to 1R
-                                new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
-
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid].update({
-                                            'qty': new_qty, 'sltp_orders': new_orders, 'sl': new_sl_price,
-                                            'trade_phase': 2, 'trailing_active': True # Activate trailing for final part
-                                        })
-                                        add_managed_trade_to_db(managed_trades[tid])
-                                send_telegram(f"✅ S2-TP2 Hit for {sym}. Closed 30%, SL moved to 1R profit. Trailing activated.")
-                                continue
-                        continue # End of S2 logic
-                    
-                    elif strategy_id == '3':
-                        # --- Advanced SuperTrend (S3) Exit & Management Logic ---
-                        if not meta.get('trailing', True):
-                            continue # Skip if trailing is manually disabled
-
-                        s3_params = CONFIG['STRATEGY_3']
-                        
-                        # Calculate indicators needed for S3 logic
-                        df_monitor['atr2'] = atr_wilder(df_monitor, length=s3_params['TRAILING_ATR_PERIOD'])
-                        df_monitor['atr20'] = atr_wilder(df_monitor, length=s3_params['SUPERTREND_ATR_PERIOD'])
-                        supertrend(df_monitor, period=s3_params['SUPERTREND_ATR_PERIOD'], multiplier=s3_params['SUPERTREND_MULTIPLIER'], atr_series=df_monitor['atr20'])
-                        df_monitor['hhv10'] = hhv(df_monitor['high'], length=s3_params['TRAILING_HHV_PERIOD'])
-                        df_monitor['llv10'] = llv(df_monitor['low'], length=s3_params['TRAILING_HHV_PERIOD'])
-
-                        atr2_now = safe_last(df_monitor['atr2'])
-                        
-                        close_trade = False
-                        exit_reason = None
-
-                        # Exit Rule 1: Volatility Closure
-                        atr2_pct = (atr2_now / current_price) * 100 if current_price > 0 else 0
-                        if atr2_pct > s3_params['VOLATILITY_MAX_ATR2_PCT']:
-                            log.warning(f"S3 Volatility Exit for {tid}. ATR% {atr2_pct:.2f} > {s3_params['VOLATILITY_MAX_ATR2_PCT']}%")
-                            close_trade = True
-                            exit_reason = 'VOLATILITY_CLOSE'
-
-                        # Exit Rule 2: SuperTrend Flip
-                        if not close_trade:
-                            st_direction = safe_last(df_monitor.get('supertrend_direction'))
-                            if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
-                                log.info(f"S3 SuperTrend Flip Exit for {tid}.")
-                                close_trade = True
-                                exit_reason = 'SUPERTREND_FLIP'
-                        
-                        if close_trade:
-                            log.info(f"Closing trade {tid} for reason: {exit_reason}")
-                            cancel_trade_sltp_orders_sync(meta)
-                            close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid]['exit_reason'] = exit_reason
-                            continue
-
-                        # Trailing Stop Management
-                        is_trailing_active = meta.get('s3_trailing_active', False)
-                        
-                        if not is_trailing_active:
-                            profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
-                            if profit_pct >= s3_params['TRAILING_ACTIVATION_PROFIT_PCT']:
-                                log.info(f"S3: Activating trailing stop for {tid} at {profit_pct:.2f}% profit.")
-                                is_trailing_active = True
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid]['s3_trailing_active'] = True
-                                        add_managed_trade_to_db(managed_trades[tid])
-
-                        if is_trailing_active:
-                            trail_dist = s3_params['TRAILING_ATR_MULTIPLIER'] * atr2_now
-                            current_trailing_stop = meta.get('s3_trailing_stop', meta['sl'])
-                            new_sl = None
-
-                            if side == 'BUY':
-                                candidate_trail = safe_last(df_monitor.get('hhv10')) - trail_dist
-                                price_based_trail = current_price - trail_dist
-                                effective_candidate = min(candidate_trail, price_based_trail)
-                                if effective_candidate > current_trailing_stop: new_sl = effective_candidate
-                            else: # SELL
-                                candidate_trail = safe_last(df_monitor.get('llv10')) + trail_dist
-                                price_based_trail = current_price + trail_dist
-                                effective_candidate = max(candidate_trail, price_based_trail)
-                                if effective_candidate < current_trailing_stop: new_sl = effective_candidate
-                            
-                            if new_sl:
-                                log.info(f"S3 Trailing SL for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl:.4f}")
-                                cancel_trade_sltp_orders_sync(meta)
-                                new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid].update({
-                                            'sl': new_sl, 
-                                            'sltp_orders': new_orders, 
-                                            's3_trailing_stop': new_sl
-                                        })
-                                        add_managed_trade_to_db(managed_trades[tid])
-                                send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
-                        continue # End of S3 logic
-                    
-                    elif strategy_id == '4':
-                        # --- Advanced SuperTrend v2 (S4) Exit & Management Logic ---
-                        if not meta.get('trailing', True):
-                            continue # Skip if trailing is manually disabled
-                            
+                    if strategy_id == '4':
+                        if not meta.get('trailing', True): continue
                         s4_params = CONFIG['STRATEGY_4']
-                        current_price = safe_last(df_monitor['close'])
-                        entry_price = meta['entry_price']
                         
-                        # 1. Profit Gate Check to activate trailing
                         if not meta.get('s4_trailing_active'):
                             profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
-                            if profit_pct >= 0.005: # 0.5% profit
+                            if profit_pct >= 0.005:
                                 log.info(f"S4: Profit gate hit for {tid}. Activating trailing stop.")
-                                with managed_trades_lock:
+                                async with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid]['s4_trailing_active'] = True
-                                        add_managed_trade_to_db(managed_trades[tid])
-                                send_telegram(f"📈 Trailing stop activated for S4 trade on {sym} at {profit_pct:.2f}% profit.")
-                                meta['s4_trailing_active'] = True # Update meta for the current loop iteration
+                                        await asyncio.to_thread(add_managed_trade_to_db, managed_trades[tid])
+                                await asyncio.to_thread(send_telegram, f"📈 Trailing stop activated for S4 trade on {sym} at {profit_pct:.2f}% profit.")
+                                meta['s4_trailing_active'] = True
                         
-                        # 2. Main Trailing Logic (only runs if active and on new candle)
                         if meta.get('s4_trailing_active'):
                             latest_candle = df_monitor.iloc[-1]
                             last_checked_ts_str = meta.get('s4_last_candle_ts')
-                            
                             if not last_checked_ts_str:
                                 log.warning(f"S4 trade {tid} is missing s4_last_candle_ts. Skipping trailing logic.")
                                 continue
-                                
                             last_checked_ts = datetime.fromisoformat(last_checked_ts_str).astimezone(timezone.utc)
                             latest_candle_ts = latest_candle.name.to_pydatetime().astimezone(timezone.utc)
 
                             if latest_candle_ts > last_checked_ts:
                                 log.info(f"S4: New candle detected for active trail on {tid}.")
-                                
-                                df_monitor['atr2'] = atr_wilder(df_monitor, length=s4_params['TRAILING_ATR_PERIOD'])
-                                df_monitor['hhv10'] = hhv(df_monitor['high'], length=s4_params['TRAILING_HHV_PERIOD'])
-                                df_monitor['llv10'] = llv(df_monitor['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-                                df_monitor['supertrend'], df_monitor['supertrend_direction'] = supertrend(df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
+                                df_monitor['atr2'] = await asyncio.to_thread(atr_wilder, df_monitor, length=s4_params['TRAILING_ATR_PERIOD'])
+                                df_monitor['hhv10'] = await asyncio.to_thread(hhv, df_monitor['high'], length=s4_params['TRAILING_HHV_PERIOD'])
+                                df_monitor['llv10'] = await asyncio.to_thread(llv, df_monitor['low'], length=s4_params['TRAILING_HHV_PERIOD'])
+                                _, df_monitor['supertrend_direction'] = await asyncio.to_thread(supertrend, df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
                                 newly_closed_candle = df_monitor.loc[latest_candle_ts]
 
-                                # SuperTrend Flip Exit Check
                                 st_direction = newly_closed_candle['supertrend_direction']
                                 if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
                                     log.info(f"S4 SuperTrend Flip Exit for {tid}.")
-                                    cancel_trade_sltp_orders_sync(meta)
-                                    close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                                    with managed_trades_lock:
-                                        if tid in managed_trades:
-                                            managed_trades[tid]['exit_reason'] = 'S4_SUPERTREND_FLIP'
+                                    await asyncio.to_thread(cancel_trade_sltp_orders_sync, meta)
+                                    await asyncio.to_thread(close_partial_market_position_sync, sym, side, qty_to_close=meta['qty'])
+                                    async with managed_trades_lock:
+                                        if tid in managed_trades: managed_trades[tid]['exit_reason'] = 'S4_SUPERTREND_FLIP'
                                     continue
 
-                                # Trailing Stop Update
                                 current_trailing_stop = meta.get('s4_trailing_stop', meta['sl'])
                                 trail_dist = s4_params['TRAILING_ATR_MULTIPLIER'] * newly_closed_candle['atr2']
                                 new_sl_candidate = None
                                 if side == 'BUY':
-                                    candidate = newly_closed_candle['hhv10'] - trail_dist
-                                    price_based = newly_closed_candle['close'] - trail_dist
-                                    effective_candidate = max(candidate, price_based)
-                                    if effective_candidate > current_trailing_stop:
-                                        new_sl_candidate = effective_candidate
-                                else: # SELL
-                                    candidate = newly_closed_candle['llv10'] + trail_dist
-                                    price_based = newly_closed_candle['close'] + trail_dist
-                                    effective_candidate = min(candidate, price_based)
-                                    if effective_candidate < current_trailing_stop:
-                                        new_sl_candidate = effective_candidate
+                                    effective_candidate = max(newly_closed_candle['hhv10'] - trail_dist, newly_closed_candle['close'] - trail_dist)
+                                    if effective_candidate > current_trailing_stop: new_sl_candidate = effective_candidate
+                                else:
+                                    effective_candidate = min(newly_closed_candle['llv10'] + trail_dist, newly_closed_candle['close'] + trail_dist)
+                                    if effective_candidate < current_trailing_stop: new_sl_candidate = effective_candidate
+                                
                                 if new_sl_candidate:
                                     log.info(f"S4 Trailing SL update for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl_candidate:.4f}")
                                     current_trailing_stop = new_sl_candidate
-                                    with managed_trades_lock:
-                                        if tid in managed_trades:
-                                            managed_trades[tid]['s4_trailing_stop'] = new_sl_candidate
+                                    async with managed_trades_lock:
+                                        if tid in managed_trades: managed_trades[tid]['s4_trailing_stop'] = new_sl_candidate
 
-                                # Candle-Body Close Exit Check
                                 close_price = newly_closed_candle['close']
                                 if (side == 'BUY' and close_price < current_trailing_stop) or (side == 'SELL' and close_price > current_trailing_stop):
                                     log.info(f"S4 Trailing Stop Body-Close Exit for {tid}. Price: {close_price}, Stop: {current_trailing_stop}")
-                                    cancel_trade_sltp_orders_sync(meta)
-                                    close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                                    with managed_trades_lock:
-                                        if tid in managed_trades:
-                                            managed_trades[tid]['exit_reason'] = 'S4_TRAIL_STOP_BODY_CLOSE'
+                                    await asyncio.to_thread(cancel_trade_sltp_orders_sync, meta)
+                                    await asyncio.to_thread(close_partial_market_position_sync, sym, side, qty_to_close=meta['qty'])
+                                    async with managed_trades_lock:
+                                        if tid in managed_trades: managed_trades[tid]['exit_reason'] = 'S4_TRAIL_STOP_BODY_CLOSE'
                                     continue
                                 
-                                # Persist timestamp after processing
-                                with managed_trades_lock:
+                                async with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid]['s4_last_candle_ts'] = latest_candle_ts.isoformat()
-                                        add_managed_trade_to_db(managed_trades[tid])
-                        
-                        continue # End of S4 logic
+                                        await asyncio.to_thread(add_managed_trade_to_db, managed_trades[tid])
+                        continue
 
-                    # --- Generic BE & Trailing Logic ---
-                    # This block handles Strategy 1's BE/Trailing, and Strategy 2's final trailing phase.
-                    
-                    # Break-Even Trigger (Only for S1, or S2 if it hasn't hit TP1 yet)
-                    if not meta.get('be_moved'):
-                        profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
-                        if profit_pct >= exit_params['BE_TRIGGER']:
-                            log.info(f"Trade {tid} (S{strategy_id}) hit BE trigger. Moving SL.")
-                            cancel_trade_sltp_orders_sync(meta)
-                            new_sl_price = entry_price * (1 + exit_params['BE_SL_OFFSET'] if side == 'BUY' else 1 - exit_params['BE_SL_OFFSET'])
-                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=meta['qty'])
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid].update({'sl': new_sl_price, 'sltp_orders': new_orders, 'be_moved': True, 'trailing_active': True})
-                                    add_managed_trade_to_db(managed_trades[tid])
-                            send_telegram(f"📈 Breakeven triggered for {tid} ({sym}). SL moved to {new_sl_price:.4f} and trailing stop activated.")
-                            continue
-
-                    # Trailing Stop (For S1 after BE, and for S2 after TP2)
-                    if meta.get('trailing_active') and meta.get('trailing', True):
-                        atr_now = safe_latest_atr_from_df(df_monitor)
-                        
-                        volatility_ratio = atr_now / current_price if current_price > 0 else 0
-                        adx(df_monitor, period=CONFIG['ADX_PERIOD'])
-                        trend_strength = safe_last(df_monitor.get('adx'), default=0)
-                        
-                        if strategy_id == '2':
-                            atr_multiplier = 2.5
-                        else:
-                            atr_multiplier = calculate_trailing_distance(strategy_id, volatility_ratio, trend_strength)
-                        
-                        log.debug(f"Trailing for {sym} (S{strategy_id}): vol_ratio={volatility_ratio:.4f}, adx={trend_strength:.2f}, atr_mult={atr_multiplier:.2f}")
-
-                        new_sl = None
-                        current_sl = meta['sl']
-                        
-                        if side == 'BUY':
-                            potential_sl = current_price - (atr_now * atr_multiplier)
-                            if potential_sl > current_sl: new_sl = potential_sl
-                        else: # SELL
-                            potential_sl = current_price + (atr_now * atr_multiplier)
-                            if potential_sl < current_sl: new_sl = potential_sl
-                        
-                        if new_sl:
-                            log.info(f"Trailing SL for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
-                            cancel_trade_sltp_orders_sync(meta)
-                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid].update({'sl': new_sl, 'sltp_orders': new_orders})
-                                    add_managed_trade_to_db(managed_trades[tid])
-                            send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
-                
                 except Exception as e:
-                    log_and_send_error(f"Failed to process in-trade management logic for {tid}", e)
+                    await asyncio.to_thread(log_and_send_error, f"Failed to process in-trade management logic for {tid}", e)
 
             if to_remove:
-                log.info(f"Preparing to remove {len(to_remove)} closed trade(s) from managed state: {to_remove}")
-                with managed_trades_lock:
-                    log.info(f"State before removal: {len(managed_trades)} trades. Keys: {list(managed_trades.keys())}")
+                async with managed_trades_lock:
                     for tid in to_remove:
-                        removed_trade = managed_trades.pop(tid, None)
-                        if removed_trade:
-                            log.info(f"Successfully removed trade {tid} from in-memory state.")
-                        else:
-                            log.warning(f"Attempted to remove trade {tid} from state, but it was not found.")
-                    log.info(f"State after removal: {len(managed_trades)} trades. Keys: {list(managed_trades.keys())}")
-
-            # --- Overload Monitoring ---
+                        managed_trades.pop(tid, None)
+            
             loop_end_time = time.time()
             duration = loop_end_time - loop_start_time
             if duration > CONFIG["MONITOR_LOOP_THRESHOLD_SEC"]:
                 if not overload_notified:
-                    log.warning(f"Monitor loop took {duration:.2f}s to complete, exceeding threshold of {CONFIG['MONITOR_LOOP_THRESHOLD_SEC']}s.")
-                    send_telegram(f"⚠️ Bot Alert: The main monitoring loop is running slow ({duration:.2f}s), which may indicate server overload and could affect performance.")
+                    log.warning(f"Monitor loop took {duration:.2f}s to complete, exceeding threshold.")
+                    await asyncio.to_thread(send_telegram, f"⚠️ Bot Alert: The monitor task is running slow ({duration:.2f}s).")
                     overload_notified = True
             elif overload_notified:
-                # Reset notification flag if performance is back to normal
-                log.info("Monitor loop performance is back to normal.")
+                log.info("Monitor task performance is back to normal.")
                 overload_notified = False
             
-            # The loop should sleep for at least a little bit, but subtract processing time
-            # to keep the cycle time relatively constant.
-            log.debug(f"Monitor thread loop finished. Total duration: {duration:.2f}s.")
             sleep_duration = max(0.1, 5 - duration)
-            time.sleep(sleep_duration)
+            await asyncio.sleep(sleep_duration)
 
+        except asyncio.CancelledError:
+            log.info("Async monitor task cancelled.")
+            break
         except Exception as e:
-            log.exception("An unhandled exception occurred in monitor thread. Bot will be paused.")
-            try:
-                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-                safe_tb = _shorten_for_telegram(tb)
-                send_telegram(f"CRITICAL ERROR in monitor thread: {e}\nTrace:\n{safe_tb}\nBot paused.")
-            except Exception as send_exc:
-                log.error("Failed to send critical error notification from monitor thread: %s", send_exc)
-            running = False
-            time.sleep(30) # Sleep before next attempt after a critical failure
+            log.exception("An unhandled exception occurred in async monitor task.")
+            await asyncio.to_thread(log_and_send_error, "Unhandled exception in monitor task loop", e)
+            await asyncio.sleep(30)
+    
+    log.info("Async monitor task exiting.")
 
-    log.info("Monitor thread exiting.")
+def _get_daily_pnl_sync() -> float:
+    """Fetches the daily PnL from the database."""
+    try:
+        conn = sqlite3.connect(CONFIG["DB_FILE"])
+        cur = conn.cursor()
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        cur.execute("SELECT SUM(pnl) FROM trades WHERE DATE(close_time) = ?", (today_str,))
+        result = cur.fetchone()[0]
+        conn.close()
+        return result if result is not None else 0.0
+    except Exception as e:
+        log.exception("Failed to get daily PnL from DB")
+        return 0.0
 
-def daily_pnl_monitor_thread_func():
-    global running, daily_loss_limit_hit, daily_profit_limit_hit, current_daily_pnl, last_trade_close_time, frozen
-    log.info("Daily PnL monitor thread started.")
+
+async def daily_pnl_monitor_async():
+    """
+    Async task that monitors daily PnL and enforces loss/profit limits.
+    """
+    global running, daily_loss_limit_hit, daily_profit_limit_hit, current_daily_pnl, last_trade_close_time, frozen, pnl_monitor_consecutive_failures
+    log.info("Async daily PnL monitor task started.")
 
     last_check_date = datetime.now(timezone.utc).date()
 
-    while not monitor_stop_event.is_set():
+    while True:
         try:
             # Daily Reset Logic
             current_date = datetime.now(timezone.utc).date()
             if current_date != last_check_date:
                 log.info(f"New day detected. Resetting daily PnL limits.")
                 if daily_loss_limit_hit:
-                    send_telegram("☀️ New day, daily loss limit has been reset.")
+                    await asyncio.to_thread(send_telegram, "☀️ New day, daily loss limit has been reset.")
                 if daily_profit_limit_hit:
-                    send_telegram("☀️ New day, daily profit limit has been reset.")
+                    await asyncio.to_thread(send_telegram, "☀️ New day, daily profit limit has been reset.")
                 
                 daily_loss_limit_hit = False
                 daily_profit_limit_hit = False
                 current_daily_pnl = 0.0
                 last_check_date = current_date
                 
-                with managed_trades_lock:
+                async with managed_trades_lock:
                     last_trade_close_time.clear()
                     log.info("Cleared last_trade_close_time for all symbols.")
 
             # PnL Check Logic
-            conn = sqlite3.connect(CONFIG["DB_FILE"])
-            cur = conn.cursor()
-            today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            cur.execute("SELECT SUM(pnl) FROM trades WHERE DATE(close_time) = ?", (today_str,))
-            result = cur.fetchone()[0]
-            conn.close()
-            daily_pnl = result if result is not None else 0.0
+            daily_pnl = await asyncio.to_thread(_get_daily_pnl_sync)
             
             if daily_pnl != current_daily_pnl:
                 log.info(f"DAILY_PNL_UPDATE: Old PnL: {current_daily_pnl:.4f}, New PnL from DB: {daily_pnl:.4f}")
@@ -4037,7 +3724,7 @@ def daily_pnl_monitor_thread_func():
                     log.warning(f"MAX DAILY LOSS LIMIT HIT! PnL: {daily_pnl:.2f}, Limit: {CONFIG['MAX_DAILY_LOSS']:.2f}")
                     frozen = True
                     daily_loss_limit_hit = True
-                    send_telegram(f"🚨 MAX DAILY LOSS LIMIT HIT! 🚨\nToday's PnL: {daily_pnl:.2f} USDT\nLimit: {CONFIG['MAX_DAILY_LOSS']:.2f} USDT\nBot is now FROZEN. Use /unfreeze to resume trading.")
+                    await asyncio.to_thread(send_telegram, f"🚨 MAX DAILY LOSS LIMIT HIT! 🚨\nToday's PnL: {daily_pnl:.2f} USDT\nLimit: {CONFIG['MAX_DAILY_LOSS']:.2f} USDT\nBot is now FROZEN. Use /unfreeze to resume trading.")
             
             # Profit Limit Check
             if not daily_profit_limit_hit and CONFIG["MAX_DAILY_PROFIT"] > 0:
@@ -4051,41 +3738,64 @@ def daily_pnl_monitor_thread_func():
                         frozen = True
                         freeze_msg = "\nBot is now FROZEN (no new entries)."
 
-                    send_telegram(f"🎉 MAX DAILY PROFIT TARGET HIT! 🎉\nToday's PnL: {daily_pnl:.2f} USDT\nTarget: {CONFIG['MAX_DAILY_PROFIT']:.2f} USDT{freeze_msg}")
+                    await asyncio.to_thread(send_telegram, f"🎉 MAX DAILY PROFIT TARGET HIT! 🎉\nToday's PnL: {daily_pnl:.2f} USDT\nTarget: {CONFIG['MAX_DAILY_PROFIT']:.2f} USDT{freeze_msg}")
 
             # On success, reset failure counter
             pnl_monitor_consecutive_failures = 0
             # Sleep for the configured interval
-            time.sleep(CONFIG["DAILY_PNL_CHECK_INTERVAL"])
+            await asyncio.sleep(CONFIG["DAILY_PNL_CHECK_INTERVAL"])
 
+        except asyncio.CancelledError:
+            log.info("Async daily PnL monitor task cancelled.")
+            break
         except Exception as e:
             pnl_monitor_consecutive_failures += 1
-            log.exception(f"An unhandled exception occurred in the daily PnL monitor thread (failure #{pnl_monitor_consecutive_failures}).")
+            log.exception(f"An unhandled exception occurred in the async daily PnL monitor task (failure #{pnl_monitor_consecutive_failures}).")
             
             sleep_duration = 120  # Default 2 minutes sleep on error
             if pnl_monitor_consecutive_failures >= 3:
-                send_telegram(f"🚨 CRITICAL: The Daily PnL Monitor thread has failed {pnl_monitor_consecutive_failures} consecutive times. It will now sleep for 1 hour. Please investigate the logs.")
+                await asyncio.to_thread(send_telegram, f"🚨 CRITICAL: The Daily PnL Monitor task has failed {pnl_monitor_consecutive_failures} consecutive times. It will now sleep for 1 hour. Please investigate the logs.")
                 sleep_duration = 3600 # 1 hour
             
-            time.sleep(sleep_duration)
+            await asyncio.sleep(sleep_duration)
     
-    log.info("Daily PnL monitor thread exiting.")
+    log.info("Async daily PnL monitor task exiting.")
 
 
-def monthly_maintenance_thread_func():
-    global last_maintenance_month
-    log.info("Monthly maintenance thread started.")
-    
-    # Load the last run month from a state file to persist across restarts
+def _load_maintenance_state_sync():
+    """Loads the last run month from a state file to persist across restarts."""
     try:
         with open("maintenance_state.json", "r") as f:
             state = json.load(f)
-            last_maintenance_month = state.get("last_maintenance_month", "")
+            return state.get("last_maintenance_month", "")
     except FileNotFoundError:
-        last_maintenance_month = ""
         log.info("maintenance_state.json not found, starting fresh.")
+        return ""
+    except Exception as e:
+        log.exception("Failed to load maintenance state")
+        return ""
 
-    while not monitor_stop_event.is_set():
+def _save_maintenance_state_sync(state_str: str):
+    """Saves the last run month to a state file."""
+    try:
+        with open("maintenance_state.json", "w") as f:
+            json.dump({"last_maintenance_month": state_str}, f)
+    except IOError as e:
+        log.error(f"Could not write maintenance state file: {e}")
+    except Exception as e:
+        log.exception("Failed to save maintenance state")
+
+
+async def monthly_maintenance_async():
+    """
+    Async task that handles monthly report generation and database pruning.
+    """
+    global last_maintenance_month
+    log.info("Async monthly maintenance task started.")
+
+    last_maintenance_month = await asyncio.to_thread(_load_maintenance_state_sync)
+
+    while True:
         try:
             now = datetime.now(timezone.utc)
             current_month_str = now.strftime('%Y-%m')
@@ -4100,32 +3810,31 @@ def monthly_maintenance_thread_func():
                 month = last_day_of_previous_month.month
 
                 log.info(f"Generating report for {year}-{month:02d}...")
-                asyncio.run_coroutine_threadsafe(generate_and_send_monthly_report(year, month), main_loop)
+                await generate_and_send_monthly_report(year, month)
                 
                 # Add a small delay to ensure the report sends before we prune the data
-                time.sleep(15)
+                await asyncio.sleep(15)
 
                 log.info(f"Pruning database records for {year}-{month:02d}...")
-                prune_trades_db(year, month)
+                await asyncio.to_thread(prune_trades_db, year, month)
                 
                 last_maintenance_month = current_month_str
                 # Persist state
-                try:
-                    with open("maintenance_state.json", "w") as f:
-                        json.dump({"last_maintenance_month": last_maintenance_month}, f)
-                except IOError as e:
-                    log.error(f"Could not write maintenance state file: {e}")
+                await asyncio.to_thread(_save_maintenance_state_sync, last_maintenance_month)
                 
                 log.info(f"Monthly maintenance for {year}-{month:02d} complete. Next check in 1 hour.")
 
             # Sleep for an hour before checking again
-            time.sleep(3600)
+            await asyncio.sleep(3600)
 
+        except asyncio.CancelledError:
+            log.info("Async monthly maintenance task cancelled.")
+            break
         except Exception as e:
-            log.exception("An error occurred in the monthly maintenance thread.")
-            time.sleep(3600) # Wait an hour before retrying on error
+            log.exception("An error occurred in the async monthly maintenance task.")
+            await asyncio.sleep(3600) # Wait an hour before retrying on error
 
-    log.info("Monthly maintenance thread exiting.")
+    log.info("Async monthly maintenance task exiting.")
 
 
 # --- Performance Alerter ---
@@ -4135,68 +3844,100 @@ alert_states = {
     "avg_rr_7d": {"alerted": False, "threshold": 1.8},
 }
 
-def performance_alerter_thread_func():
-    log.info("Performance alerter thread started.")
-    # Initial sleep to allow some data to accumulate
-    time.sleep(3600) 
+def _get_performance_metrics_sync() -> dict:
+    """Connects to DB and fetches performance dataframes."""
+    metrics = {
+        "trades_last_24h": None,
+        "df_3d": None,
+        "df_7d": None
+    }
+    try:
+        conn = sqlite3.connect(CONFIG["DB_FILE"])
+        now = datetime.now(timezone.utc)
+        
+        one_day_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+        trades_last_24h_df = pd.read_sql_query("SELECT COUNT(*) FROM trades WHERE open_time >= ?", conn, params=(one_day_ago,))
+        if not trades_last_24h_df.empty:
+            metrics["trades_last_24h"] = trades_last_24h_df.iloc[0,0]
 
-    while not monitor_stop_event.is_set():
+        three_days_ago = (now - timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
+        metrics["df_3d"] = pd.read_sql_query("SELECT pnl FROM trades WHERE open_time >= ?", conn, params=(three_days_ago,))
+
+        seven_days_ago = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+        metrics["df_7d"] = pd.read_sql_query("SELECT pnl, risk_usdt FROM trades WHERE open_time >= ? AND risk_usdt > 0", conn, params=(seven_days_ago,))
+        
+        conn.close()
+    except Exception as e:
+        log.exception("Failed to get performance metrics from DB")
+    
+    return metrics
+
+
+async def performance_alerter_async():
+    """
+    Async task that periodically checks performance metrics and sends alerts.
+    """
+    global alerter_consecutive_failures
+    log.info("Async performance alerter task started.")
+    # Initial sleep to allow some data to accumulate
+    await asyncio.sleep(3600) 
+
+    while True:
         try:
-            now = datetime.now(timezone.utc)
-            conn = sqlite3.connect(CONFIG["DB_FILE"])
+            metrics = await asyncio.to_thread(_get_performance_metrics_sync)
             
             # 1. Check Trades per Day (last 24 hours)
-            one_day_ago = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
-            trades_last_24h_df = pd.read_sql_query("SELECT COUNT(*) FROM trades WHERE open_time >= ?", conn, params=(one_day_ago,))
-            if not trades_last_24h_df.empty:
-                trades_last_24h = trades_last_24h_df.iloc[0,0]
+            trades_last_24h = metrics.get("trades_last_24h")
+            if trades_last_24h is not None:
                 if trades_last_24h < alert_states["trades_per_day"]["threshold"] and not alert_states["trades_per_day"]["alerted"]:
-                    send_telegram(f"📉 *Performance Alert: Low Trade Frequency*\n\n- Trades in last 24h: {trades_last_24h}\n- Threshold: < {alert_states['trades_per_day']['threshold']}")
+                    await asyncio.to_thread(send_telegram, f"📉 *Performance Alert: Low Trade Frequency*\n\n- Trades in last 24h: {trades_last_24h}\n- Threshold: < {alert_states['trades_per_day']['threshold']}")
                     alert_states["trades_per_day"]["alerted"] = True
                 elif trades_last_24h >= alert_states["trades_per_day"]["threshold"] and alert_states["trades_per_day"]["alerted"]:
-                    send_telegram("✅ *Performance Restored: Trade Frequency*")
+                    await asyncio.to_thread(send_telegram, "✅ *Performance Restored: Trade Frequency*")
                     alert_states["trades_per_day"]["alerted"] = False
 
             # 2. Check Win Rate (last 3 days)
-            three_days_ago = (now - timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
-            df_3d = pd.read_sql_query("SELECT pnl FROM trades WHERE open_time >= ?", conn, params=(three_days_ago,))
-            if not df_3d.empty and len(df_3d) > 5: # Only check if there's a reasonable number of trades
+            df_3d = metrics.get("df_3d")
+            if df_3d is not None and not df_3d.empty and len(df_3d) > 5:
                 win_rate_3d = (len(df_3d[df_3d['pnl'] > 0]) / len(df_3d)) * 100
                 if win_rate_3d < alert_states["win_rate_3d"]["threshold"] and not alert_states["win_rate_3d"]["alerted"]:
-                    send_telegram(f"📉 *Performance Alert: Low Win Rate*\n\n- Win Rate (last 3d): {win_rate_3d:.2f}%\n- Threshold: < {alert_states['win_rate_3d']['threshold']}%")
+                    await asyncio.to_thread(send_telegram, f"📉 *Performance Alert: Low Win Rate*\n\n- Win Rate (last 3d): {win_rate_3d:.2f}%\n- Threshold: < {alert_states['win_rate_3d']['threshold']}%")
                     alert_states["win_rate_3d"]["alerted"] = True
                 elif win_rate_3d >= alert_states["win_rate_3d"]["threshold"] and alert_states["win_rate_3d"]["alerted"]:
-                    send_telegram("✅ *Performance Restored: Win Rate*")
+                    await asyncio.to_thread(send_telegram, "✅ *Performance Restored: Win Rate*")
                     alert_states["win_rate_3d"]["alerted"] = False
 
             # 3. Check Avg R:R (last 7 days)
-            seven_days_ago = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-            df_7d = pd.read_sql_query("SELECT pnl, risk_usdt FROM trades WHERE open_time >= ? AND risk_usdt > 0", conn, params=(seven_days_ago,))
-            if not df_7d.empty and len(df_7d) > 5: # Only check if there's a reasonable number of trades
+            df_7d = metrics.get("df_7d")
+            if df_7d is not None and not df_7d.empty and len(df_7d) > 5:
                 avg_rr_7d = (df_7d['pnl'] / df_7d['risk_usdt']).mean()
                 if avg_rr_7d < alert_states["avg_rr_7d"]["threshold"] and not alert_states["avg_rr_7d"]["alerted"]:
-                     send_telegram(f"📉 *Performance Alert: Low Avg R:R*\n\n- Avg R:R (last 7d): {avg_rr_7d:.2f}R\n- Threshold: < {alert_states['avg_rr_7d']['threshold']}R")
+                     await asyncio.to_thread(send_telegram, f"📉 *Performance Alert: Low Avg R:R*\n\n- Avg R:R (last 7d): {avg_rr_7d:.2f}R\n- Threshold: < {alert_states['avg_rr_7d']['threshold']}R")
                      alert_states["avg_rr_7d"]["alerted"] = True
                 elif avg_rr_7d >= alert_states["avg_rr_7d"]["threshold"] and alert_states["avg_rr_7d"]["alerted"]:
-                    send_telegram("✅ *Performance Restored: Average R:R*")
+                    await asyncio.to_thread(send_telegram, "✅ *Performance Restored: Average R:R*")
                     alert_states["avg_rr_7d"]["alerted"] = False
-
-            conn.close()
             
             # On success, reset failure counter
             alerter_consecutive_failures = 0
             # Sleep for 6 hours
-            time.sleep(6 * 3600)
+            await asyncio.sleep(6 * 3600)
+            
+        except asyncio.CancelledError:
+            log.info("Async performance alerter task cancelled.")
+            break
         except Exception as e:
             alerter_consecutive_failures += 1
-            log.exception(f"An unhandled exception occurred in the performance alerter thread (failure #{alerter_consecutive_failures}).")
+            log.exception(f"An unhandled exception occurred in the async performance alerter task (failure #{alerter_consecutive_failures}).")
             
             sleep_duration = 3600  # Default 1 hour sleep on error
             if alerter_consecutive_failures >= 3:
-                send_telegram(f"🚨 CRITICAL: The Performance Alerter thread has failed {alerter_consecutive_failures} consecutive times. It will now sleep for 6 hours. Please investigate the logs.")
+                await asyncio.to_thread(send_telegram, f"🚨 CRITICAL: The Performance Alerter task has failed {alerter_consecutive_failures} consecutive times. It will now sleep for 6 hours. Please investigate the logs.")
                 sleep_duration = 6 * 3600 # 6 hours
             
-            time.sleep(sleep_duration)
+            await asyncio.sleep(sleep_duration)
+
+    log.info("Async performance alerter task exiting.")
 
 
 async def manage_session_freeze_state():
@@ -4653,10 +4394,11 @@ def build_control_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def handle_callback_query_sync(update, loop):
+async def handle_callback_query_async(update):
+    """Handles callback queries from inline keyboards asynchronously."""
     query = update.callback_query
     try:
-        query.answer()
+        await asyncio.to_thread(query.answer)
         data = query.data
         log.info(f"Received callback query: {data}")
 
@@ -4665,45 +4407,44 @@ def handle_callback_query_sync(update, loop):
         
         percent = int(percent_str)
 
-        async def _task():
-            trades = await get_managed_trades_snapshot()
-            if trade_id not in trades:
-                await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found or already closed.")
-                return
+        trades = await get_managed_trades_snapshot()
+        if trade_id not in trades:
+            await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found or already closed.")
+            return
 
-            trade = trades[trade_id]
-            symbol = trade['symbol']
-            side = trade['side']
-            initial_qty = trade['initial_qty']
+        trade = trades[trade_id]
+        symbol = trade['symbol']
+        side = trade['side']
+        initial_qty = trade['initial_qty']
+        
+        qty_to_close = initial_qty * (percent / 100.0)
+        qty_to_close = await asyncio.to_thread(round_qty, symbol, qty_to_close)
+
+        if qty_to_close <= 0:
+            await asyncio.to_thread(send_telegram, f"Calculated quantity to close for {trade_id} is zero. No action taken.")
+            return
+
+        try:
+            if percent == 100:
+                # Closing 100% is a full close, let the monitor thread handle it by cancelling orders and closing position
+                await asyncio.to_thread(cancel_close_orders_sync, symbol)
+                pos_info = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+                pos = pos_info[0]
+                qty_to_close = float(pos['positionAmt'])
+                await asyncio.to_thread(close_partial_market_position_sync, symbol, side, abs(qty_to_close))
+                msg = f"✅ Closing 100% of {trade_id} ({symbol})."
+            else:
+                await asyncio.to_thread(close_partial_market_position_sync, symbol, side, qty_to_close)
+                msg = f"✅ Closing {percent}% of {trade_id} ({symbol})."
             
-            qty_to_close = initial_qty * (percent / 100.0)
-            qty_to_close = await asyncio.to_thread(round_qty, symbol, qty_to_close)
-
-            if qty_to_close <= 0:
-                await asyncio.to_thread(send_telegram, f"Calculated quantity to close for {trade_id} is zero. No action taken.")
-                return
-
-            try:
-                if percent == 100:
-                    # Closing 100% is a full close, let the monitor thread handle it by cancelling orders and closing position
-                    await asyncio.to_thread(cancel_close_orders_sync, symbol)
-                    pos = client.futures_position_information(symbol=symbol)[0]
-                    qty_to_close = float(pos['positionAmt'])
-                    await asyncio.to_thread(close_partial_market_position_sync, symbol, side, abs(qty_to_close))
-                    msg = f"✅ Closing 100% of {trade_id} ({symbol})."
-                else:
-                    await asyncio.to_thread(close_partial_market_position_sync, symbol, side, qty_to_close)
-                    msg = f"✅ Closing {percent}% of {trade_id} ({symbol})."
-                
-                await asyncio.to_thread(query.edit_message_text, text=f"{query.message.text}\n\nAction: {msg}")
-            except Exception as e:
-                log.exception(f"Failed to execute action for callback {data}")
-                await asyncio.to_thread(send_telegram, f"❌ Error processing action for {trade_id}: {e}")
-
-        asyncio.run_coroutine_threadsafe(_task(), loop)
+            await asyncio.to_thread(query.edit_message_text, text=f"{query.message.text}\n\nAction: {msg}")
+        except Exception as e:
+            log.exception(f"Failed to execute action for callback {data}")
+            await asyncio.to_thread(send_telegram, f"❌ Error processing action for {trade_id}: {e}")
 
     except Exception as e:
-        log.exception("Error in handle_callback_query_sync")
+        log.exception("Error in handle_callback_query_async")
+
 
 async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
     """
@@ -4741,12 +4482,14 @@ async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
         log.exception(f"Error during run_test_order for S{strategy_id} on {symbol}")
         await asyncio.to_thread(send_telegram, f"❌ An error occurred during the test: {e}")
 
-def handle_update_sync(update, loop):
+
+async def handle_update_async(update):
+    """Handles incoming Telegram updates asynchronously."""
     try:
         if update is None:
             return
         if update.callback_query:
-            handle_callback_query_sync(update, loop)
+            await handle_callback_query_async(update)
             return
         if getattr(update, 'message', None):
             msg = update.message
@@ -4774,44 +4517,40 @@ def handle_update_sync(update, loop):
                             new_val = val_str
                         
                         CONFIG[key] = new_val
-                        send_telegram(f"✅ Parameter updated: {key} = {CONFIG[key]}")
+                        await asyncio.to_thread(send_telegram, f"✅ Parameter updated: {key} = {CONFIG[key]}")
                         return # Stop further processing
                     except (ValueError, TypeError) as e:
-                        send_telegram(f"❌ Error setting {key}: Invalid value '{val_str}'. Please provide a valid value. Error: {e}")
+                        await asyncio.to_thread(send_telegram, f"❌ Error setting {key}: Invalid value '{val_str}'. Please provide a valid value. Error: {e}")
                         return
             # --- End Automatic Parameter Editing ---
 
             if text.startswith("/startbot"):
                 if daily_loss_limit_hit:
-                    send_telegram(f"❌ Cannot start bot: Daily loss limit of {CONFIG['MAX_DAILY_LOSS']:.2f} USDT has been reached. Bot will remain paused until the next UTC day.")
+                    await asyncio.to_thread(send_telegram, f"❌ Cannot start bot: Daily loss limit of {CONFIG['MAX_DAILY_LOSS']:.2f} USDT has been reached. Bot will remain paused until the next UTC day.")
                 else:
-                    fut = asyncio.run_coroutine_threadsafe(_set_running(True), loop)
-                    try: fut.result(timeout=5)
-                    except Exception as e: log.error("Failed to execute /startbot action: %s", e)
-                    send_telegram("✅ Bot is now **RUNNING**.", parse_mode='Markdown')
+                    await _set_running(True)
+                    await asyncio.to_thread(send_telegram, "✅ Bot is now **RUNNING**.", parse_mode='Markdown')
                     
                     # Start the periodic rogue position checker
                     async def start_rogue_checker():
                         global rogue_check_task
                         if rogue_check_task and not rogue_check_task.done():
                             log.info("Rogue position checker task is already running.")
-                            send_telegram("Rogue position checker is already active.")
+                            await asyncio.to_thread(send_telegram, "Rogue position checker is already active.")
                             return
                         
                         log.info("Performing initial check for rogue positions...")
-                        send_telegram("Performing initial check for rogue positions...")
+                        await asyncio.to_thread(send_telegram, "Performing initial check for rogue positions...")
                         await check_and_import_rogue_trades()
                         
                         log.info("Starting hourly rogue position checker...")
                         rogue_check_task = asyncio.create_task(periodic_rogue_check_loop())
-                        send_telegram("Hourly rogue position checker started.")
+                        await asyncio.to_thread(send_telegram, "Hourly rogue position checker started.")
 
-                    asyncio.run_coroutine_threadsafe(start_rogue_checker(), loop)
+                    asyncio.create_task(start_rogue_checker())
             elif text.startswith("/stopbot"):
-                fut = asyncio.run_coroutine_threadsafe(_set_running(False), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute /stopbot action: %s", e)
-                send_telegram("🛑 Bot is now **STOPPED**.", parse_mode='Markdown')
+                await _set_running(False)
+                await asyncio.to_thread(send_telegram, "🛑 Bot is now **STOPPED**.", parse_mode='Markdown')
 
                 # Stop the periodic rogue position checker
                 async def stop_rogue_checker():
@@ -4823,36 +4562,23 @@ def handle_update_sync(update, loop):
                         except asyncio.CancelledError:
                             log.info("Rogue position checker task cancelled successfully.")
                         rogue_check_task = None
-                        send_telegram("Hourly rogue position checker stopped.")
+                        await asyncio.to_thread(send_telegram, "Hourly rogue position checker stopped.")
                     else:
-                        send_telegram("Hourly rogue position checker was not running.")
+                        await asyncio.to_thread(send_telegram, "Hourly rogue position checker was not running.")
 
-                asyncio.run_coroutine_threadsafe(stop_rogue_checker(), loop)
+                asyncio.create_task(stop_rogue_checker())
             elif text.startswith("/freeze"):
-                fut = asyncio.run_coroutine_threadsafe(_freeze_command(), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute /freeze action: %s", e)
-                send_telegram("❄️ Bot is now **FROZEN**. It will not open new trades.", parse_mode='Markdown')
+                await _freeze_command()
+                await asyncio.to_thread(send_telegram, "❄️ Bot is now **FROZEN**. It will not open new trades.", parse_mode='Markdown')
             elif text.startswith("/unfreeze"):
-                fut = asyncio.run_coroutine_threadsafe(_unfreeze_command(), loop)
-                try: fut.result(timeout=5)
-                except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
-                send_telegram("✅ Bot is now **UNFROZEN**. Active session freeze has been overridden.", parse_mode='Markdown')
+                await _unfreeze_command()
+                await asyncio.to_thread(send_telegram, "✅ Bot is now **UNFROZEN**. Active session freeze has been overridden.", parse_mode='Markdown')
             elif text.startswith("/status"):
-                log.info("Received /status command. Scheduling task.")
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
-                trades = {}
-                try:
-                    log.info("Waiting for /status task future result...")
-                    trades = fut.result(timeout=10) # Increased timeout for debugging
-                    log.info("Got /status task future result.")
-                except Exception as e:
-                    log.error("Failed to get managed trades for /status: %s", e, exc_info=True)
-                
+                trades = await get_managed_trades_snapshot()
                 unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
                 
                 # Account & PnL Info
-                balance = get_account_balance_usdt()
+                balance = await asyncio.to_thread(get_account_balance_usdt)
                 balance_str = f"{balance:.2f} USDT" if balance > 0 else "N/A (API Error?)"
                 
                 pnl_info = (
@@ -4902,30 +4628,25 @@ def handle_update_sync(update, loop):
                     f"Available Balance: *{balance_str}*\n\n"
                     f"📈 *Trade PnL Info*\n{pnl_info}"
                 )
-                send_telegram(txt, parse_mode='Markdown')
+                await asyncio.to_thread(send_telegram, txt, parse_mode='Markdown')
                 try:
-                    telegram_bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
+                    await asyncio.to_thread(telegram_bot.send_message, chat_id=int(TELEGRAM_CHAT_ID), text="Controls:", reply_markup=build_control_keyboard())
                 except Exception:
                     log.exception("Failed to send telegram keyboard")
             elif text.startswith("/ip") or text.startswith("/forceip"):
-                ip = get_public_ip()
-                send_telegram(f"Server IP: {ip}")
+                ip = await asyncio.to_thread(get_public_ip)
+                await asyncio.to_thread(send_telegram, f"Server IP: {ip}")
             elif text.startswith("/listorders"):
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
-                trades = {}
-                try:
-                    trades = fut.result(timeout=5)
-                except Exception:
-                    pass
+                trades = await get_managed_trades_snapshot()
                 if not trades:
-                    send_telegram("No managed trades.")
+                    await asyncio.to_thread(send_telegram, "No managed trades.")
                 else:
-                    send_telegram("Open Trades:")
+                    await asyncio.to_thread(send_telegram, "Open Trades:")
                     for trade_id, v in trades.items():
                         unreal = v.get('unreal')
                         unreal_str = "N/A" if unreal is None else f"{float(unreal):.6f}"
                         
-                        text = (f"📈 *{v['symbol']}* `{v['side']}`\n"
+                        text_msg = (f"📈 *{v['symbol']}* `{v['side']}`\n"
                                 f"   - **Qty:** `{v['qty']}`\n"
                                 f"   - **Entry:** `{v['entry_price']:.4f}`\n"
                                 f"   - **SL/TP:** `{v['sl']:.4f}` / `{v['tp']:.4f}`\n"
@@ -4940,9 +4661,9 @@ def handle_update_sync(update, loop):
                         ])
                         
                         try:
-                            telegram_bot.send_message(
+                            await asyncio.to_thread(telegram_bot.send_message,
                                 chat_id=int(TELEGRAM_CHAT_ID),
-                                text=text,
+                                text=text_msg,
                                 reply_markup=keyboard,
                                 parse_mode='Markdown'
                             )
@@ -4950,30 +4671,24 @@ def handle_update_sync(update, loop):
                             log.error(f"Failed to send /listorders message for {trade_id}: {e}")
 
             elif text.startswith("/listpending"):
-                fut = asyncio.run_coroutine_threadsafe(get_pending_orders_snapshot(), loop)
-                pending_orders = {}
-                try:
-                    pending_orders = fut.result(timeout=5)
-                except Exception as e:
-                    log.error("Failed to get pending orders for /listpending: %s", e)
-                
+                pending_orders = await get_pending_orders_snapshot()
                 if not pending_orders:
-                    send_telegram("No pending limit orders.")
+                    await asyncio.to_thread(send_telegram, "No pending limit orders.")
                 else:
-                    send_telegram("Pending Limit Orders:")
+                    await asyncio.to_thread(send_telegram, "Pending Limit Orders:")
                     for p_id, p_meta in pending_orders.items():
                         placed_time_dt = datetime.fromisoformat(p_meta['place_time'])
                         age = format_timedelta(datetime.utcnow() - placed_time_dt)
-                        text = (f"⏳ *{p_meta['symbol']}* `{p_meta['side']}`\n"
+                        text_msg = (f"⏳ *{p_meta['symbol']}* `{p_meta['side']}`\n"
                                 f"   - **Qty:** `{p_meta['qty']}`\n"
                                 f"   - **Price:** `{p_meta['limit_price']:.4f}`\n"
                                 f"   - **Age:** `{age}`\n"
                                 f"   - **ID:** `{p_id}`")
                         
-                        send_telegram(text, parse_mode='Markdown')
+                        await asyncio.to_thread(send_telegram, text_msg, parse_mode='Markdown')
 
             elif text.startswith("/sessions"):
-                send_telegram("Checking session status...")
+                await asyncio.to_thread(send_telegram, "Checking session status...")
                 now_utc = datetime.now(timezone.utc)
                 merged_intervals = get_merged_freeze_intervals()
                 
@@ -4981,7 +4696,7 @@ def handle_update_sync(update, loop):
                 for start, end, name in merged_intervals:
                     if start <= now_utc < end:
                         time_left = end - now_utc
-                        send_telegram(f"❄️ Bot is FROZEN for {name}.\n\nTime until unfreeze: {format_timedelta(time_left)}")
+                        await asyncio.to_thread(send_telegram, f"❄️ Bot is FROZEN for {name}.\n\nTime until unfreeze: {format_timedelta(time_left)}")
                         in_freeze = True
                         break
                 
@@ -4989,21 +4704,21 @@ def handle_update_sync(update, loop):
                     if merged_intervals:
                         next_start, _, next_name = merged_intervals[0]
                         time_to_next = next_start - now_utc
-                        send_telegram(f"✅ Bot is ACTIVE.\n\nNext freeze for {next_name} in: {format_timedelta(time_to_next)}")
+                        await asyncio.to_thread(send_telegram, f"✅ Bot is ACTIVE.\n\nNext freeze for {next_name} in: {format_timedelta(time_to_next)}")
                     else:
-                        send_telegram("✅ Bot is ACTIVE.\n\nNo session freezes are scheduled in the next 48 hours.")
+                        await asyncio.to_thread(send_telegram, "✅ Bot is ACTIVE.\n\nNo session freezes are scheduled in the next 48 hours.")
             
             elif text.startswith("/showparams"):
                 param_list = [f" - `{k}` = `{v}`" for k, v in CONFIG.items()]
                 out = "⚙️ *Current Bot Parameters*\n\n" + "\n".join(param_list)
-                send_telegram(out, parse_mode='Markdown')
+                await asyncio.to_thread(send_telegram, out, parse_mode='Markdown')
             elif text.startswith("/setparam"):
                 parts = text.split()
                 if len(parts) >= 3:
                     key = parts[1]
                     val = " ".join(parts[2:])
                     if key not in CONFIG:
-                        send_telegram(f"Parameter {key} not found.")
+                        await asyncio.to_thread(send_telegram, f"Parameter {key} not found.")
                     else:
                         old = CONFIG[key]
                         try:
@@ -5017,130 +4732,79 @@ def handle_update_sync(update, loop):
                                 CONFIG[key] = [x.strip().upper() for x in val.split(",")]
                             else:
                                 CONFIG[key] = val
-                            send_telegram(f"Set {key} = {CONFIG[key]}")
+                            await asyncio.to_thread(send_telegram, f"Set {key} = {CONFIG[key]}")
                         except Exception as e:
-                            send_telegram(f"Failed to set {key}: {e}")
+                            await asyncio.to_thread(send_telegram, f"Failed to set {key}: {e}")
                 else:
-                    send_telegram("Usage: /setparam KEY VALUE")
+                    await asyncio.to_thread(send_telegram, "Usage: /setparam KEY VALUE")
             elif text.startswith("/validate"):
-                result = validate_and_sanity_check_sync(send_report=False)
-                send_telegram("Validation result: " + ("OK" if result["ok"] else "ERROR"))
+                result = await asyncio.to_thread(validate_and_sanity_check_sync, send_report=False)
+                await asyncio.to_thread(send_telegram, "Validation result: " + ("OK" if result["ok"] else "ERROR"))
                 for c in result["checks"]:
-                    send_telegram(f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
+                    await asyncio.to_thread(send_telegram, f"{c['type']}: ok={c['ok']} detail={c.get('detail')}")
             elif text.startswith("/report"):
-                # Handler for the /report command to generate and send the PnL report
-                send_telegram("Generating performance report, please wait...")
-                log.info("Scheduling /report task.")
-                fut = asyncio.run_coroutine_threadsafe(generate_and_send_report(), loop)
-                try:
-                    log.info("Waiting for /report task future...")
-                    fut.result(timeout=60) # Give it a long timeout for report generation
-                    log.info("/report task finished.")
-                except Exception as e:
-                    log.error("Failed to execute /report action: %s", e, exc_info=True)
-                    send_telegram(f"Failed to generate report: {e}")
+                await asyncio.to_thread(send_telegram, "Generating performance report, please wait...")
+                await generate_and_send_report()
             elif text.startswith("/stratreport"):
-                send_telegram("Generating strategy performance report, please wait...")
-                fut = asyncio.run_coroutine_threadsafe(generate_and_send_strategy_report(), loop)
-                try:
-                    fut.result(timeout=60)
-                except Exception as e:
-                    log.error("Failed to execute /stratreport action: %s", e)
-                    send_telegram(f"Failed to generate strategy report: {e}")
+                await asyncio.to_thread(send_telegram, "Generating strategy performance report, please wait...")
+                await generate_and_send_strategy_report()
             elif text.startswith("/chart"):
                 parts = text.split()
                 if len(parts) < 2:
-                    send_telegram("Usage: /chart <SYMBOL>")
+                    await asyncio.to_thread(send_telegram, "Usage: /chart <SYMBOL>")
                 else:
                     symbol = parts[1].upper()
-                    send_telegram(f"Generating chart for {symbol}, please wait...")
-                    
-                    async def _task():
-                        title, chart_bytes = await asyncio.to_thread(generate_adv_chart_sync, symbol)
-                        await asyncio.to_thread(
-                            send_telegram,
-                            msg=title,
-                            document_content=chart_bytes,
-                            document_name=f"{symbol}_chart.png"
-                        )
-                    
-                    fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                    try:
-                        fut.result(timeout=60)
-                    except Exception as e:
-                        log.error(f"Failed to execute /chart action for {symbol}: {e}")
-                        send_telegram(f"Failed to generate chart for {symbol}: {e}")
+                    await asyncio.to_thread(send_telegram, f"Generating chart for {symbol}, please wait...")
+                    title, chart_bytes = await asyncio.to_thread(generate_adv_chart_sync, symbol)
+                    await asyncio.to_thread(
+                        send_telegram,
+                        msg=title,
+                        document_content=chart_bytes,
+                        document_name=f"{symbol}_chart.png"
+                    )
             elif text.startswith("/rejects"):
-                async def _task():
-                    if not rejected_trades:
-                        await asyncio.to_thread(send_telegram, "No rejected trades have been recorded yet.")
-                        return
-
+                if not rejected_trades:
+                    await asyncio.to_thread(send_telegram, "No rejected trades have been recorded yet.")
+                else:
                     report_lines = ["*Last 5 Rejected Trades*"]
-                    # Using list() to create a copy for safe iteration
                     for reject in reversed(list(rejected_trades)):
                         ts = datetime.fromisoformat(reject['timestamp']).strftime('%Y-%m-%d %H:%M:%S UTC')
                         details_str = ", ".join([f"{k}: {v}" for k, v in reject['details'].items()])
-                        
                         line = (
                             f"\n*Symbol:* {reject['symbol']} at {ts}\n"
                             f"  - *Reason:* {reject['reason']}\n"
                             f"  - *Details:* `{details_str}`"
                         )
                         report_lines.append(line)
-                    
                     await asyncio.to_thread(send_telegram, "\n".join(report_lines), parse_mode='Markdown')
-
-                log.info("Scheduling /rejects task.")
-                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try:
-                    log.info("Waiting for /rejects task future...")
-                    fut.result(timeout=10)
-                    log.info("/rejects task finished waiting for future.")
-                except Exception as e:
-                    log.error("Failed to execute /rejects action: %s", e, exc_info=True)
             elif text.startswith("/trail"):
                 parts = text.split()
                 if len(parts) != 3:
-                    send_telegram("Usage: /trail <trade_id> <on|off>")
+                    await asyncio.to_thread(send_telegram, "Usage: /trail <trade_id> <on|off>")
                 else:
                     trade_id, state = parts[1], parts[2].lower()
                     if state not in ['on', 'off']:
-                        send_telegram("Invalid state. Use 'on' or 'off'.")
+                        await asyncio.to_thread(send_telegram, "Invalid state. Use 'on' or 'off'.")
                     else:
                         new_trailing_state = (state == 'on')
-                        
-                        async def _task():
-                            async with managed_trades_lock:
-                                if trade_id in managed_trades:
-                                    # Update in-memory state first
-                                    managed_trades[trade_id]['trailing'] = new_trailing_state
-                                    
-                                    # Persist to DB and Firebase
-                                    trade_to_update = managed_trades[trade_id]
-                                    await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
-                                    if firebase_db:
-                                        try:
-                                            # Update only the 'trailing' field in Firebase for efficiency
-                                            await asyncio.to_thread(
-                                                firebase_db.child("managed_trades").child(trade_id).child("trailing").set,
-                                                new_trailing_state
-                                            )
-                                        except Exception as e:
-                                            log.exception(f"Failed to update trailing status in Firebase for {trade_id}: {e}")
-
-                                    status_msg = "ENABLED" if new_trailing_state else "DISABLED"
-                                    msg = f"✅ Trailing stop for trade `{trade_id}` has been manually {status_msg}."
-                                    await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
-                                else:
-                                    await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
-
-                        fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                        try:
-                            fut.result(timeout=10)
-                        except Exception as e:
-                            log.error(f"Failed to execute /trail command: {e}")
-                            send_telegram(f"An error occurred while processing the /trail command: {e}")
+                        async with managed_trades_lock:
+                            if trade_id in managed_trades:
+                                managed_trades[trade_id]['trailing'] = new_trailing_state
+                                trade_to_update = managed_trades[trade_id]
+                                await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
+                                if firebase_db:
+                                    try:
+                                        await asyncio.to_thread(
+                                            firebase_db.child("managed_trades").child(trade_id).child("trailing").set,
+                                            new_trailing_state
+                                        )
+                                    except Exception as e:
+                                        log.exception(f"Failed to update trailing status in Firebase for {trade_id}: {e}")
+                                status_msg = "ENABLED" if new_trailing_state else "DISABLED"
+                                msg = f"✅ Trailing stop for trade `{trade_id}` has been manually {status_msg}."
+                                await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+                            else:
+                                await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
 
             elif text.startswith("/help"):
                 help_text = (
@@ -5173,16 +4837,10 @@ def handle_update_sync(update, loop):
                     "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
                     "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP."
                 )
-                async def _task():
-                    await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
-                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try:
-                    fut.result(timeout=10)
-                except Exception as e:
-                    log.error("Failed to execute /help action: %s", e)
+                await asyncio.to_thread(send_telegram, help_text, parse_mode='Markdown')
             elif text.startswith("/usage"):
-                cpu_usage = psutil.cpu_percent(interval=1)
-                mem_data = get_memory_info()
+                cpu_usage = await asyncio.to_thread(psutil.cpu_percent, interval=1)
+                mem_data = await asyncio.to_thread(get_memory_info)
                 
                 usage_report = (
                     f"🖥️ *System Resource Usage*\n\n"
@@ -5198,17 +4856,17 @@ def handle_update_sync(update, loop):
                     f"    - Total: {mem_data['total_gb']:.2f} GB\n"
                     f"    - Used: {mem_data['used_gb']:.2f} GB"
                 )
-                send_telegram(usage_report, parse_mode='Markdown')
+                await asyncio.to_thread(send_telegram, usage_report, parse_mode='Markdown')
             elif text.startswith(("/testorder", "/fulltestorder")):
                 import random
                 parts = text.split()
                 if len(parts) < 2:
-                    send_telegram("Usage: /testorder <S1|S2|S3|S4> [SYMBOL]\nExample: /testorder S1 BTCUSDT")
+                    await asyncio.to_thread(send_telegram, "Usage: /testorder <S1|S2|S3|S4> [SYMBOL]\nExample: /testorder S1 BTCUSDT")
                     return
 
                 strategy_id_str = parts[1].upper()
                 if strategy_id_str not in ["S1", "S2", "S3", "S4"]:
-                    send_telegram(f"Invalid strategy: {strategy_id_str}. Please use S1, S2, S3, or S4.")
+                    await asyncio.to_thread(send_telegram, f"Invalid strategy: {strategy_id_str}. Please use S1, S2, S3, or S4.")
                     return
                 
                 strategy_id = int(strategy_id_str[1:])
@@ -5217,28 +4875,19 @@ def handle_update_sync(update, loop):
                 if len(parts) > 2:
                     symbol = parts[2].upper()
                     if symbol not in CONFIG["SYMBOLS"]:
-                       send_telegram(f"Symbol {symbol} is not in the bot's symbol list.")
+                       await asyncio.to_thread(send_telegram, f"Symbol {symbol} is not in the bot's symbol list.")
                        return
                 else:
                     symbol = random.choice(CONFIG["SYMBOLS"])
 
                 full_test = text.startswith("/fulltestorder")
                 
-                send_telegram(f"🚀 Initiating {'full' if full_test else 'simple'} test order for Strategy {strategy_id} on {symbol}...")
-                
-                async def _task():
-                    await run_test_order(strategy_id, symbol, full_test)
-
-                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try:
-                    fut.result(timeout=60)
-                except Exception as e:
-                    log.error(f"Failed to execute test order for S{strategy_id} on {symbol}: {e}")
-                    send_telegram(f"❌ Failed to execute test order: {e}")
+                await asyncio.to_thread(send_telegram, f"🚀 Initiating {'full' if full_test else 'simple'} test order for Strategy {strategy_id} on {symbol}...")
+                await run_test_order(strategy_id, symbol, full_test)
             elif text.startswith("/forcetrade"):
                 parts = text.split()
                 if len(parts) != 4:
-                    send_telegram("Usage: /forcetrade <S1|S2|S3|S4> <SYMBOL> <buy|sell>")
+                    await asyncio.to_thread(send_telegram, "Usage: /forcetrade <S1|S2|S3|S4> <SYMBOL> <buy|sell>")
                     return
 
                 strategy_id_str = parts[1].upper()
@@ -5246,117 +4895,101 @@ def handle_update_sync(update, loop):
                 side_str = parts[3].lower()
 
                 if strategy_id_str not in ["S1", "S2", "S3", "S4"]:
-                    send_telegram(f"Invalid strategy: {strategy_id_str}. Please use S1, S2, S3, or S4.")
+                    await asyncio.to_thread(send_telegram, f"Invalid strategy: {strategy_id_str}. Please use S1, S2, S3, or S4.")
                     return
                 
                 strategy_id = int(strategy_id_str[1:])
                 
                 if symbol not in CONFIG["SYMBOLS"]:
-                   send_telegram(f"Symbol {symbol} is not in the bot's symbol list. Add it via config if you want to trade it.")
+                   await asyncio.to_thread(send_telegram, f"Symbol {symbol} is not in the bot's symbol list. Add it via config if you want to trade it.")
                    return
 
                 if side_str not in ['buy', 'sell']:
-                    send_telegram(f"Invalid side: `{side_str}`. Must be 'buy' or 'sell'.", parse_mode='Markdown')
+                    await asyncio.to_thread(send_telegram, f"Invalid side: `{side_str}`. Must be 'buy' or 'sell'.", parse_mode='Markdown')
                     return
                 
                 side = 'BUY' if side_str == 'buy' else 'SELL'
                 
-                send_telegram(f"🚀 Initiating force trade for S{strategy_id} on {symbol} ({side})...")
-                
-                async def _task():
-                    await force_trade_entry(strategy_id, symbol, side)
-
-                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try:
-                    fut.result(timeout=60) # Give it a long timeout for the trade execution
-                except Exception as e:
-                    log.error(f"Failed to execute force trade for S{strategy_id} on {symbol}: {e}")
-                    send_telegram(f"❌ Failed to execute force trade: {e}")
+                await asyncio.to_thread(send_telegram, f"🚀 Initiating force trade for S{strategy_id} on {symbol} ({side})...")
+                await force_trade_entry(strategy_id, symbol, side)
             elif text.startswith("/scalein"):
                 parts = text.split()
                 if len(parts) < 3:
-                    send_telegram("Usage: /scalein <trade_id> <risk_usd_to_add>")
+                    await asyncio.to_thread(send_telegram, "Usage: /scalein <trade_id> <risk_usd_to_add>")
                 else:
                     trade_id, risk_to_add_str = parts[1], parts[2]
                     try:
                         risk_to_add = float(risk_to_add_str)
                         
-                        async def _task():
-                            trades = await get_managed_trades_snapshot()
-                            if trade_id not in trades:
-                                await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found.")
-                                return
+                        trades = await get_managed_trades_snapshot()
+                        if trade_id not in trades:
+                            await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found.")
+                            return
+                        
+                        trade = trades[trade_id]
+                        price_distance = abs(trade['entry_price'] - trade['sl'])
+                        if price_distance <= 0:
+                            await asyncio.to_thread(send_telegram, f"Cannot scale in, price distance is zero.")
+                            return
+
+                        qty_to_add = risk_to_add / price_distance
+                        qty_to_add = await asyncio.to_thread(round_qty, trade['symbol'], qty_to_add)
+
+                        if qty_to_add > 0:
+                            await asyncio.to_thread(open_market_position_sync, trade['symbol'], trade['side'], qty_to_add, trade['leverage'])
                             
-                            trade = trades[trade_id]
-                            price_distance = abs(trade['entry_price'] - trade['sl'])
-                            if price_distance <= 0:
-                                await asyncio.to_thread(send_telegram, f"Cannot scale in, price distance is zero.")
-                                return
+                            async with managed_trades_lock:
+                                trade['qty'] += qty_to_add
+                                trade['notional'] += qty_to_add * trade['entry_price'] # Approximate
+                                trade['risk_usdt'] += risk_to_add
+                                await asyncio.to_thread(add_managed_trade_to_db, trade)
 
-                            qty_to_add = risk_to_add / price_distance
-                            qty_to_add = await asyncio.to_thread(round_qty, trade['symbol'], qty_to_add)
+                            await asyncio.to_thread(send_telegram, f"✅ Scaled in {trade_id} by {qty_to_add} {trade['symbol']}.")
+                        else:
+                            await asyncio.to_thread(send_telegram, "Calculated quantity to add is zero.")
 
-                            if qty_to_add > 0:
-                                await asyncio.to_thread(open_market_position_sync, trade['symbol'], trade['side'], qty_to_add, trade['leverage'])
-                                
-                                async with managed_trades_lock:
-                                    trade['qty'] += qty_to_add
-                                    trade['notional'] += qty_to_add * trade['entry_price'] # Approximate
-                                    trade['risk_usdt'] += risk_to_add
-                                    await asyncio.to_thread(add_managed_trade_to_db, trade)
-
-                                await asyncio.to_thread(send_telegram, f"✅ Scaled in {trade_id} by {qty_to_add} {trade['symbol']}.")
-                            else:
-                                await asyncio.to_thread(send_telegram, "Calculated quantity to add is zero.")
-
-                        fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                        fut.result(timeout=30)
                     except ValueError:
-                        send_telegram("Invalid risk amount.")
+                        await asyncio.to_thread(send_telegram, "Invalid risk amount.")
                     except Exception as e:
                         log.exception(f"Failed to scale in {trade_id}")
-                        send_telegram(f"❌ Error scaling in {trade_id}: {e}")
+                        await asyncio.to_thread(send_telegram, f"❌ Error scaling in {trade_id}: {e}")
             elif text.startswith("/testrun"):
-                send_telegram("🚀 Initiating full test run on testnet...")
-                
-                async def _task():
-                    await run_full_testnet_test()
-
-                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try:
-                    fut.result(timeout=300) # Long timeout for the full test
-                except Exception as e:
-                    log.error(f"Failed to execute /testrun: {e}")
-                    send_telegram(f"❌ Test run failed: {e}")
+                await asyncio.to_thread(send_telegram, "🚀 Initiating full test run on testnet...")
+                await run_full_testnet_test()
             else:
-                send_telegram("Unknown command. Use /status to see the keyboard.")
+                await asyncio.to_thread(send_telegram, "Unknown command. Use /status to see the keyboard.")
     except Exception:
-        log.exception("Error in handle_update_sync")
+        log.exception("Error in handle_update_async")
 
-def telegram_polling_thread(loop):
+
+async def telegram_polling_async():
+    """Asynchronously polls for and handles Telegram updates."""
     global telegram_bot
     if not telegram_bot:
-        log.info("telegram thread not started: bot not configured")
+        log.info("Telegram task not started: bot not configured")
         return
     offset = None
-    while not monitor_stop_event.is_set():
+    while True:
         try:
-            updates = telegram_bot.get_updates(offset=offset, timeout=20)
+            updates = await asyncio.to_thread(telegram_bot.get_updates, offset=offset, timeout=20)
             for u in updates:
                 offset = u.update_id + 1
-                handle_update_sync(u, loop)
-            time.sleep(0.2)
+                asyncio.create_task(handle_update_async(u))
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            log.info("Async telegram polling task cancelled.")
+            break
         except Exception as e:
             if "timed out" in str(e).lower():
                 log.debug("Telegram get_updates timed out, retrying...")
                 continue
-            log.exception("Telegram polling thread error")
+            log.exception("Async telegram polling task error")
             try:
-                ip = get_public_ip()
-                send_telegram(f"Telegram polling error: {e}")
+                ip = await asyncio.to_thread(get_public_ip)
+                await asyncio.to_thread(send_telegram, f"Telegram polling error: {e}")
             except Exception:
                 pass
-            time.sleep(5)
+            await asyncio.sleep(5)
 
 async def _set_running(val: bool):
     global running, ip_whitelist_error
@@ -5572,58 +5205,61 @@ async def handle_critical_error_async(exc: Exception, context: str = None):
 async def root():
     return {"status": "ok", "running": running, "managed_trades": len(managed_trades)}
 
+async def main_standalone():
+    """Main function to run the bot in standalone mode."""
+    global client, main_loop
+    global scan_task, background_services_task, monitor_task
+
+    log.info("Running in standalone mode. Initializing...")
+    main_loop = asyncio.get_running_loop()
+    
+    init_db()
+    init_firebase_sync()
+    load_state_from_firebase_sync()
+    
+    ok, err = init_binance_client_sync()
+    validate_and_sanity_check_sync(True)
+
+    if ok:
+        await reconcile_open_trades()
+        scan_task = main_loop.create_task(scanning_loop())
+        background_services_task = main_loop.create_task(manage_background_services())
+        monitor_task = main_loop.create_task(monitor_async())
+        log.info("Scheduled main async tasks (scan, background, monitor).")
+    else:
+        log.warning("Binance client not initialized, main tasks not started.")
+
+    await asyncio.to_thread(send_telegram, "KAMA strategy bot started (standalone). Running={}".format(running))
+    
+    # Keep the main coroutine running
+    try:
+        while True:
+            await asyncio.sleep(3600) # Sleep for a long time
+    except asyncio.CancelledError:
+        log.info("Main standalone task cancelled.")
+
+
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    
+    main_task = loop.create_task(main_standalone())
+
     try:
-        log.info("Running in standalone mode. Initializing...")
-        main_loop = loop
-        init_db()
-        ok, err = init_binance_client_sync()
-        validate_and_sanity_check_sync(True)
-        if ok:
-            monitor_stop_event.clear()
-            monitor_thread_obj = threading.Thread(target=monitor_thread_func, daemon=True)
-            monitor_thread_obj.start()
-            log.info("Started monitor thread.")
-
-            pnl_monitor_thread_obj = threading.Thread(target=daily_pnl_monitor_thread_func, daemon=True)
-            pnl_monitor_thread_obj.start()
-            log.info("Started daily PnL monitor thread.")
-
-            maintenance_thread_obj = threading.Thread(target=monthly_maintenance_thread_func, daemon=True)
-            maintenance_thread_obj.start()
-            log.info("Started monthly maintenance thread.")
-        else:
-            log.warning("Binance client not initialized, monitor threads not started.")
-        if telegram_bot:
-            telegram_thread = threading.Thread(target=telegram_polling_thread, args=(loop,), daemon=True)
-            telegram_thread.start()
-            log.info("Started telegram polling thread.")
-        scan_task = None
-        if ok:
-            scan_task = loop.create_task(scanning_loop())
-            log.info("Scanning loop scheduled.")
-        else:
-            log.warning("Binance client not initialized, scanning loop not started.")
-        loop.run_until_complete(asyncio.to_thread(send_telegram, "KAMA strategy bot started (standalone). Running={}".format(running)))
         loop.run_forever()
     except KeyboardInterrupt:
         log.info("Keyboard interrupt received. Shutting down.")
     finally:
         log.info("Exiting.")
-        monitor_stop_event.set()
-        if scan_task:
-            scan_task.cancel()
         
-        async def gather_tasks():
-            tasks = [t for t in asyncio.all_tasks(loop=loop) if t is not asyncio.current_task(loop=loop)]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel all running async tasks
+        tasks = [t for t in asyncio.all_tasks(loop=loop) if t is not asyncio.current_task(loop=loop)]
+        for task in tasks:
+            task.cancel()
+        
+        async def gather_cancelled():
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        loop.run_until_complete(gather_tasks())
-        if monitor_thread_obj and monitor_thread_obj.is_alive():
-            monitor_thread_obj.join(timeout=2)
-        if pnl_monitor_thread_obj and pnl_monitor_thread_obj.is_alive():
-            pnl_monitor_thread_obj.join(timeout=2)
+        loop.run_until_complete(gather_cancelled())
+
         loop.close()
