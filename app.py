@@ -1615,17 +1615,27 @@ def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int)
     if IS_HEDGE_MODE:
         params['positionSide'] = position_side
 
-    try:
-        log.info(f"Placing market order for {symbol}: {params}")
-        order_response = client.futures_create_order(**params)
-        log.info(f"Market order placement successful for {symbol}. Response: {order_response}")
-        return order_response
-    except BinanceAPIException as e:
-        log.exception("BinanceAPIException placing market order: %s", e)
-        raise
-    except Exception as e:
-        log.exception("Exception placing market order: %s", e)
-        raise
+    max_retries = 3
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            log.info(f"Placing market order for {symbol} (Attempt {attempt + 1}/{max_retries}): {params}")
+            order_response = client.futures_create_order(**params)
+            log.info(f"Market order placement successful for {symbol}. Response: {order_response}")
+            return order_response # Success
+        except BinanceAPIException as e:
+            log.exception(f"BinanceAPIException on attempt {attempt + 1} placing market order: {e}")
+            last_exception = e
+            if attempt < max_retries - 1:
+                time.sleep(2)
+        except Exception as e:
+            log.exception(f"Exception on attempt {attempt + 1} placing market order: {e}")
+            last_exception = e
+            if attempt < max_retries - 1:
+                time.sleep(2)
+
+    log.error(f"Failed to place market order for {symbol} after {max_retries} attempts.")
+    raise last_exception
 
 def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, leverage: int, stop_price: float, take_price: float):
     """
@@ -2962,12 +2972,19 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             log.info(f"S4: Placing MARKET {side} order for {qty} {symbol} at ~{current_price}")
             await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
 
-            await asyncio.sleep(2)
-            positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
-            position_side = 'LONG' if side == 'BUY' else 'SHORT'
-            pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+            # Poll for up to 5 seconds for the position to appear
+            pos = None
+            for i in range(5):
+                await asyncio.sleep(1)
+                positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+                position_side = 'LONG' if side == 'BUY' else 'SHORT'
+                pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+                if pos:
+                    log.info(f"Position for {symbol} found after {i+1} second(s).")
+                    break
+            
             if not pos:
-                raise RuntimeError(f"Position for {symbol} not found after S4 market order.")
+                raise RuntimeError(f"Position for {symbol} not found after S4 market order (waited 5s).")
             
             actual_entry_price = float(pos['entryPrice'])
             actual_qty = abs(float(pos['positionAmt']))
@@ -3151,14 +3168,19 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
         log.info(f"FORCE TRADE: Placing MARKET {side} order for {qty} {symbol} with {leverage}x leverage.")
         await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
         
-        # Give exchange time to update position
-        await asyncio.sleep(2) 
-        positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
-        position_side = 'LONG' if side == 'BUY' else 'SHORT'
-        pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+        # Poll for up to 5 seconds for the position to appear
+        pos = None
+        for i in range(5):
+            await asyncio.sleep(1)
+            positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+            if pos:
+                log.info(f"Forced position for {symbol} found after {i+1} second(s).")
+                break
         
         if not pos:
-             raise RuntimeError(f"Position for {symbol} not found after forced market order.")
+             raise RuntimeError(f"Position for {symbol} not found after forced market order (waited 5s).")
         
         actual_entry_price = float(pos['entryPrice'])
         actual_qty = abs(float(pos['positionAmt']))
@@ -5255,6 +5277,7 @@ async def run_full_testnet_test():
     test_client = None
     report_lines = ["*Binance Testnet End-to-End Test Report*"]
     test_symbol = "BTCUSDT"
+    test_trade_id = None # Initialize to None
     
     original_managed_trades = {}
     
