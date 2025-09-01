@@ -77,7 +77,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4"),  # 0=all, or comma-separated, e.g., "1,2"
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4,1"),  # 0=all, or comma-separated, e.g., "1,2"
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -4710,6 +4710,7 @@ async def run_simulation(strategy_to_run: str, symbol: str, days: int):
             await asyncio.to_thread(send_telegram, "❌ Not enough historical data available to run the full simulation.")
             return
 
+        simulated_open_trades = []
         signal_count = 0
         
         # Main simulation loop
@@ -4718,40 +4719,83 @@ async def run_simulation(strategy_to_run: str, symbol: str, days: int):
             
             # It's more efficient to calculate all indicators once
             df_with_indicators = calculate_all_indicators(df_slice.copy())
-            
-            # Check all strategies
-            signals = []
-            if strategy_to_run == "S1":
-                signals.append(simulate_strategy_bb(symbol, df_with_indicators))
-            elif strategy_to_run == "S2":
-                signals.append(simulate_strategy_supertrend(symbol, df_with_indicators))
-            elif strategy_to_run == "S3":
-                signals.append(simulate_strategy_3(symbol, df_with_indicators))
-            elif strategy_to_run == "S4":
-                signals.append(simulate_strategy_4(symbol, df_with_indicators))
-            elif strategy_to_run == "ALL":
-                signals.append(simulate_strategy_bb(symbol, df_with_indicators))
-                signals.append(simulate_strategy_supertrend(symbol, df_with_indicators))
-                signals.append(simulate_strategy_3(symbol, df_with_indicators))
-                signals.append(simulate_strategy_4(symbol, df_with_indicators))
 
-            for signal in signals:
-                if signal:
-                    signal_count += 1
-                    timestamp_dt = datetime.fromisoformat(signal['timestamp'])
-                    msg = (
-                        f"🔔 *Simulation Signal Found* 🔔\n\n"
-                        f"**Strategy:** `{signal['strategy']}`\n"
-                        f"**Symbol:** `{symbol}`\n"
-                        f"**Side:** `{signal['side']}`\n"
-                        f"**Timestamp:** `{timestamp_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}`\n"
-                        f"**Entry:** `{signal['entry_price']:.4f}`\n"
-                        f"**SL:** `{signal['sl_price']:.4f}`\n"
-                        f"**TP:** `{signal['tp_price']:.4f}`"
-                    )
-                    await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+            # --- Manage existing simulated trades ---
+            active_trades_copy = list(simulated_open_trades) # Iterate over a copy
+            for trade in active_trades_copy:
+                result = manage_simulated_trade(trade, df_with_indicators)
+                if result:
+                    event, price = result
+                    timestamp_dt = df_with_indicators.index[-1].to_pydatetime()
+                    
+                    if event in ["SL_HIT", "TP_HIT"]:
+                        pnl = (price - trade['entry_price']) * (1 if trade['side'] == 'BUY' else -1)
+                        duration = timestamp_dt - trade['entry_time']
+                        
+                        msg = (
+                            f"💥 *SIM: Trade Closed* 💥\n\n"
+                            f"**Reason:** {event}\n"
+                            f"**Strategy:** `{trade['strategy']}`\n"
+                            f"**Exit Price:** `{price:.4f}`\n"
+                            f"**PnL:** `{pnl:.4f}` (approx.)\n"
+                            f"**Duration:** `{format_timedelta(duration)}`"
+                        )
+                        await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+                        simulated_open_trades.remove(trade)
 
-        summary_msg = f"✅ Simulation for `{symbol}` complete. Found `{signal_count}` signal(s)."
+                    elif event == "SL_MOVED":
+                        msg = (
+                            f"📈 *SIM: Trailing SL Moved*\n\n"
+                            f"**Strategy:** `{trade['strategy']}`\n"
+                            f"**New SL:** `{price:.4f}`"
+                        )
+                        await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+
+            # --- Check for new signals ---
+            # Avoid opening a new trade if one is already open for this symbol
+            if not any(t['symbol'] == symbol for t in simulated_open_trades):
+                signals = []
+                if strategy_to_run in ["S1", "ALL"]:
+                    signals.append(simulate_strategy_bb(symbol, df_with_indicators))
+                if strategy_to_run in ["S2", "ALL"]:
+                    signals.append(simulate_strategy_supertrend(symbol, df_with_indicators))
+                if strategy_to_run in ["S3", "ALL"]:
+                    signals.append(simulate_strategy_3(symbol, df_with_indicators))
+                if strategy_to_run in ["S4", "ALL"]:
+                    signals.append(simulate_strategy_4(symbol, df_with_indicators))
+
+                for signal in signals:
+                    if signal:
+                        signal_count += 1
+                        timestamp_dt = datetime.fromisoformat(signal['timestamp'])
+                        
+                        # Create a simulated trade object
+                        simulated_trade = {
+                            "symbol": symbol,
+                            "side": signal['side'],
+                            "entry_price": signal['entry_price'],
+                            "sl": signal['sl_price'],
+                            "tp": signal['tp_price'],
+                            "entry_time": timestamp_dt,
+                            "strategy": signal['strategy']
+                        }
+                        simulated_open_trades.append(simulated_trade)
+                        
+                        msg = (
+                            f"🔔 *SIM: Signal Found* 🔔\n\n"
+                            f"**Strategy:** `{signal['strategy']}`\n"
+                            f"**Symbol:** `{symbol}`\n"
+                            f"**Side:** `{signal['side']}`\n"
+                            f"**Timestamp:** `{timestamp_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}`\n"
+                            f"**Entry:** `{signal['entry_price']:.4f}`\n"
+                            f"**SL:** `{signal['sl_price']:.4f}`\n"
+                            f"**TP:** `{signal['tp_price']:.4f}`"
+                        )
+                        await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+                        # Since we opened a trade, we don't check for other signals on this candle
+                        break
+
+        summary_msg = f"✅ Simulation for `{symbol}` complete. Found `{signal_count}` total signal(s)."
         await asyncio.to_thread(send_telegram, summary_msg, parse_mode='Markdown')
 
     except Exception as e:
@@ -4759,6 +4803,58 @@ async def run_simulation(strategy_to_run: str, symbol: str, days: int):
     finally:
         # Restore original strategy mode
         CONFIG["STRATEGY_MODE"] = original_strat_mode
+
+
+def manage_simulated_trade(trade: Dict[str, Any], df_slice: pd.DataFrame) -> Optional[tuple[str, float]]:
+    """
+    Manages a single simulated trade for one candle tick.
+    Checks for SL/TP hits and updates trailing stops.
+    Returns a tuple of (event_type, price) if an event occurs, otherwise None.
+    """
+    current_candle = df_slice.iloc[-1]
+    side = trade['side']
+    sl_price = trade['sl']
+    tp_price = trade['tp']
+    candle_low = current_candle['low']
+    candle_high = current_candle['high']
+
+    # Check for Stop Loss
+    if side == 'BUY' and candle_low <= sl_price:
+        return ("SL_HIT", sl_price)
+    if side == 'SELL' and candle_high >= sl_price:
+        return ("SL_HIT", sl_price)
+
+    # Check for Take Profit (if it exists)
+    if tp_price > 0:
+        if side == 'BUY' and candle_high >= tp_price:
+            return ("TP_HIT", tp_price)
+        if side == 'SELL' and candle_low <= tp_price:
+            return ("TP_HIT", tp_price)
+
+    # Trailing Stop Logic (adapted from monitor_thread_func)
+    strategy_id = trade.get('strategy', '1') # Default to S1 for safety
+    exit_params = CONFIG['STRATEGY_EXIT_PARAMS'].get(strategy_id, CONFIG['STRATEGY_EXIT_PARAMS']['1'])
+    
+    # Simple trailing for now, can be enhanced with BE logic later
+    atr_now = safe_last(df_slice.get('atr'), default=0)
+    if atr_now > 0:
+        atr_multiplier = exit_params.get("ATR_MULTIPLIER", 1.5)
+        new_sl = None
+        
+        if side == 'BUY':
+            potential_sl = candle_high - (atr_now * atr_multiplier)
+            if potential_sl > sl_price:
+                new_sl = potential_sl
+        else: # SELL
+            potential_sl = candle_low + (atr_now * atr_multiplier)
+            if potential_sl < sl_price:
+                new_sl = potential_sl
+        
+        if new_sl:
+            trade['sl'] = new_sl # Update the trade dict directly
+            return ("SL_MOVED", new_sl)
+            
+    return None
 
 
 def build_control_keyboard():
