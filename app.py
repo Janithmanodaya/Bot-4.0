@@ -116,7 +116,6 @@ CONFIG = {
         "TRAILING_ATR_PERIOD": int(os.getenv("S4_TRAIL_ATR_PERIOD", "2")),
         "TRAILING_HHV_PERIOD": int(os.getenv("S4_TRAIL_HHV_PERIOD", "10")),
         "TRAILING_ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")),
-        "INITIAL_STOP_PCT": float(os.getenv("S4_INITIAL_STOP_PCT", "0.02")), # 2% hard stop
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
     },
     "STRATEGY_EXIT_PARAMS": {
@@ -175,6 +174,7 @@ CONFIG = {
     "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
+    "SESSION_FREEZE_ENABLED": os.getenv("SESSION_FREEZE_ENABLED", "true").lower() in ("true", "1", "yes"),
 
     # --- INDICATOR SETTINGS ---
     # "BB_LENGTH_CUSTOM" and "BB_STD_CUSTOM" are now in STRATEGY_1
@@ -2968,9 +2968,9 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         log.info(f"S4 TEST MODE: Using far-limit price {price_for_order:.4f} for calculations.")
 
     # 5. Calculate Position Size
-    stop_pct = s4_params['INITIAL_STOP_PCT']
     risk_usd = s4_params['RISK_USD']
-    price_distance_for_sizing = current_price * stop_pct
+    # The price distance for sizing is now based on the initial trail stop
+    price_distance_for_sizing = abs(price_for_order - initial_trail_stop)
     if price_distance_for_sizing <= 0:
         _record_rejection(symbol, "S4-Invalid price distance for sizing", {'dist': price_distance_for_sizing})
         return
@@ -3085,8 +3085,9 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             actual_qty = abs(float(pos['positionAmt']))
             
             sltp_orders = {}
-            sl_price = actual_entry_price * (1 - stop_pct) if side == 'BUY' else actual_entry_price * (1 + stop_pct)
-            log.info(f"S4: Placing initial hard SL for {symbol} at {sl_price}")
+            # The initial SL is now the calculated trail stop
+            sl_price = initial_trail_stop
+            log.info(f"S4: Placing initial SL for {symbol} at {sl_price}")
             sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
 
             trade_id = f"{symbol}_S4_{int(time.time())}"
@@ -3178,7 +3179,7 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
 
         elif strategy_id == 3:
             s_params = CONFIG['STRATEGY_3']
-            stop_pct = s_params.get('INITIAL_STOP_PCT', 0.015) # S3 does not have this param, fallback
+            stop_pct = s_params.get('FALLBACK_SL_PCT', 0.015) # S3 does not have this param, fallback
             sl_price = current_price * (1 - stop_pct) if side == 'BUY' else current_price * (1 + stop_pct)
             
             balance = await asyncio.to_thread(get_account_balance_usdt)
@@ -3195,13 +3196,8 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
 
         elif strategy_id == 4:
             s_params = CONFIG['STRATEGY_4']
-            stop_pct = s_params['INITIAL_STOP_PCT']
-            sl_price = current_price * (1 - stop_pct) if side == 'BUY' else current_price * (1 + stop_pct)
             
-            risk_usdt = s_params['RISK_USD']
-            price_distance = abs(current_price - sl_price)
-            qty = risk_usdt / price_distance if price_distance > 0 else 0.0
-            
+            # Calculate the initial trail stop to use as the SL
             df['atr2'] = atr_wilder(df, length=s_params['TRAILING_ATR_PERIOD'])
             df['hhv10'] = hhv(df['high'], length=s_params['TRAILING_HHV_PERIOD'])
             df['llv10'] = llv(df['low'], length=s_params['TRAILING_HHV_PERIOD'])
@@ -3210,6 +3206,11 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
                 initial_trail_stop = max(safe_last(df['hhv10']) - trail_dist, current_price - trail_dist)
             else:
                 initial_trail_stop = min(safe_last(df['llv10']) + trail_dist, current_price + trail_dist)
+            
+            sl_price = initial_trail_stop
+            risk_usdt = s_params['RISK_USD']
+            price_distance = abs(current_price - sl_price)
+            qty = risk_usdt / price_distance if price_distance > 0 else 0.0
 
             trade_meta_extra = {
                 "s4_trailing_stop": initial_trail_stop,
@@ -4239,6 +4240,15 @@ async def manage_session_freeze_state():
     """
     global frozen, session_freeze_override, session_freeze_active, notified_frozen_session
 
+    if not CONFIG.get("SESSION_FREEZE_ENABLED", True):
+        # If the feature is disabled, it can never be frozen by a session.
+        # Reset any lingering session state and return only the manual freeze status.
+        if session_freeze_active:
+            log.info("Session freeze feature is disabled. Resetting state.")
+            session_freeze_active = False
+            session_freeze_override = False
+        return frozen
+
     is_naturally_frozen, session_name = get_session_freeze_status(datetime.now(timezone.utc))
 
     # Determine the effective freeze status for the bot's trading logic.
@@ -4860,7 +4870,7 @@ def manage_simulated_trade(trade: Dict[str, Any], df_slice: pd.DataFrame) -> Opt
 def build_control_keyboard():
     buttons = [
         [KeyboardButton("/startbot"), KeyboardButton("/stopbot")],
-        [KeyboardButton("/freeze"), KeyboardButton("/unfreeze")],
+        [KeyboardButton("/freeze"), KeyboardButton("/unfreeze"), KeyboardButton("/sessionfreeze")],
         [KeyboardButton("/listorders"), KeyboardButton("/listpending")],
         [KeyboardButton("/status"), KeyboardButton("/showparams")],
         [KeyboardButton("/usage"), KeyboardButton("/report"), KeyboardButton("/stratreport")],
@@ -5348,6 +5358,16 @@ def handle_update_sync(update, loop):
                             log.error(f"Failed to execute /trail command: {e}")
                             send_telegram(f"An error occurred while processing the /trail command: {e}")
 
+            elif text.startswith("/sessionfreeze"):
+                parts = text.split()
+                if len(parts) != 2 or parts[1].lower() not in ['on', 'off']:
+                    send_telegram("Usage: /sessionfreeze <on|off>")
+                else:
+                    new_state = parts[1].lower() == 'on'
+                    CONFIG["SESSION_FREEZE_ENABLED"] = new_state
+                    status_msg = "ENABLED" if new_state else "DISABLED"
+                    send_telegram(f"✅ Automatic session freeze feature has been {status_msg}.")
+
             elif text.startswith("/help"):
                 help_text = (
                     "*KAMA Bot Commands*\n\n"
@@ -5356,6 +5376,7 @@ def handle_update_sync(update, loop):
                     "- `/stopbot`: Stops the bot (pauses scanning for trades).\n"
                     "- `/freeze`: Manually freezes the bot, preventing all new trades.\n"
                     "- `/unfreeze`: Lifts a manual freeze and overrides any active session freeze.\n"
+                    "- `/sessionfreeze <on|off>`: Enables or disables the automatic session freeze feature.\n"
                     "- `/forcetrade <S1-S4> <SYMBOL> <buy|sell>`: Forces an immediate market trade.\n"
                     "- `/scalein <trade_id> <risk_usd>`: Adds to an existing position by a risk amount.\n"
                     "- `/trail <trade_id> <on|off>`: Manually enable or disable the automatic trailing stop for a trade.\n\n"
@@ -5377,7 +5398,7 @@ def handle_update_sync(update, loop):
                     "- `/validate`: Performs a sanity check on the configuration.\n"
                     "- `/help`: Displays this help message.\n\n"
                     "*Testing*\n"
-                    "- `/simulate [S1-S4|ALL] [SYM] [DAYS]`: Runs a simulation.\n"
+                    "- `/simulate [STRAT] [SYM] [DAYS]`: Runs a simulation (all args optional).\n"
                     "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
                     "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP.\n"
                     "- `/testrun`: Runs a full end-to-end test on the Binance testnet."
@@ -5390,33 +5411,32 @@ def handle_update_sync(update, loop):
                 except Exception as e:
                     log.error("Failed to execute /help action: %s", e)
             elif text.startswith("/simulate"):
-                parts = text.split()
+                parts = text.split()[1:] # Ignore the command itself
+                
                 # Defaults
-                strategy_to_run = "ALL"
+                strategy = "ALL"
                 symbol = "BTCUSDT"
                 days = 1
                 
-                # Parse arguments
-                if len(parts) > 1:
-                    strategy_to_run = parts[1].upper()
-                if len(parts) > 2:
-                    symbol = parts[2].upper()
-                if len(parts) > 3:
-                    try:
-                        days = int(parts[3])
-                    except ValueError:
-                        send_telegram("Invalid number of days. Using default of 1.")
-                        days = 1
-
-                valid_strategies = ["S1", "S2", "S3", "S4", "ALL"]
-                if strategy_to_run not in valid_strategies:
-                    send_telegram(f"Invalid strategy specified. Please use one of: {', '.join(valid_strategies)}")
-                    return
+                if parts:
+                    # Check for strategy first
+                    if parts[0].upper() in ["S1", "S2", "S3", "S4", "ALL"]:
+                        strategy = parts[0].upper()
+                        parts.pop(0)
+                    
+                    # Check for symbol next (must not be a number)
+                    if parts and not parts[0].isdigit():
+                        symbol = parts[0].upper()
+                        parts.pop(0)
+                        
+                    # Anything left must be the days
+                    if parts and parts[0].isdigit():
+                        days = int(parts[0])
 
                 send_telegram("Scheduling simulation task...")
                 # Run the simulation in a coroutine
                 async def _task():
-                    await run_simulation(strategy_to_run, symbol, days)
+                    await run_simulation(strategy, symbol, days)
                 
                 fut = asyncio.run_coroutine_threadsafe(_task(), loop)
                 try:
