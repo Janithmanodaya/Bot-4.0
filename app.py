@@ -110,12 +110,10 @@ CONFIG = {
         "ATR_SL_MULT": float(os.getenv("S3_ATR_SL_MULT", 1.5)),
         "FALLBACK_SL_PCT": float(os.getenv("S3_FALLBACK_SL_PCT", 0.015)),
     },
-    "STRATEGY_4": { # Advanced SuperTrend v2 strategy
-        "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "20")), # Uses a standard ST for signals
-        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "3.0")),
-        "TRAILING_ATR_PERIOD": int(os.getenv("S4_TRAIL_ATR_PERIOD", "2")),
-        "TRAILING_HHV_PERIOD": int(os.getenv("S4_TRAIL_HHV_PERIOD", "10")),
-        "TRAILING_ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")),
+    "STRATEGY_4": { # DEMA+SuperTrend strategy
+        "DEMA_PERIOD": int(os.getenv("S4_DEMA_PERIOD", "200")),
+        "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "20")),
+        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "6.0")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
     },
     "STRATEGY_EXIT_PARAMS": {
@@ -1341,6 +1339,22 @@ def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9):
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
 
 
+def dema(series: pd.Series, length: int) -> pd.Series:
+    """Calculates the Double Exponential Moving Average (DEMA)."""
+    ema1 = series.ewm(span=length, adjust=False).mean()
+    ema2 = ema1.ewm(span=length, adjust=False).mean()
+    return 2 * ema1 - ema2
+
+
+def candle_body_crosses_dema(candle: pd.Series, dema_value: float) -> bool:
+    """Checks if a candle's body (open to close) crosses a DEMA value."""
+    if pd.isna(dema_value) or 'open' not in candle or 'close' not in candle:
+        return False
+    candle_open = float(candle['open'])
+    candle_close = float(candle['close'])
+    return min(candle_open, candle_close) < dema_value < max(candle_open, candle_close)
+
+
 # -------------------------
 # Binance Init
 # -------------------------
@@ -2292,6 +2306,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         CONFIG.get("STRATEGY_2", {}).get("SUPERTREND_PERIOD", 7),
         CONFIG.get("STRATEGY_3", {}).get("SLOW_MA", 21),
         CONFIG.get("STRATEGY_4", {}).get("SUPERTREND_PERIOD", 20),
+        CONFIG.get("STRATEGY_4", {}).get("DEMA_PERIOD", 200),
     )
     if df is None or len(df) < max_lookback:
         log.warning(f"Not enough data for indicator calculation, need {max_lookback} have {len(df)}")
@@ -2323,12 +2338,10 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out['s3_ma_slow'] = sma(out['close'], s3_params['SLOW_MA'])
 
     if 0 in modes or 4 in modes:
-        # ---- Strategy 4 (Adv SuperTrend V2) ----
+        # ---- Strategy 4 (DEMA+SuperTrend) ----
         s4_params = CONFIG['STRATEGY_4']
-        out['s4_atr2'] = atr_wilder(out, length=s4_params['TRAILING_ATR_PERIOD'])
-        out['s4_hhv10'] = hhv(out['high'], length=s4_params['TRAILING_HHV_PERIOD'])
-        out['s4_llv10'] = llv(out['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-        out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'], source=out['close'])
+        out['s4_dema'] = dema(out['close'], length=s4_params['DEMA_PERIOD'])
+        out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
 
     return out
 
@@ -2881,262 +2894,244 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
     await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
 def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Simulation version of the DEMA+SuperTrend strategy (S4).
+    Returns signal details if a signal is found, otherwise None.
+    """
+    # --- Timeframe Check ---
+    if CONFIG["TIMEFRAME"] != "15m":
+        return None
+
     s4_params = CONFIG['STRATEGY_4']
-    required_len = max(s4_params['TRAILING_HHV_PERIOD'], s4_params['SUPERTREND_PERIOD']) + 5
-    if len(df) < required_len: return None
     
+    # --- Indicator & Data Check ---
+    required_cols = ['s4_dema', 's4_st', 's4_st_dir', 'open', 'close']
+    if len(df) < 4 or any(col not in df.columns for col in required_cols):
+        return None
+
+    # --- Define Candles ---
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
+    current_candle = df.iloc[-1]
+    entry_price = current_candle['open']
+
+    # --- Signal Detection ---
     side = None
+    if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
+        side = 'BUY'
+    elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
+        side = 'SELL'
     
-    if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1: side = 'BUY'
-    elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1: side = 'SELL'
-    if not side: return None
-    
-    entry_price = float(signal_candle['close'])
-    
-    # Calculate the initial trail stop to use as the SL
-    trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['s4_atr2']
-    if side == 'BUY':
-        candidate_trail = signal_candle['s4_hhv10'] - trail_distance
-        price_based_trail = signal_candle['close'] - trail_distance
-        sl_price = max(candidate_trail, price_based_trail)
-    else: # SELL
-        candidate_trail = signal_candle['s4_llv10'] + trail_distance
-        price_based_trail = signal_candle['close'] + trail_distance
-        sl_price = min(candidate_trail, price_based_trail)
+    if not side:
+        return None
+
+    # --- Entry Rule 1: DEMA Trend Filter ---
+    dema_value_signal = signal_candle['s4_dema']
+    if side == 'BUY' and entry_price <= dema_value_signal:
+        return None
+    if side == 'SELL' and entry_price >= dema_value_signal:
+        return None
         
-    return {"strategy": "S4-AdvST", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": 0, "timestamp": signal_candle.name.isoformat()}
+    # --- Entry Rule 2: DEMA Cross Rejection ---
+    if candle_body_crosses_dema(signal_candle, dema_value_signal):
+        return None
+    prev_dema_value = prev_candle['s4_dema']
+    if candle_body_crosses_dema(prev_candle, prev_dema_value):
+        return None
+
+    # --- Entry Rule 3: Candle Size Rejection ---
+    signal_body_size = abs(signal_candle['close'] - signal_candle['open'])
+    prev_body_size = abs(prev_candle['close'] - prev_candle['open'])
+    if prev_body_size > 0 and signal_body_size > (3 * prev_body_size):
+        return None
+        
+    # --- Passed all filters, return signal ---
+    sl_price = signal_candle['s4_st']
+    
+    # S4 has no predefined TP, so set it to 0
+    tp_price = 0 
+    
+    return {
+        "strategy": "S4-DEMA-ST",
+        "side": side,
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "timestamp": signal_candle.name.isoformat()
+    }
 
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
-    Evaluates and executes trades based on the Advanced SuperTrend v2 strategy (S4).
-    - Candle-body close confirmation for trailing stop.
-    - ATR-line alignment at signal time.
+    Evaluates and executes trades based on the DEMA+SuperTrend strategy (S4).
     """
     global managed_trades
+
+    # --- Timeframe Check ---
+    if CONFIG["TIMEFRAME"] != "15m" and not test_signal:
+        if not hasattr(evaluate_strategy_4, 'has_warned'):
+            log.warning("S4 is designed for 15m timeframe only. Current timeframe is not 15m. S4 will not execute.")
+            evaluate_strategy_4.has_warned = True # Prevent spamming logs
+        return
+
     s4_params = CONFIG['STRATEGY_4']
     
+    # --- Pre-trade checks ---
     if not test_signal:
-        if check_for_liquidity_grab(df, symbol):
-            return
         async with managed_trades_lock:
             if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
                 return
-
-    # 2. Calculate Indicators
-    required_len = max(s4_params['TRAILING_HHV_PERIOD'], s4_params['SUPERTREND_PERIOD']) + 5
-    if len(df) < required_len:
-        log.warning(f"Not enough data for S4 on {symbol}, need {required_len} have {len(df)}")
+        async with pending_limit_orders_lock:
+            if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
+                return
+    
+    # --- Indicator & Data Check ---
+    required_cols = ['s4_dema', 's4_st', 's4_st_dir', 'open', 'close']
+    if len(df) < 4 or any(col not in df.columns for col in required_cols):
+        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data. Need at least 4 bars.")
         return
 
+    # --- Define Candles ---
     signal_candle = df.iloc[-2]
-    current_price = df['open'].iloc[-1]
-    side = None
-    initial_trail_stop = 0.0
+    prev_candle = df.iloc[-3]
+    current_candle = df.iloc[-1] 
+    entry_price = current_candle['open']
 
+    # --- Signal Detection ---
+    side = None
     if test_signal:
         side = test_signal
         log.info(f"S4 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
-        # Use a dummy trail stop for testing
-        trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['s4_atr2']
-        initial_trail_stop = current_price - trail_distance if side == 'BUY' else current_price + trail_distance
     else:
-        # 3. Check for Signal
-        if len(df) < 3: return
-        prev_candle = df.iloc[-3]
-        
         if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
             side = 'BUY'
         elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
             side = 'SELL'
-        if not side: return
+        
+        if not side:
+            return # No signal
 
-        # Signal Expiry Check
-        signal_close_time = signal_candle.name.to_pydatetime()
-        time_since_signal = datetime.now(timezone.utc) - signal_close_time
-        if time_since_signal > timedelta(minutes=3):
-            _record_rejection(symbol, "S4 Signal Expired", {"age_seconds": time_since_signal.total_seconds()})
-            return
+    # --- Entry Rule 1: DEMA Trend Filter ---
+    dema_value_signal = signal_candle['s4_dema']
+    if side == 'BUY' and entry_price <= dema_value_signal:
+        _record_rejection(symbol, "S4 DEMA Filter", {"side": "BUY", "price": entry_price, "dema": dema_value_signal})
+        return
+    if side == 'SELL' and entry_price >= dema_value_signal:
+        _record_rejection(symbol, "S4 DEMA Filter", {"side": "SELL", "price": entry_price, "dema": dema_value_signal})
+        return
+        
+    # --- Entry Rule 2: DEMA Cross Rejection ---
+    if candle_body_crosses_dema(signal_candle, dema_value_signal):
+        _record_rejection(symbol, "S4 DEMA Cross", {"candle": "signal", "dema": dema_value_signal})
+        return
+    prev_dema_value = prev_candle['s4_dema']
+    if candle_body_crosses_dema(prev_candle, prev_dema_value):
+        _record_rejection(symbol, "S4 DEMA Cross", {"candle": "previous", "dema": prev_dema_value})
+        return
 
-        # 4. Pre-entry Alignment Filter
-        trail_distance = s4_params['TRAILING_ATR_MULTIPLIER'] * signal_candle['s4_atr2']
-        if side == 'BUY':
-            candidate_trail = signal_candle['s4_hhv10'] - trail_distance
-            price_based_trail = signal_candle['close'] - trail_distance
-            initial_trail_stop = max(candidate_trail, price_based_trail)
-            if initial_trail_stop >= current_price:
-                _record_rejection(symbol, "S4-Alignment fail (long)", {'trail': initial_trail_stop, 'price': current_price})
-                return
-        else: # SELL
-            candidate_trail = signal_candle['s4_llv10'] + trail_distance
-            price_based_trail = signal_candle['close'] + trail_distance
-            initial_trail_stop = min(candidate_trail, price_based_trail)
-            if initial_trail_stop <= current_price:
-                _record_rejection(symbol, "S4-Alignment fail (short)", {'trail': initial_trail_stop, 'price': current_price})
-                return
-            
-    # For test orders, we use a far-away limit price instead of market.
-    price_for_order = current_price
-    if test_signal:
-        price_for_order = current_price * 0.5 if side == 'BUY' else current_price * 1.5
-        log.info(f"S4 TEST MODE: Using far-limit price {price_for_order:.4f} for calculations.")
+    # --- Entry Rule 3: Candle Size Rejection ---
+    signal_body_size = abs(signal_candle['close'] - signal_candle['open'])
+    prev_body_size = abs(prev_candle['close'] - prev_candle['open'])
+    if prev_body_size > 0 and signal_body_size > (3 * prev_body_size):
+        _record_rejection(symbol, "S4 Candle Size", {"signal_body": signal_body_size, "prev_body": prev_body_size})
+        return
+        
+    log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
 
-    # 5. Calculate Position Size
+    # --- Stop Loss and Sizing ---
+    stop_loss_price = signal_candle['s4_st']
     risk_usd = s4_params['RISK_USD']
-    # The price distance for sizing is now based on the initial trail stop
-    price_distance_for_sizing = abs(price_for_order - initial_trail_stop)
-    if price_distance_for_sizing <= 0:
-        _record_rejection(symbol, "S4-Invalid price distance for sizing", {'dist': price_distance_for_sizing})
-        return
-
-    ideal_qty = risk_usd / price_distance_for_sizing if price_distance_for_sizing > 0 else 0.0
-
-    # --- New Robust Quantity Calculation ---
-    min_notional = 100.0 if test_signal else CONFIG["MIN_NOTIONAL_USDT"]
-    if test_signal:
-        log.info(f"S4 TEST MODE: Overriding min notional to ${min_notional:.2f}.")
-
-    qty_for_min_notional = min_notional / price_for_order if price_for_order > 0 else 0.0
     
-    qty = max(ideal_qty, qty_for_min_notional)
-
-    # Round up to the nearest step size
-    step_size = await asyncio.to_thread(get_step_size, symbol)
-    if step_size is not None and step_size > 0:
-        qty_dec = Decimal(str(qty))
-        step_dec = Decimal(str(step_size))
-        
-        num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
-        final_qty_dec = num_steps * step_dec
-        qty = float(final_qty_dec)
-
-    if qty <= 0:
-        _record_rejection(symbol, "S4-Quantity is zero after adjustments", {'ideal_qty': ideal_qty})
+    price_distance = abs(entry_price - stop_loss_price)
+    if price_distance <= 0:
+        _record_rejection(symbol, "S4 Invalid SL Distance", {"entry": entry_price, "sl": stop_loss_price})
         return
-        
-    # --- Recalculate final risk and leverage ---
-    notional = qty * current_price # Notional for leverage is based on real price
+
+    qty = risk_usd / price_distance
+    
+    final_qty = await asyncio.to_thread(round_qty, symbol, qty, rounding=ROUND_DOWN)
+    
+    notional = final_qty * entry_price
+    min_notional = CONFIG.get("MIN_NOTIONAL_USDT", 5.0)
+    if notional < min_notional:
+        final_qty = await asyncio.to_thread(round_qty, symbol, min_notional / entry_price, rounding=ROUND_CEILING)
+        notional = final_qty * entry_price
+
+    if final_qty <= 0:
+        _record_rejection(symbol, "S4 Qty Zero", {"calc_qty": qty})
+        return
+
     balance = await asyncio.to_thread(get_account_balance_usdt)
-    actual_risk_usdt = qty * price_distance_for_sizing
+    actual_risk_usdt = final_qty * price_distance
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
-    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    
+    leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
 
-    # 6. Place Orders
+    # --- Place Order ---
     if test_signal:
-        # --- TEST MODE LOGIC ---
-        limit_price = price_for_order # Use the already-calculated far price
-        sl_price = limit_price * (1 - stop_pct) if side == 'BUY' else limit_price * (1 + stop_pct)
-        log.info(f"S4 TEST MODE: Placing {'full' if full_test else 'simple'} test order for {symbol} at far-limit price {limit_price:.4f}")
+        log.info(f"S4 TEST MODE: Would place MARKET order for {final_qty} {symbol} at ~{entry_price}. SL: {stop_loss_price}")
+        test_msg = (
+            f"🧪 *S4 Test Signal Passed*\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Entry Price:** `~{entry_price:.4f}`\n"
+            f"**Qty:** `{final_qty}`\n"
+            f"**Stop Loss:** `{stop_loss_price:.4f}`\n"
+            f"**Sized Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
+        return
 
-        if full_test:
+    try:
+        log.info(f"S4: Placing MARKET {side} order for {final_qty} {symbol} at ~{entry_price}")
+        await asyncio.to_thread(open_market_position_sync, symbol, side, final_qty, leverage)
+
+        pos = None
+        for i in range(10):
+            await asyncio.sleep(0.5)
+            positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
             position_side = 'LONG' if side == 'BUY' else 'SHORT'
-            close_side = 'SELL' if side == 'BUY' else 'BUY'
-            limit_entry = {'symbol': symbol, 'side': side, 'type': 'LIMIT', 'quantity': str(qty), 'price': round_price(symbol, limit_price), 'timeInForce': 'GTC'}
-            if IS_HEDGE_MODE: limit_entry['positionSide'] = position_side
-            
-            base_close = {'symbol': symbol, 'side': close_side, 'quantity': str(qty)}
-            if IS_HEDGE_MODE: base_close['positionSide'] = position_side
-            else: base_close['reduceOnly'] = True
-            
-            sl_order = base_close.copy()
-            sl_order.update({'type': 'STOP_MARKET', 'stopPrice': round_price(symbol, sl_price)})
-            
-            order_batch = [limit_entry, sl_order]
-            try:
-                log.info(f"S4 FULL TEST: Placing batch order: {order_batch}")
-                await asyncio.to_thread(client.futures_place_batch_order, batchOrders=order_batch)
-                test_msg = (
-                    f"🧪 *S4 Full Test Order Executed*\n\n"
-                    f"**Symbol:** `{symbol}`\n"
-                    f"**Side:** `{side}`\n"
-                    f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
-                    f"**Qty:** `{qty}`\n"
-                    f"**Stop Loss:** `{round_price(symbol, sl_price)}`\n"
-                f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
-                    f"**Leverage:** `{leverage}x`"
-                )
-                await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
-            except Exception as e:
-                await asyncio.to_thread(log_and_send_error, f"S4 Full Test order failed for {symbol}", e)
-        else:
-            try:
-                await asyncio.to_thread(place_limit_order_sync, symbol, side, qty, limit_price)
-                test_msg = (
-                    f"🧪 *S4 Simple Test Order Executed*\n\n"
-                    f"**Symbol:** `{symbol}`\n"
-                    f"**Side:** `{side}`\n"
-                    f"**Price:** `{round_price(symbol, limit_price)}` (Far Limit)\n"
-                    f"**Qty:** `{qty}`\n"
-                    f"**Risk (for sizing):** `{actual_risk_usdt:.2f} USDT`\n"
-                    f"**Leverage (for sizing):** `{leverage}x`"
-                )
-                await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
-            except Exception as e:
-                await asyncio.to_thread(log_and_send_error, f"S4 Test order failed for {symbol}", e)
-    else:
-        # --- REAL TRADE LOGIC ---
-        try:
-            log.info(f"S4: Placing MARKET {side} order for {qty} {symbol} at ~{current_price}")
-            await asyncio.to_thread(open_market_position_sync, symbol, side, qty, leverage)
+            pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+            if pos:
+                log.info(f"Position for {symbol} found after {i+1} attempts.")
+                break
+        
+        if not pos:
+            raise RuntimeError(f"Position for {symbol} not found after S4 market order (waited 5s).")
+        
+        actual_entry_price = float(pos['entryPrice'])
+        actual_qty = abs(float(pos['positionAmt']))
+        
+        sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_loss_price, qty=actual_qty)
 
-            # Poll for up to 5 seconds for the position to appear
-            pos = None
-            for i in range(5):
-                await asyncio.sleep(1)
-                positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
-                position_side = 'LONG' if side == 'BUY' else 'SHORT'
-                pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
-                if pos:
-                    log.info(f"Position for {symbol} found after {i+1} second(s).")
-                    break
-            
-            if not pos:
-                raise RuntimeError(f"Position for {symbol} not found after S4 market order (waited 5s).")
-            
-            actual_entry_price = float(pos['entryPrice'])
-            actual_qty = abs(float(pos['positionAmt']))
-            
-            sltp_orders = {}
-            # The initial SL is now the calculated trail stop
-            sl_price = initial_trail_stop
-            log.info(f"S4: Placing initial SL for {symbol} at {sl_price}")
-            sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=sl_price, qty=actual_qty)
+        trade_id = f"{symbol}_S4_{int(time.time())}"
+        meta = {
+            "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
+            "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
+            "leverage": leverage, "sl": stop_loss_price, "tp": 0,
+            "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
+            "risk_usdt": actual_risk_usdt, "strategy_id": 4,
+        }
 
-            trade_id = f"{symbol}_S4_{int(time.time())}"
-            meta = {
-                "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
-                "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
-                "leverage": leverage, "sl": sl_price, "tp": 0,
-                "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
-                "risk_usdt": actual_risk_usdt, "strategy_id": 4,
-                "atr_at_entry": signal_candle['s4_atr2'],
-                "s4_trailing_stop": initial_trail_stop,
-                "s4_last_candle_ts": signal_candle.name.isoformat(),
-                "s4_trailing_active": False,
-                "trailing": CONFIG["TRAILING_ENABLED"],
-            }
+        async with managed_trades_lock:
+            managed_trades[trade_id] = meta
+        await asyncio.to_thread(add_managed_trade_to_db, meta)
 
-            async with managed_trades_lock:
-                managed_trades[trade_id] = meta
-            await asyncio.to_thread(add_managed_trade_to_db, meta)
+        new_trade_msg = (
+            f"✅ *New Trade Opened: S4*\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Entry:** `{actual_entry_price:.4f}`\n"
+            f"**Initial SL (SuperTrend):** `{stop_loss_price:.4f}`\n"
+            f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_trade_msg, parse_mode='Markdown')
 
-            new_trade_msg = (
-                f"✅ *New Trade Opened: S4*\n\n"
-                f"**Symbol:** `{symbol}`\n"
-                f"**Side:** `{side}`\n"
-                f"**Entry:** `{actual_entry_price:.4f}`\n"
-                f"**Hard SL:** `{sl_price:.4f}`\n"
-                f"**Initial Trail:** `{initial_trail_stop:.4f}`\n"
-                f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
-                f"**Leverage:** `{leverage}x`"
-            )
-            await asyncio.to_thread(send_telegram, new_trade_msg, parse_mode='Markdown')
-
-        except Exception as e:
-            await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
 
 
 
@@ -3613,8 +3608,8 @@ def monitor_thread_func():
             kline_data_cache = {}
             for sym_key in active_symbols:
                 try:
-                    # Fetch enough data for RSI calculation
-                    kline_data_cache[sym_key] = fetch_klines_sync(sym_key, CONFIG["TIMEFRAME"], 50)
+                    # Fetch enough data for S4 DEMA(200) calculation
+                    kline_data_cache[sym_key] = fetch_klines_sync(sym_key, CONFIG["TIMEFRAME"], 250)
                 except Exception as e:
                     log.error(f"Failed to pre-fetch klines for {sym_key} in monitor loop: {e}")
                     kline_data_cache[sym_key] = None
@@ -3845,98 +3840,36 @@ def monitor_thread_func():
                         continue # End of S3 logic
                     
                     elif strategy_id == '4':
-                        # --- Advanced SuperTrend v2 (S4) Exit & Management Logic ---
-                        if not meta.get('trailing', True):
-                            continue # Skip if trailing is manually disabled
-                            
-                        s4_params = CONFIG['STRATEGY_4']
-                        current_price = safe_last(df_monitor['close'])
-                        entry_price = meta['entry_price']
+                        # --- DEMA+SuperTrend (S4) Exit Logic ---
+                        # Exit is triggered when a closed candle crosses the SuperTrend line.
                         
-                        # 1. Profit Gate Check to activate trailing
-                        if not meta.get('s4_trailing_active'):
-                            profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
-                            if profit_pct >= 0.005: # 0.5% profit
-                                log.info(f"S4: Profit gate hit for {tid}. Activating trailing stop.")
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid]['s4_trailing_active'] = True
-                                        add_managed_trade_to_db(managed_trades[tid])
-                                send_telegram(f"📈 Trailing stop activated for S4 trade on {sym} at {profit_pct:.2f}% profit.")
-                                meta['s4_trailing_active'] = True # Update meta for the current loop iteration
+                        # Ensure we have enough data and indicators are calculated
+                        df_with_indicators = calculate_all_indicators(df_monitor.copy())
+                        if df_with_indicators is None or df_with_indicators.empty or 's4_st' not in df_with_indicators.columns:
+                            log.warning(f"S4 Monitor: Could not calculate indicators for {sym}, skipping exit check.")
+                            continue
+
+                        # The last closed candle is at index -2
+                        last_closed_candle = df_with_indicators.iloc[-2]
+                        close_price = last_closed_candle['close']
+                        supertrend_value = last_closed_candle['s4_st']
                         
-                        # 2. Main Trailing Logic (only runs if active and on new candle)
-                        if meta.get('s4_trailing_active'):
-                            latest_candle = df_monitor.iloc[-1]
-                            last_checked_ts_str = meta.get('s4_last_candle_ts')
-                            
-                            if not last_checked_ts_str:
-                                log.warning(f"S4 trade {tid} is missing s4_last_candle_ts. Skipping trailing logic.")
-                                continue
-                                
-                            last_checked_ts = datetime.fromisoformat(last_checked_ts_str).astimezone(timezone.utc)
-                            latest_candle_ts = latest_candle.name.to_pydatetime().astimezone(timezone.utc)
-
-                            if latest_candle_ts > last_checked_ts:
-                                log.info(f"S4: New candle detected for active trail on {tid}.")
-                                
-                                df_monitor['atr2'] = atr_wilder(df_monitor, length=s4_params['TRAILING_ATR_PERIOD'])
-                                df_monitor['hhv10'] = hhv(df_monitor['high'], length=s4_params['TRAILING_HHV_PERIOD'])
-                                df_monitor['llv10'] = llv(df_monitor['low'], length=s4_params['TRAILING_HHV_PERIOD'])
-                                df_monitor['supertrend'], df_monitor['supertrend_direction'] = supertrend(df_monitor, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
-                                newly_closed_candle = df_monitor.loc[latest_candle_ts]
-
-                                # SuperTrend Flip Exit Check
-                                st_direction = newly_closed_candle['supertrend_direction']
-                                if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
-                                    log.info(f"S4 SuperTrend Flip Exit for {tid}.")
-                                    cancel_trade_sltp_orders_sync(meta)
-                                    close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                                    with managed_trades_lock:
-                                        if tid in managed_trades:
-                                            managed_trades[tid]['exit_reason'] = 'S4_SUPERTREND_FLIP'
-                                    continue
-
-                                # Trailing Stop Update
-                                current_trailing_stop = meta.get('s4_trailing_stop', meta['sl'])
-                                trail_dist = s4_params['TRAILING_ATR_MULTIPLIER'] * newly_closed_candle['atr2']
-                                new_sl_candidate = None
-                                if side == 'BUY':
-                                    candidate = newly_closed_candle['hhv10'] - trail_dist
-                                    price_based = newly_closed_candle['close'] - trail_dist
-                                    effective_candidate = max(candidate, price_based)
-                                    if effective_candidate > current_trailing_stop:
-                                        new_sl_candidate = effective_candidate
-                                else: # SELL
-                                    candidate = newly_closed_candle['llv10'] + trail_dist
-                                    price_based = newly_closed_candle['close'] + trail_dist
-                                    effective_candidate = min(candidate, price_based)
-                                    if effective_candidate < current_trailing_stop:
-                                        new_sl_candidate = effective_candidate
-                                if new_sl_candidate:
-                                    log.info(f"S4 Trailing SL update for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl_candidate:.4f}")
-                                    current_trailing_stop = new_sl_candidate
-                                    with managed_trades_lock:
-                                        if tid in managed_trades:
-                                            managed_trades[tid]['s4_trailing_stop'] = new_sl_candidate
-
-                                # Candle-Body Close Exit Check
-                                close_price = newly_closed_candle['close']
-                                if (side == 'BUY' and close_price < current_trailing_stop) or (side == 'SELL' and close_price > current_trailing_stop):
-                                    log.info(f"S4 Trailing Stop Body-Close Exit for {tid}. Price: {close_price}, Stop: {current_trailing_stop}")
-                                    cancel_trade_sltp_orders_sync(meta)
-                                    close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                                    with managed_trades_lock:
-                                        if tid in managed_trades:
-                                            managed_trades[tid]['exit_reason'] = 'S4_TRAIL_STOP_BODY_CLOSE'
-                                    continue
-                                
-                                # Persist timestamp after processing
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid]['s4_last_candle_ts'] = latest_candle_ts.isoformat()
-                                        add_managed_trade_to_db(managed_trades[tid])
+                        close_trade = False
+                        if side == 'BUY' and close_price < supertrend_value:
+                            log.info(f"S4 Exit Triggered for {tid} (BUY). Close ({close_price}) < SuperTrend ({supertrend_value}).")
+                            close_trade = True
+                        elif side == 'SELL' and close_price > supertrend_value:
+                            log.info(f"S4 Exit Triggered for {tid} (SELL). Close ({close_price}) > SuperTrend ({supertrend_value}).")
+                            close_trade = True
                         
+                        if close_trade:
+                            exit_reason = 'S4_SUPERTREND_CROSS'
+                            log.info(f"Closing trade {tid} for reason: {exit_reason}")
+                            cancel_trade_sltp_orders_sync(meta)
+                            close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
+                            with managed_trades_lock:
+                                if tid in managed_trades:
+                                    managed_trades[tid]['exit_reason'] = exit_reason
                         continue # End of S4 logic
 
                     # --- Generic BE & Trailing Logic ---
