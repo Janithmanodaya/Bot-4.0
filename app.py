@@ -4247,64 +4247,83 @@ async def manage_session_freeze_state():
     return is_effectively_frozen
 
 
+async def run_scan_cycle():
+    """
+    Runs a single concurrent scan of all symbols.
+    """
+    global scan_cycle_count
+
+    if await manage_session_freeze_state():
+        log.info("Scan cycle skipped due to session freeze.")
+        return
+
+    log.info("Starting concurrent symbol scan...")
+    symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"] if s.strip()]
+    tasks = [evaluate_and_enter(s) for s in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for symbol, result in zip(symbols, results):
+        if isinstance(result, Exception):
+            log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
+    
+    scan_cycle_count += 1
+    
+    # --- NEW: Clear indicator cache to free memory ---
+    log.info("Clearing indicator cache to conserve memory.")
+    indicator_cache.clear()
+
+
 async def scanning_loop():
     global initial_sync_complete, scan_cycle_count, next_scan_time
+    initial_sync_complete = True # Set this so status message works correctly from the start
+
     while True:
         try:
-            # --- ONE-TIME INITIAL SYNC ---
-            if not initial_sync_complete:
-                timeframe_str = CONFIG["TIMEFRAME"]
-                timeframe_delta = timeframe_to_timedelta(timeframe_str)
-                if timeframe_delta:
-                    now = datetime.now(timezone.utc)
-                    timeframe_seconds = timeframe_delta.total_seconds()
-                    last_close_timestamp = (now.timestamp() // timeframe_seconds) * timeframe_seconds
-                    last_close_dt = datetime.fromtimestamp(last_close_timestamp, tz=timezone.utc)
-                    next_close_dt = last_close_dt + timeframe_delta
-                    
-                    buffer_seconds = CONFIG.get("CANDLE_SYNC_BUFFER_SEC", 10)
-                    wait_until_dt = next_close_dt + timedelta(seconds=buffer_seconds)
-
-                    sleep_duration_seconds = (wait_until_dt - now).total_seconds()
-                    sleep_duration_seconds = max(1.0, sleep_duration_seconds)
-                    
-                    log.info(f"Performing initial sync with {timeframe_str} candle. Waiting for {sleep_duration_seconds:.2f} seconds.")
-                    await asyncio.sleep(sleep_duration_seconds)
-                
-                initial_sync_complete = True
-                log.info("Initial sync complete. Starting regular scan cycles.")
-
-            # --- REGULAR LOOP ---
             if not running:
                 await asyncio.sleep(2)
                 continue
 
-            if await manage_session_freeze_state():
-                log.info("Scan cycle skipped due to session freeze.")
-                cooldown_seconds = CONFIG["SCAN_INTERVAL"]
-                await asyncio.sleep(cooldown_seconds)
+            # --- Calculate time to next candle ---
+            timeframe_str = CONFIG["TIMEFRAME"]
+            timeframe_delta = timeframe_to_timedelta(timeframe_str)
+            
+            if not timeframe_delta:
+                # Fallback for invalid timeframe
+                log.error(f"Invalid timeframe '{timeframe_str}', falling back to fixed 60s scan interval.")
+                await run_scan_cycle()
+                await asyncio.sleep(CONFIG.get("SCAN_INTERVAL", 60))
                 continue
 
-            log.info("Starting concurrent symbol scan...")
-            symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"] if s.strip()]
-            tasks = [evaluate_and_enter(s) for s in symbols]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for symbol, result in zip(symbols, results):
-                if isinstance(result, Exception):
-                    log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
+            now = datetime.now(timezone.utc)
+            timeframe_seconds = timeframe_delta.total_seconds()
+            next_candle_open_ts = ((now.timestamp() // timeframe_seconds) + 1) * timeframe_seconds
+            next_candle_open_dt = datetime.fromtimestamp(next_candle_open_ts, tz=timezone.utc)
+            seconds_to_next_candle = (next_candle_open_dt - now).total_seconds()
             
-            scan_cycle_count += 1
-            
-            # --- NEW: Clear indicator cache to free memory ---
-            log.info("Clearing indicator cache to conserve memory.")
-            indicator_cache.clear()
+            # --- Pre-candle Pause Logic ---
+            if seconds_to_next_candle < 120: # 2 minutes
+                sync_buffer = CONFIG.get("CANDLE_SYNC_BUFFER_SEC", 10)
+                sleep_duration = seconds_to_next_candle + sync_buffer
+                
+                log.info(f"Approaching new {timeframe_str} candle. Pausing all scanning for {sleep_duration:.2f} seconds to sync.")
+                next_scan_time = datetime.now(timezone.utc) + timedelta(seconds=sleep_duration)
+                await asyncio.sleep(sleep_duration)
+                continue # Restart the loop to scan immediately after sync
 
-            # Use the simple fixed cooldown for subsequent cycles
-            cooldown_seconds = CONFIG["SCAN_INTERVAL"]
-            next_scan_time = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
-            log.info(f"Scan cycle #{scan_cycle_count} complete. Cooling down for {cooldown_seconds} seconds.")
-            await asyncio.sleep(cooldown_seconds)
+            # --- Continuous Scanning Logic ---
+            log.info(f"Continuous scan cycle starting. Stopping in {seconds_to_next_candle - 120:.2f} seconds.")
+            while seconds_to_next_candle >= 120:
+                await run_scan_cycle()
+                
+                # Short sleep to prevent CPU pegging and allow other tasks to run
+                await asyncio.sleep(1) 
+
+                # Re-check time to next candle to see if we should break the inner loop
+                now = datetime.now(timezone.utc)
+                seconds_to_next_candle = (next_candle_open_dt - now).total_seconds()
+                next_scan_time = now + timedelta(seconds=1) # Update for status message
+
+            log.info("Continuous scan cycle finished. Will pause until next candle.")
 
         except asyncio.CancelledError:
             log.info("Scanning loop cancelled.")
@@ -5068,10 +5087,7 @@ def handle_update_sync(update, loop):
                 status_lines.append(f"📈 Managed Trades: *{len(trades)}*")
                 
                 # Scan Cycle Info
-                if not initial_sync_complete:
-                    status_lines.append("🔄 Scans: *Initializing...*")
-                else:
-                    status_lines.append(f"🔄 Total Scans: *{scan_cycle_count}*")
+                status_lines.append(f"🔄 Total Scans: *{scan_cycle_count}*")
                 if next_scan_time and running:
                     time_until_next_scan = next_scan_time - datetime.now(timezone.utc)
                     if time_until_next_scan.total_seconds() > 0:
