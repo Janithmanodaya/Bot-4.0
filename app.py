@@ -744,9 +744,17 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     send_telegram(telegram_msg, parse_mode='Markdown')
 
 
-def _record_rejection(symbol: str, reason: str, details: dict):
-    """Adds a rejected trade event to the deque."""
+def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Optional[pd.Series] = None):
+    """Adds a rejected trade event to the deque with enriched details."""
     global rejected_trades
+
+    # Enrich details with key indicator values from the signal candle if available
+    if signal_candle is not None:
+        indicator_keys = ['close', 'rsi', 'adx', 's1_bbu', 's1_bbl', 's2_st', 's4_st', 's4_dema']
+        for key in indicator_keys:
+            if key in signal_candle and pd.notna(signal_candle[key]):
+                details[key] = signal_candle[key]
+
     # Format floats in details to a reasonable precision for display
     formatted_details = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in details.items()}
     record = {
@@ -2312,7 +2320,7 @@ def check_for_liquidity_grab(df: pd.DataFrame, symbol: str) -> bool:
 
         if is_large_body and is_large_wick:
             log.info(f"Liquidity grab candle detected for {symbol} at {candle.name}. Total Size: {total_candle_size_pct:.2f}%, Body: {body_size_pct:.2f}%, Wick/Body Ratio: {total_wick_size/body_size_abs if body_size_abs > 0 else 'inf'}. Skipping trade.")
-            _record_rejection(symbol, "Liquidity Grab Detected", {"candle_time": candle.name.isoformat()})
+            _record_rejection(symbol, "Liquidity Grab Detected", {"candle_time": candle.name.isoformat()}, signal_candle=candle)
             return True # Found a liquidity grab candle
 
     return False # No liquidity grab detected
@@ -2522,7 +2530,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
     elif signal_candle['close'] >= signal_candle['s1_bbu']:
         side = 'SELL'
     else:
-        _record_rejection(symbol, "S1-Not a BB signal", {"close": signal_candle['close'], "bbu": signal_candle['s1_bbu'], "bbl": signal_candle['s1_bbl']})
+        _record_rejection(symbol, "S1-Not a BB signal", {"close": signal_candle['close'], "bbu": signal_candle['s1_bbu'], "bbl": signal_candle['s1_bbl']}, signal_candle=signal_candle)
         return
 
     # Previous candle confirmation (strict)
@@ -2536,7 +2544,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
     # ADX filter for mean-reversion: only trade when ADX is low (non-trending)
     adx_value = float(df['adx'].iloc[-2]) if 'adx' in df.columns else None
     if adx_value is not None and adx_value >= adx_threshold:
-        _record_rejection(symbol, "S1-ADX too strong", {"adx": adx_value, "threshold": adx_threshold})
+        _record_rejection(symbol, "S1-ADX too strong", {"adx": adx_value, "threshold": adx_threshold}, signal_candle=signal_candle)
         return
 
     # Entry and SL
@@ -2558,7 +2566,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
     # Quantity / sizing (risk-based)
     distance = abs(entry_price - sl_price)
     if distance <= 0:
-        _record_rejection(symbol, "S1-Zero distance for sizing", {"entry": entry_price, "sl": sl_price})
+        _record_rejection(symbol, "S1-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=signal_candle)
         return
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
@@ -2575,7 +2583,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
 
     final_qty = max(ideal_qty, qty_min)
     if final_qty <= 0:
-        _record_rejection(symbol, "S1-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
+        _record_rejection(symbol, "S1-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=signal_candle)
         return
 
     # --- Recalculate final notional and leverage ---
@@ -2681,7 +2689,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     elif prev_close_vs_st > 0 and sig_close_vs_st < 0:
         side = 'SELL'
     else:
-        _record_rejection(symbol, "S2-No ST flip", {"prev_vs_st": prev_close_vs_st, "sig_vs_st": sig_close_vs_st})
+        _record_rejection(symbol, "S2-No ST flip", {"prev_vs_st": prev_close_vs_st, "sig_vs_st": sig_close_vs_st}, signal_candle=signal_candle)
         return
 
     # Previous-candle confirmation (strict)
@@ -2706,7 +2714,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     entry_price = float(signal_candle['close'])
     distance = abs(entry_price - sl_price)
     if distance <= 0:
-        _record_rejection(symbol, "S2-Zero distance for sizing", {"entry": entry_price, "sl": sl_price})
+        _record_rejection(symbol, "S2-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=signal_candle)
         return
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
@@ -2721,7 +2729,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
 
     final_qty = max(ideal_qty, qty_min)
     if final_qty <= 0:
-        _record_rejection(symbol, "S2-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
+        _record_rejection(symbol, "S2-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=signal_candle)
         return
 
     # --- Recalculate final notional and leverage ---
@@ -2825,7 +2833,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
     elif prev['s3_ma_fast'] > prev['s3_ma_slow'] and sig['s3_ma_fast'] < sig['s3_ma_slow']:
         side = 'SELL'
     else:
-        _record_rejection(symbol, "S3-No MA cross", {"prev_fast": prev['s3_ma_fast'], "prev_slow": prev['s3_ma_slow'], "sig_fast": sig['s3_ma_fast'], "sig_slow": sig['s3_ma_slow']})
+        _record_rejection(symbol, "S3-No MA cross", {"prev_fast": prev['s3_ma_fast'], "prev_slow": prev['s3_ma_slow'], "sig_fast": sig['s3_ma_fast'], "sig_slow": sig['s3_ma_slow']}, signal_candle=sig)
         return
 
     # Prev candle confirmation
@@ -2852,7 +2860,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
 
     distance = abs(entry_price - sl_price)
     if distance <= 0:
-        _record_rejection(symbol, "S3-Zero distance for sizing", {"entry": entry_price, "sl": sl_price})
+        _record_rejection(symbol, "S3-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=sig)
         return
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
@@ -2867,7 +2875,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
 
     final_qty = max(ideal_qty, qty_min)
     if final_qty <= 0:
-        _record_rejection(symbol, "S3-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
+        _record_rejection(symbol, "S3-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=sig)
         return
 
     # --- Recalculate final notional and leverage ---
@@ -3040,15 +3048,15 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     # --- Entry Rule 1: DEMA Trend Filter ---
     dema_value_signal = signal_candle['s4_dema']
     if side == 'BUY' and entry_price <= dema_value_signal:
-        _record_rejection(symbol, "S4 DEMA Filter", {"side": "BUY", "price": entry_price, "dema": dema_value_signal})
+        _record_rejection(symbol, "S4 DEMA Filter", {"side": "BUY", "price": entry_price, "dema": dema_value_signal}, signal_candle=signal_candle)
         return
     if side == 'SELL' and entry_price >= dema_value_signal:
-        _record_rejection(symbol, "S4 DEMA Filter", {"side": "SELL", "price": entry_price, "dema": dema_value_signal})
+        _record_rejection(symbol, "S4 DEMA Filter", {"side": "SELL", "price": entry_price, "dema": dema_value_signal}, signal_candle=signal_candle)
         return
         
     # --- Entry Rule 2: DEMA Cross Rejection ---
     if candle_body_crosses_dema(signal_candle, dema_value_signal):
-        _record_rejection(symbol, "S4 DEMA Cross", {"candle": "signal", "dema": dema_value_signal})
+        _record_rejection(symbol, "S4 DEMA Cross", {"candle": "signal", "dema": dema_value_signal}, signal_candle=signal_candle)
         return
     prev_dema_value = prev_candle['s4_dema']
     if candle_body_crosses_dema(prev_candle, prev_dema_value):
@@ -3059,7 +3067,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     signal_body_size = abs(signal_candle['close'] - signal_candle['open'])
     prev_body_size = abs(prev_candle['close'] - prev_candle['open'])
     if prev_body_size > 0 and signal_body_size > (3 * prev_body_size):
-        _record_rejection(symbol, "S4 Candle Size", {"signal_body": signal_body_size, "prev_body": prev_body_size})
+        _record_rejection(symbol, "S4 Candle Size", {"signal_body": signal_body_size, "prev_body": prev_body_size}, signal_candle=signal_candle)
         return
         
     log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
@@ -3075,9 +3083,10 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
 
     if time_since_signal > 180:
         _record_rejection(
-            symbol, 
-            "S4 Signal Expired", 
-            {"side": side, "age_sec": f"{time_since_signal:.2f}", "limit_sec": 180}
+            symbol,
+            "S4 Signal Expired",
+            {"side": side, "age_sec": f"{time_since_signal:.2f}", "limit_sec": 180},
+            signal_candle=signal_candle,
         )
         return
     # --- End of new logic ---
@@ -3088,7 +3097,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     
     price_distance = abs(entry_price - stop_loss_price)
     if price_distance <= 0:
-        _record_rejection(symbol, "S4 Invalid SL Distance", {"entry": entry_price, "sl": stop_loss_price})
+        _record_rejection(symbol, "S4 Invalid SL Distance", {"entry": entry_price, "sl": stop_loss_price}, signal_candle=signal_candle)
         return
 
     ideal_qty = risk_usd / price_distance
@@ -3102,7 +3111,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     notional = final_qty * entry_price
 
     if final_qty <= 0:
-        _record_rejection(symbol, "S4 Qty Zero", {"ideal_qty": ideal_qty, "min_qty": qty_min})
+        _record_rejection(symbol, "S4 Qty Zero", {"ideal_qty": ideal_qty, "min_qty": qty_min}, signal_candle=signal_candle)
         return
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
