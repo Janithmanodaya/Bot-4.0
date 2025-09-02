@@ -77,7 +77,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4"),  # 0=all, or comma-separated, e.g., "1,2"
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4,1"),  # 0=all, or comma-separated, e.g., "1,2"
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -3717,13 +3717,16 @@ def monitor_thread_func():
                                 new_sl_price = entry_price # Move to BE
                                 new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
 
+                                trade_to_update_in_db = None
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid].update({
                                             'qty': new_qty, 'sltp_orders': new_orders, 'sl': new_sl_price,
                                             'trade_phase': 1, 'be_moved': True, 'trailing_active': False # Deactivate normal trailing until final phase
                                         })
-                                        add_managed_trade_to_db(managed_trades[tid])
+                                        trade_to_update_in_db = managed_trades[tid].copy()
+                                if trade_to_update_in_db:
+                                    add_managed_trade_to_db(trade_to_update_in_db)
                                 send_telegram(f"✅ S2-TP1 Hit for {sym}. Closed 30%, SL moved to BE.")
                                 continue
                         
@@ -3741,13 +3744,16 @@ def monitor_thread_func():
                                 new_sl_price = entry_price + atr_at_entry if side == 'BUY' else entry_price - atr_at_entry # Move SL to 1R
                                 new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
 
+                                trade_to_update_in_db = None
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid].update({
                                             'qty': new_qty, 'sltp_orders': new_orders, 'sl': new_sl_price,
                                             'trade_phase': 2, 'trailing_active': True # Activate trailing for final part
                                         })
-                                        add_managed_trade_to_db(managed_trades[tid])
+                                        trade_to_update_in_db = managed_trades[tid].copy()
+                                if trade_to_update_in_db:
+                                    add_managed_trade_to_db(trade_to_update_in_db)
                                 send_telegram(f"✅ S2-TP2 Hit for {sym}. Closed 30%, SL moved to 1R profit. Trailing activated.")
                                 continue
                         continue # End of S2 logic
@@ -3803,10 +3809,13 @@ def monitor_thread_func():
                             if profit_pct >= s3_params['TRAILING_ACTIVATION_PROFIT_PCT']:
                                 log.info(f"S3: Activating trailing stop for {tid} at {profit_pct:.2f}% profit.")
                                 is_trailing_active = True
+                                trade_to_update_in_db = None
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid]['s3_trailing_active'] = True
-                                        add_managed_trade_to_db(managed_trades[tid])
+                                        trade_to_update_in_db = managed_trades[tid].copy()
+                                if trade_to_update_in_db:
+                                    add_managed_trade_to_db(trade_to_update_in_db)
 
                         if is_trailing_active:
                             trail_dist = s3_params['TRAILING_ATR_MULTIPLIER'] * atr2_now
@@ -3828,6 +3837,7 @@ def monitor_thread_func():
                                 log.info(f"S3 Trailing SL for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl:.4f}")
                                 cancel_trade_sltp_orders_sync(meta)
                                 new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                                trade_to_update_in_db = None
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid].update({
@@ -3835,7 +3845,9 @@ def monitor_thread_func():
                                             'sltp_orders': new_orders, 
                                             's3_trailing_stop': new_sl
                                         })
-                                        add_managed_trade_to_db(managed_trades[tid])
+                                        trade_to_update_in_db = managed_trades[tid].copy()
+                                if trade_to_update_in_db:
+                                    add_managed_trade_to_db(trade_to_update_in_db)
                                 send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
                         continue # End of S3 logic
                     
@@ -3883,10 +3895,13 @@ def monitor_thread_func():
                             cancel_trade_sltp_orders_sync(meta)
                             new_sl_price = entry_price * (1 + exit_params['BE_SL_OFFSET'] if side == 'BUY' else 1 - exit_params['BE_SL_OFFSET'])
                             new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=meta['qty'])
+                            trade_to_update_in_db = None
                             with managed_trades_lock:
                                 if tid in managed_trades:
                                     managed_trades[tid].update({'sl': new_sl_price, 'sltp_orders': new_orders, 'be_moved': True, 'trailing_active': True})
-                                    add_managed_trade_to_db(managed_trades[tid])
+                                    trade_to_update_in_db = managed_trades[tid].copy()
+                            if trade_to_update_in_db:
+                                add_managed_trade_to_db(trade_to_update_in_db)
                             send_telegram(f"📈 Breakeven triggered for {tid} ({sym}). SL moved to {new_sl_price:.4f} and trailing stop activated.")
                             continue
 
@@ -3919,10 +3934,13 @@ def monitor_thread_func():
                             log.info(f"Trailing SL for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
                             cancel_trade_sltp_orders_sync(meta)
                             new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                            trade_to_update_in_db = None
                             with managed_trades_lock:
                                 if tid in managed_trades:
                                     managed_trades[tid].update({'sl': new_sl, 'sltp_orders': new_orders})
-                                    add_managed_trade_to_db(managed_trades[tid])
+                                    trade_to_update_in_db = managed_trades[tid].copy()
+                            if trade_to_update_in_db:
+                                add_managed_trade_to_db(trade_to_update_in_db)
                             send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
                 
                 except Exception as e:
@@ -5012,14 +5030,16 @@ def handle_update_sync(update, loop):
                 except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
                 send_telegram("✅ Bot is now **UNFROZEN**. Active session freeze has been overridden.", parse_mode='Markdown')
             elif text.startswith("/status"):
-                log.info("Received /status command.")
+                log.info("Received /status command. Scheduling task.")
+                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
                 trades = {}
                 try:
-                    with managed_trades_lock:
-                        trades = dict(managed_trades)
+                    log.info("Waiting for /status task future result...")
+                    trades = fut.result(timeout=10) # Increased timeout for debugging
+                    log.info("Got /status task future result.")
                 except Exception as e:
                     log.error("Failed to get managed trades for /status: %s", e, exc_info=True)
-
+                
                 unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
                 
                 # Account & PnL Info
@@ -5052,7 +5072,6 @@ def handle_update_sync(update, loop):
                     status_lines.append("🔄 Scans: *Initializing...*")
                 else:
                     status_lines.append(f"🔄 Total Scans: *{scan_cycle_count}*")
-
                 if next_scan_time and running:
                     time_until_next_scan = next_scan_time - datetime.now(timezone.utc)
                     if time_until_next_scan.total_seconds() > 0:
