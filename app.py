@@ -3005,6 +3005,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     if CONFIG["TIMEFRAME"] != "15m" and not test_signal:
         if not hasattr(evaluate_strategy_4, 'has_warned'):
             log.warning("S4 is designed for 15m timeframe only. Current timeframe is not 15m. S4 will not execute.")
+            _record_rejection(symbol, "S4 Invalid Timeframe", {"timeframe": CONFIG["TIMEFRAME"]})
             evaluate_strategy_4.has_warned = True # Prevent spamming logs
         return
 
@@ -3014,9 +3015,11 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     if not test_signal:
         async with managed_trades_lock:
             if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+                log.info(f"S4: Skipping evaluation for {symbol} as a trade is already open and hedging is disabled.")
                 return
         async with pending_limit_orders_lock:
             if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
+                log.info(f"S4: Skipping evaluation for {symbol} as a pending limit order already exists.")
                 return
     
     # --- Indicator & Data Check ---
@@ -3043,6 +3046,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             side = 'SELL'
         
         if not side:
+            log.info(f"S4: No signal detected for {symbol} on the last closed candle.")
             return # No signal
 
     # --- Entry Rule 1: DEMA Trend Filter ---
