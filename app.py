@@ -203,7 +203,7 @@ CONFIG = {
     
     "DRY_RUN": os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes"),
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
-    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "true").lower() in ("true", "1", "yes"),
     "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "25")),
     "AUTO_RESTART_ON_IP_ERROR": os.getenv("AUTO_RESTART_ON_IP_ERROR", "true").lower() in ("true", "1", "yes"),
 }
@@ -3757,44 +3757,61 @@ def monitor_thread_func():
             to_remove = []
             for tid, meta in trades_snapshot.items():
                 sym = meta['symbol']
-                pos = next((p for p in positions if p.get('symbol') == sym), None)
-                if not pos:
-                    continue
-                
-                pos_amt = float(pos.get('positionAmt') or 0.0)
-                unreal = float(pos.get('unRealizedProfit') or 0.0)
-                
-                with managed_trades_lock:
-                    if tid in managed_trades:
-                        managed_trades[tid]['unreal'] = unreal
+                side = meta['side']
 
-                if abs(pos_amt) < 1e-8:
+                # Determine expected positionSide based on the trade's side
+                expected_pos_side = 'LONG' if side == 'BUY' else 'SHORT'
+
+                # Find the specific position (LONG or SHORT)
+                pos = next((p for p in positions if p.get('symbol') == sym and p.get('positionSide') == expected_pos_side), None)
+
+                # If we are not in hedge mode, the positionSide is 'BOTH'
+                if pos is None and not IS_HEDGE_MODE:
+                     pos = next((p for p in positions if p.get('symbol') == sym and p.get('positionSide') == 'BOTH'), None)
+
+                is_closed = False
+                unreal_pnl_for_trade = 0.0 # Default PnL to 0
+                
+                if pos:
+                    # We found a matching position, check if its amount is zero.
+                    pos_amt = float(pos.get('positionAmt') or 0.0)
+                    unreal_pnl_for_trade = float(pos.get('unRealizedProfit') or 0.0)
+
+                    if abs(pos_amt) < 1e-8:
+                        is_closed = True
+                        # For closed positions, the final PnL is in the unrealizedProfit field upon closure.
+                    else:
+                        # Position is still open, update its PnL in our managed state
+                        with managed_trades_lock:
+                            if tid in managed_trades:
+                                managed_trades[tid]['unreal'] = unreal_pnl_for_trade
+                else:
+                    # If we didn't find a position for our specific side, it must be closed.
+                    is_closed = True
+
+                if is_closed:
                     close_time = datetime.utcnow().replace(tzinfo=timezone.utc)
                     meta['close_time'] = close_time.isoformat()
-                    exit_reason = meta.get('exit_reason', 'SL/TP') # Default to SL/TP if not set by an early exit
-                    
+                    exit_reason = meta.get('exit_reason', 'SL/TP') 
+
                     # --- Post-Loss Cooldown Logic ---
-                    if unreal < 0:
+                    if unreal_pnl_for_trade < 0:
                         cooldown_end_time = close_time + timedelta(hours=CONFIG['LOSS_COOLDOWN_HOURS'])
                         symbol_loss_cooldown[sym] = cooldown_end_time
-                        log.info(f"Symbol {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown (until {cooldown_end_time}). PnL: {unreal:.4f}.")
+                        log.info(f"Symbol {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown (until {cooldown_end_time}). PnL: {unreal_pnl_for_trade:.4f}.")
                         send_telegram(f"🧊 {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
 
-
-                    log.info(f"TRADE_CLOSE_EVENT: ID={tid}, Symbol={sym}, PnL={unreal:.4f}, Reason={exit_reason}. Preparing to record and remove from managed trades.")
+                    log.info(f"TRADE_CLOSE_EVENT: ID={tid}, Symbol={sym}, PnL={unreal_pnl_for_trade:.4f}, Reason={exit_reason}. Preparing to record and remove from managed trades.")
                     
-                    # Prepare the record with all available data, including new strategy fields
                     trade_record = meta.copy()
                     trade_record.update({
-                        'exit_price': float(pos.get('entryPrice') or 0.0),
-                        'pnl': unreal,
+                        'exit_price': float(pos.get('entryPrice') or 0.0) if pos else meta['entry_price'],
+                        'pnl': unreal_pnl_for_trade,
                         'close_time': meta['close_time'],
                         'exit_reason': exit_reason
                     })
-                    # The 'meta' dictionary already contains all the strategy fields,
-                    # so we can just pass the updated record to the function.
                     record_trade(trade_record)
-                    remove_managed_trade_from_db(tid) # Keep as backup
+                    remove_managed_trade_from_db(tid)
                     with managed_trades_lock:
                         last_trade_close_time[sym] = close_time
                     
@@ -3803,7 +3820,7 @@ def monitor_thread_func():
                         f"**ID:** `{meta['id']}`\n"
                         f"**Symbol:** {sym}\n"
                         f"**Reason:** {exit_reason}\n"
-                        f"**PnL:** `{unreal:.4f} USDT`"
+                        f"**PnL:** `{unreal_pnl_for_trade:.4f} USDT`"
                     )
                     send_telegram(close_msg, parse_mode='Markdown')
                     to_remove.append(tid)
