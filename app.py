@@ -69,7 +69,8 @@ log = logging.getLogger("ema-bb-bot")
 
 # Globals
 client: Optional[Client] = None
-telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+request = telegram.request.Request(con_pool_size=10)
+telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN, request=request) if TELEGRAM_BOT_TOKEN else None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # -------------------------
@@ -4249,22 +4250,31 @@ async def manage_session_freeze_state():
 
 async def run_scan_cycle():
     """
-    Runs a single concurrent scan of all symbols.
+    Runs a single concurrent scan of all symbols, limited by a semaphore
+    to prevent overwhelming the thread pool.
     """
     global scan_cycle_count
+    sem = asyncio.Semaphore(4)
 
     if await manage_session_freeze_state():
         log.info("Scan cycle skipped due to session freeze.")
         return
 
-    log.info("Starting concurrent symbol scan...")
+    async def throttled_eval(symbol):
+        async with sem:
+            # The return value of evaluate_and_enter is not used, but we await it
+            # to ensure the semaphore is held for the duration of the evaluation.
+            return await evaluate_and_enter(symbol)
+
+    log.info("Starting concurrent symbol scan (concurrency limit: 4)...")
     symbols = [s.strip().upper() for s in CONFIG["SYMBOLS"] if s.strip()]
-    tasks = [evaluate_and_enter(s) for s in symbols]
+    tasks = [throttled_eval(s) for s in symbols]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for symbol, result in zip(symbols, results):
         if isinstance(result, Exception):
-            log.error(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
+            # Log the exception with traceback for better debugging
+            log.exception(f"Error evaluating symbol {symbol} during concurrent scan: {result}")
     
     scan_cycle_count += 1
     
@@ -5321,20 +5331,21 @@ def handle_update_sync(update, loop):
                         new_trailing_state = (state == 'on')
                         
                         async def _task():
+                            trade_to_update = None
+                            # --- Lock, update in-memory state, and get a copy ---
                             async with managed_trades_lock:
                                 if trade_id in managed_trades:
-                                    # Update in-memory state first
                                     managed_trades[trade_id]['trailing'] = new_trailing_state
-                                    
-                                    # Persist to DB and Firebase
-                                    trade_to_update = managed_trades[trade_id]
-                                    await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
-
-                                    status_msg = "ENABLED" if new_trailing_state else "DISABLED"
-                                    msg = f"✅ Trailing stop for trade `{trade_id}` has been manually {status_msg}."
-                                    await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
-                                else:
-                                    await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
+                                    trade_to_update = managed_trades[trade_id].copy()
+                            
+                            # --- Perform slow I/O (DB, Telegram) outside the lock ---
+                            if trade_to_update:
+                                await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
+                                status_msg = "ENABLED" if new_trailing_state else "DISABLED"
+                                msg = f"✅ Trailing stop for trade `{trade_id}` has been manually {status_msg}."
+                                await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+                            else:
+                                await asyncio.to_thread(send_telegram, f"❌ Trade with ID `{trade_id}` not found.", parse_mode='Markdown')
 
                         fut = asyncio.run_coroutine_threadsafe(_task(), loop)
                         try:
@@ -5531,6 +5542,7 @@ def handle_update_sync(update, loop):
                         risk_to_add = float(risk_to_add_str)
                         
                         async def _task():
+                            # --- Get trade data without holding lock for long ---
                             trades = await get_managed_trades_snapshot()
                             if trade_id not in trades:
                                 await asyncio.to_thread(send_telegram, f"Trade {trade_id} not found.")
@@ -5546,15 +5558,25 @@ def handle_update_sync(update, loop):
                             qty_to_add = await asyncio.to_thread(round_qty, trade['symbol'], qty_to_add)
 
                             if qty_to_add > 0:
+                                # --- Perform slow I/O (API call) outside the lock ---
                                 await asyncio.to_thread(open_market_position_sync, trade['symbol'], trade['side'], qty_to_add, trade['leverage'])
                                 
+                                trade_to_update = None
+                                # --- Lock, update in-memory state, and get a copy ---
                                 async with managed_trades_lock:
-                                    trade['qty'] += qty_to_add
-                                    trade['notional'] += qty_to_add * trade['entry_price'] # Approximate
-                                    trade['risk_usdt'] += risk_to_add
-                                    await asyncio.to_thread(add_managed_trade_to_db, trade)
+                                    if trade_id in managed_trades:
+                                        managed_trades[trade_id]['qty'] += qty_to_add
+                                        managed_trades[trade_id]['notional'] += qty_to_add * trade['entry_price'] # Approximate
+                                        managed_trades[trade_id]['risk_usdt'] += risk_to_add
+                                        trade_to_update = managed_trades[trade_id].copy()
 
-                                await asyncio.to_thread(send_telegram, f"✅ Scaled in {trade_id} by {qty_to_add} {trade['symbol']}.")
+                                # --- Perform slow I/O (DB, Telegram) outside the lock ---
+                                if trade_to_update:
+                                    await asyncio.to_thread(add_managed_trade_to_db, trade_to_update)
+                                    await asyncio.to_thread(send_telegram, f"✅ Scaled in {trade_id} by {qty_to_add} {trade['symbol']}.")
+                                else:
+                                    # This case is unlikely but handled for safety
+                                    await asyncio.to_thread(send_telegram, f"Could not update trade {trade_id} after scaling in. Please check status.")
                             else:
                                 await asyncio.to_thread(send_telegram, "Calculated quantity to add is zero.")
 
