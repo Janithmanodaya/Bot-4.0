@@ -654,14 +654,22 @@ def get_public_ip() -> str:
         return "unable-to-fetch-ip"
 
 def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float]:
-    df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 200)
+    # Fetch klines, enough for S4 indicators
+    df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 250)
     if df is None or df.empty:
         raise RuntimeError("No kline data to calc default SL/TP")
-    atr_now = safe_latest_atr_from_df(df)
-    atr_mult = CONFIG.get("SL_TP_ATR_MULT") or CONFIG.get("STRATEGY_EXIT_PARAMS", {}).get('1', {}).get("ATR_MULTIPLIER") or 2.0
-    sl_dist = atr_mult * atr_now
-    stop_price = entry_price - sl_dist if side == 'BUY' else entry_price + sl_dist
-    take_price = entry_price + sl_dist if side == 'BUY' else entry_price - sl_dist
+
+    # Calculate S4 Supertrend to determine the SL
+    s4_params = CONFIG['STRATEGY_4']
+    df['s4_st'], _ = supertrend(df, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
+
+    # The stop price is the most recent Supertrend value
+    stop_price = safe_last(df['s4_st'])
+
+    # We are no longer placing a TP, but the function signature requires returning two values.
+    # The calling function (_import_rogue_position_async) ignores the second value.
+    take_price = 0.0
+
     return stop_price, take_price
 
 def timeframe_to_timedelta(tf: str) -> Optional[timedelta]:
