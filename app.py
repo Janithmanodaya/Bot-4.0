@@ -2384,8 +2384,8 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         # User requested specific settings for the TSL indicator.
         # Note: Using 'low' as a source for both up and down trends is unconventional.
         # For short trades, the upper band (stop) will be based on 'low', which might be tighter than intended.
-        tsl_atr_period = s4_params.get("TSL_ATR_PERIOD", 10)
-        tsl_atr_mult = s4_params.get("TSL_ATR_MULTIPLIER", 3.0)
+        tsl_atr_period = s4_params.get("TSL_ATR_PERIOD", 2)
+        tsl_atr_mult = s4_params.get("TSL_ATR_MULTIPLIER", 4.6)
         tsl_atr = atr(out, length=tsl_atr_period)
         out['s4_tsl_st'], out['s4_tsl_st_dir'] = supertrend(out, period=tsl_atr_period, multiplier=tsl_atr_mult, atr_series=tsl_atr, source=out['low'])
 
@@ -3011,7 +3011,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     Evaluates and executes trades based on the DEMA+SuperTrend strategy (S4).
     """
     global managed_trades
-    log.info(f"S4: Evaluating {symbol}...")
 
     # --- Timeframe Check ---
     if CONFIG["TIMEFRAME"] != "15m" and not test_signal:
@@ -3037,7 +3036,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     # --- Indicator & Data Check ---
     required_cols = ['s4_dema', 's4_st', 's4_st_dir', 'open', 'close']
     if len(df) < 4 or any(col not in df.columns for col in required_cols):
-        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data. Need at least 4 bars. Have {len(df)} bars.")
+        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data. Need at least 4 bars.")
         return
 
     # --- Define Candles ---
@@ -3052,19 +3051,17 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         side = test_signal
         log.info(f"S4 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
     else:
-        log.info(f"S4 Signal Check for {symbol}: prev_st_dir={prev_candle['s4_st_dir']}, sig_st_dir={signal_candle['s4_st_dir']}")
         if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
             side = 'BUY'
         elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
             side = 'SELL'
         
         if not side:
-            log.info(f"S4: No SuperTrend flip signal detected for {symbol} on the last closed candle.")
+            log.info(f"S4: No signal detected for {symbol} on the last closed candle.")
             return # No signal
 
     # --- Entry Rule 1: DEMA Trend Filter ---
     dema_value_signal = signal_candle['s4_dema']
-    log.info(f"S4 DEMA Filter Check for {symbol} ({side}): entry_price={entry_price}, dema={dema_value_signal}")
     if side == 'BUY' and entry_price <= dema_value_signal:
         _record_rejection(symbol, "S4 DEMA Filter", {"side": "BUY", "price": entry_price, "dema": dema_value_signal}, signal_candle=signal_candle)
         return
@@ -3098,7 +3095,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     
     current_time = datetime.now(timezone.utc)
     time_since_signal = (current_time - signal_candle_close_time).total_seconds()
-    log.info(f"S4 Expiry Check for {symbol}: signal_age={time_since_signal:.2f}s")
 
     if time_since_signal > 180:
         _record_rejection(
