@@ -1457,6 +1457,32 @@ def get_symbol_info(symbol: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+def get_min_notional_sync(symbol: str) -> float:
+    """
+    Retrieves the minimum notional value for a given symbol from exchange info.
+    Falls back to the globally configured MIN_NOTIONAL_USDT.
+    """
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict):
+            return float(CONFIG.get("MIN_NOTIONAL_USDT", 5.0))
+
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return float(CONFIG.get("MIN_NOTIONAL_USDT", 5.0))
+
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'MIN_NOTIONAL':
+                notional_val = f.get('notional')
+                if notional_val:
+                    # Add a small buffer to avoid floating point issues
+                    return float(notional_val) * 1.01
+        
+        return float(CONFIG.get("MIN_NOTIONAL_USDT", 5.0))
+    except Exception as e:
+        log.exception(f"Failed to get min notional for {symbol}, using config fallback. Error: {e}")
+        return float(CONFIG.get("MIN_NOTIONAL_USDT", 5.0))
+
 def get_step_size(symbol: str) -> Optional[Decimal]:
     """Retrieves the lot step size for a given symbol from exchange info."""
     try:
@@ -2543,7 +2569,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
     ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
     # ensure min notional
-    min_notional = CONFIG.get("MIN_NOTIONAL_USDT", 10.0)
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
 
@@ -2689,7 +2715,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
     ideal_qty = risk_usdt / distance
     ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
-    min_notional = CONFIG.get("MIN_NOTIONAL_USDT", 10.0)
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
 
@@ -2835,7 +2861,7 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
     ideal_qty = risk_usdt / distance
     ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
-    min_notional = CONFIG.get("MIN_NOTIONAL_USDT", 10.0)
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
 
@@ -3038,6 +3064,24 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         
     log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
 
+    # --- NEW: 3-Minute Signal Expiry ---
+    signal_candle_close_time = signal_candle.name.to_pydatetime()
+    # Ensure it's timezone-aware if it's not already
+    if signal_candle_close_time.tzinfo is None:
+        signal_candle_close_time = signal_candle_close_time.replace(tzinfo=timezone.utc)
+    
+    current_time = datetime.now(timezone.utc)
+    time_since_signal = (current_time - signal_candle_close_time).total_seconds()
+
+    if time_since_signal > 180:
+        _record_rejection(
+            symbol, 
+            "S4 Signal Expired", 
+            {"side": side, "age_sec": f"{time_since_signal:.2f}", "limit_sec": 180}
+        )
+        return
+    # --- End of new logic ---
+
     # --- Stop Loss and Sizing ---
     stop_loss_price = signal_candle['s4_st']
     risk_usd = s4_params['RISK_USD']
@@ -3047,18 +3091,18 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         _record_rejection(symbol, "S4 Invalid SL Distance", {"entry": entry_price, "sl": stop_loss_price})
         return
 
-    qty = risk_usd / price_distance
-    
-    final_qty = await asyncio.to_thread(round_qty, symbol, qty, rounding=ROUND_DOWN)
-    
+    ideal_qty = risk_usd / price_distance
+    ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+    qty_min = min_notional / entry_price if entry_price > 0 else 0.0
+    qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+
+    final_qty = max(ideal_qty, qty_min)
     notional = final_qty * entry_price
-    min_notional = CONFIG.get("MIN_NOTIONAL_USDT", 5.0)
-    if notional < min_notional:
-        final_qty = await asyncio.to_thread(round_qty, symbol, min_notional / entry_price, rounding=ROUND_CEILING)
-        notional = final_qty * entry_price
 
     if final_qty <= 0:
-        _record_rejection(symbol, "S4 Qty Zero", {"calc_qty": qty})
+        _record_rejection(symbol, "S4 Qty Zero", {"ideal_qty": ideal_qty, "min_qty": qty_min})
         return
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
@@ -3234,20 +3278,16 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             return
 
         # --- Common Sizing & Leverage Calculation ---
-        min_notional = CONFIG["MIN_NOTIONAL_USDT"]
-        notional_val = qty * current_price
-        if notional_val < min_notional:
-            qty = min_notional / current_price if current_price > 0 else 0.0
-        
-        # Round up to the nearest step size
-        step_size = await asyncio.to_thread(get_step_size, symbol)
-        if step_size is not None and step_size > 0:
-            qty_dec = Decimal(str(qty))
-            step_dec = Decimal(str(step_size))
-            
-            num_steps = (qty_dec / step_dec).to_integral_value(rounding=ROUND_CEILING)
-            final_qty_dec = num_steps * step_dec
-            qty = float(final_qty_dec)
+        # Round down ideal quantity to not exceed risk
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, qty, rounding=ROUND_DOWN)
+
+        # Calculate minimum quantity to meet notional value
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = min_notional / current_price if current_price > 0 else 0.0
+        qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+
+        # Final quantity is the larger of the two
+        qty = max(ideal_qty, qty_min)
 
         if qty <= 0:
             await asyncio.to_thread(send_telegram, f"❌ Calculated quantity for force trade is zero. Aborting.", parse_mode='Markdown')
