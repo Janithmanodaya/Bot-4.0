@@ -69,7 +69,7 @@ log = logging.getLogger("ema-bb-bot")
 
 # Globals
 client: Optional[Client] = None
-request = telegram.request.Request(con_pool_size=10)
+request = telegram.utils.request.Request(con_pool_size=10)
 telegram_bot: Optional[telegram.Bot] = telegram.Bot(token=TELEGRAM_BOT_TOKEN, request=request) if TELEGRAM_BOT_TOKEN else None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 
