@@ -2026,9 +2026,15 @@ def cancel_trade_sltp_orders_sync(trade_meta: Dict[str, Any]):
         return
 
     try:
-        log.info(f"Cancelling {len(order_ids_to_cancel)} specific orders for trade {trade_meta.get('id')} on {symbol}.")
-        str_order_ids = [str(oid) for oid in order_ids_to_cancel]
-        client.futures_cancel_orders(symbol=symbol, orderIdList=str_order_ids)
+        log.info(f"Cancelling {len(order_ids_to_cancel)} specific orders for trade {trade_meta.get('id')} on {symbol} one by one.")
+        for order_id in order_ids_to_cancel:
+            try:
+                client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            except BinanceAPIException as e:
+                if e.code == -2011:
+                    log.warning(f"Could not cancel order {order_id} for trade {trade_meta.get('id')} (may already be gone).")
+                else:
+                    raise
         
         time.sleep(0.5)
         log.info(f"Cancellation request sent for trade {trade_meta.get('id')}.")
@@ -2061,8 +2067,16 @@ def cancel_close_orders_sync(symbol: str):
             log.info(f"No open SL/TP orders to cancel for {symbol}.")
             return
 
-        log.info(f"Cancelling batch of {len(order_ids_to_cancel)} orders for {symbol}.")
-        client.futures_cancel_orders(symbol=symbol, orderIdList=order_ids_to_cancel)
+        log.info(f"Cancelling {len(order_ids_to_cancel)} orders for {symbol} one by one.")
+        for order_id in order_ids_to_cancel:
+            try:
+                client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            except BinanceAPIException as e:
+                # Ignore error if order is already filled/cancelled
+                if e.code == -2011: 
+                    log.warning(f"Could not cancel order {order_id} for {symbol} (may already be gone).")
+                else:
+                    raise # Re-raise other API errors
         
         # Add a short delay to allow the exchange to process the cancellation
         time.sleep(1)
