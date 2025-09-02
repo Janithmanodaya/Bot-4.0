@@ -304,7 +304,7 @@ EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
 async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) -> Optional[tuple[str, Dict[str, Any]]]:
     """
-    Imports a single rogue position, places default SL/TP orders, and returns the trade metadata.
+    Imports a single rogue position, places a default SL order, and returns the trade metadata.
     """
     try:
         log.info(f"❗️ Rogue position for {symbol} detected. Importing for management...")
@@ -315,16 +315,17 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
         notional = qty * entry_price
 
         try:
-            stop_price, take_price = await asyncio.to_thread(default_sl_tp_for_import, symbol, entry_price, side)
+            # default_sl_tp_for_import returns two values, we only need the first one.
+            stop_price, _ = await asyncio.to_thread(default_sl_tp_for_import, symbol, entry_price, side)
         except RuntimeError as e:
-            log.error(f"Failed to calculate default SL/TP for {symbol}: {e}")
+            log.error(f"Failed to calculate default SL for {symbol}: {e}")
             return None
 
         trade_id = f"{symbol}_imported_{int(time.time())}"
         meta = {
             "id": trade_id, "symbol": symbol, "side": side, "entry_price": entry_price,
             "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
-            "sl": stop_price, "tp": take_price, "open_time": datetime.utcnow().isoformat(),
+            "sl": stop_price, "tp": 0, "open_time": datetime.utcnow().isoformat(), # Set tp to 0
             "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
             "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
             "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0
@@ -333,17 +334,17 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
         await asyncio.to_thread(add_managed_trade_to_db, meta)
 
         await asyncio.to_thread(cancel_close_orders_sync, symbol)
-        log.info(f"Attempting to place SL/TP for imported trade {symbol}. SL={stop_price}, TP={take_price}, Qty={qty}")
-        await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=take_price, qty=qty)
+        log.info(f"Attempting to place SL for imported trade {symbol}. SL={stop_price}, Qty={qty}")
+        # Pass tp_price=None to prevent placing a Take Profit order
+        await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=None, qty=qty)
         
         msg = (f"ℹ️ **Position Imported**\n\n"
                f"Found and imported a position for **{symbol}**.\n\n"
                f"**Side:** {side}\n"
                f"**Entry Price:** {entry_price}\n"
                f"**Quantity:** {qty}\n\n"
-               f"A default SL/TP has been calculated and placed:\n"
-               f"**SL:** `{round_price(symbol, stop_price)}`\n"
-               f"**TP:** `{round_price(symbol, take_price)}`\n\n"
+               f"A default SL has been calculated and placed:\n"
+               f"**SL:** `{round_price(symbol, stop_price)}`\n\n"
                f"The bot will now manage this trade.")
         await asyncio.to_thread(send_telegram, msg)
         return trade_id, meta
@@ -2000,7 +2001,7 @@ def cancel_trade_sltp_orders_sync(trade_meta: Dict[str, Any]):
     try:
         log.info(f"Cancelling {len(order_ids_to_cancel)} specific orders for trade {trade_meta.get('id')} on {symbol}.")
         str_order_ids = [str(oid) for oid in order_ids_to_cancel]
-        client.futures_cancel_batch_order(symbol=symbol, orderIdList=str_order_ids)
+        client.futures_cancel_orders(symbol=symbol, orderIdList=str_order_ids)
         
         time.sleep(0.5)
         log.info(f"Cancellation request sent for trade {trade_meta.get('id')}.")
@@ -2034,7 +2035,7 @@ def cancel_close_orders_sync(symbol: str):
             return
 
         log.info(f"Cancelling batch of {len(order_ids_to_cancel)} orders for {symbol}.")
-        client.futures_cancel_batch_order(symbol=symbol, orderIdList=order_ids_to_cancel)
+        client.futures_cancel_orders(symbol=symbol, orderIdList=order_ids_to_cancel)
         
         # Add a short delay to allow the exchange to process the cancellation
         time.sleep(1)
@@ -3064,15 +3065,9 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     else:
         if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
             side = 'BUY'
-            log.critical("!!!!!!!! S4 ENTRY SIGNAL TRIGGERED (BUY) !!!!!!!!")
-            log.critical("Source: Main Supertrend Indicator (s4_st_dir)")
-            log.critical(f"Values: Previous candle s4_st_dir = -1, Signal candle s4_st_dir = 1")
         elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
             side = 'SELL'
-            log.critical("!!!!!!!! S4 ENTRY SIGNAL TRIGGERED (SELL) !!!!!!!!")
-            log.critical("Source: Main Supertrend Indicator (s4_st_dir)")
-            log.critical(f"Values: Previous candle s4_st_dir = 1, Signal candle s4_st_dir = -1")
-
+        
         if not side:
             log.info(f"S4: No signal detected for {symbol} on the last closed candle.")
             return # No signal
