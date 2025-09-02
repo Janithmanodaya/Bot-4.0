@@ -5012,16 +5012,14 @@ def handle_update_sync(update, loop):
                 except Exception as e: log.error("Failed to execute /unfreeze action: %s", e)
                 send_telegram("✅ Bot is now **UNFROZEN**. Active session freeze has been overridden.", parse_mode='Markdown')
             elif text.startswith("/status"):
-                log.info("Received /status command. Scheduling task.")
-                fut = asyncio.run_coroutine_threadsafe(get_managed_trades_snapshot(), loop)
+                log.info("Received /status command.")
                 trades = {}
                 try:
-                    log.info("Waiting for /status task future result...")
-                    trades = fut.result(timeout=10) # Increased timeout for debugging
-                    log.info("Got /status task future result.")
+                    with managed_trades_lock:
+                        trades = dict(managed_trades)
                 except Exception as e:
                     log.error("Failed to get managed trades for /status: %s", e, exc_info=True)
-                
+
                 unrealized_pnl = sum(float(v.get('unreal', 0.0)) for v in trades.values())
                 
                 # Account & PnL Info
@@ -5050,7 +5048,11 @@ def handle_update_sync(update, loop):
                 status_lines.append(f"📈 Managed Trades: *{len(trades)}*")
                 
                 # Scan Cycle Info
-                status_lines.append(f"🔄 Total Scans: *{scan_cycle_count}*")
+                if not initial_sync_complete:
+                    status_lines.append("🔄 Scans: *Initializing...*")
+                else:
+                    status_lines.append(f"🔄 Total Scans: *{scan_cycle_count}*")
+
                 if next_scan_time and running:
                     time_until_next_scan = next_scan_time - datetime.now(timezone.utc)
                     if time_until_next_scan.total_seconds() > 0:
