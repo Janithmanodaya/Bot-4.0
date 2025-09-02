@@ -232,7 +232,7 @@ notified_frozen_session: Optional[str] = None
 
 rejected_trades = deque(maxlen=5)
 last_attention_alert_time: Dict[str, datetime] = {}
-symbol_loss_cooldown: Dict[str, Dict[int, datetime]] = {}
+symbol_loss_cooldown: Dict[str, datetime] = {}
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
@@ -2397,9 +2397,20 @@ async def evaluate_and_enter(symbol: str):
     and then dispatches to the strategy evaluation functions.
     """
     log.info("Evaluating symbol: %s", symbol)
-    global running, frozen, indicator_cache
+    global running, frozen, indicator_cache, symbol_loss_cooldown
     if frozen or not running:
         return
+
+    # --- Loss Cooldown Check ---
+    if symbol in symbol_loss_cooldown:
+        cooldown_end_time = symbol_loss_cooldown[symbol]
+        if datetime.now(timezone.utc) < cooldown_end_time:
+            log.info(f"Skipping evaluation for {symbol} due to loss cooldown. Ends at {cooldown_end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}.")
+            return
+        else:
+            # Cooldown has expired, remove it and allow trading again
+            log.info(f"Loss cooldown for {symbol} has expired. Resuming evaluation.")
+            del symbol_loss_cooldown[symbol]
 
     # Pre-trade checks that apply to all strategies
     async with managed_trades_lock, pending_limit_orders_lock:
@@ -3053,9 +3064,15 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     else:
         if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
             side = 'BUY'
+            log.critical("!!!!!!!! S4 ENTRY SIGNAL TRIGGERED (BUY) !!!!!!!!")
+            log.critical("Source: Main Supertrend Indicator (s4_st_dir)")
+            log.critical(f"Values: Previous candle s4_st_dir = -1, Signal candle s4_st_dir = 1")
         elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
             side = 'SELL'
-        
+            log.critical("!!!!!!!! S4 ENTRY SIGNAL TRIGGERED (SELL) !!!!!!!!")
+            log.critical("Source: Main Supertrend Indicator (s4_st_dir)")
+            log.critical(f"Values: Previous candle s4_st_dir = 1, Signal candle s4_st_dir = -1")
+
         if not side:
             log.info(f"S4: No signal detected for {symbol} on the last closed candle.")
             return # No signal
@@ -3700,21 +3717,10 @@ def monitor_thread_func():
                     
                     # --- Post-Loss Cooldown Logic ---
                     if unreal < 0:
-                        strategy_id = meta.get('strategy_id')
-                        if strategy_id:
-                            cooldown_end_time = close_time + timedelta(hours=CONFIG['LOSS_COOLDOWN_HOURS'])
-                            if sym not in symbol_loss_cooldown:
-                                symbol_loss_cooldown[sym] = {}
-                            symbol_loss_cooldown[sym][strategy_id] = cooldown_end_time
-                            log.info(f"Strategy {strategy_id} for {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown (until {cooldown_end_time}). PnL: {unreal:.4f}.")
-                            send_telegram(f"🧊 Strategy {strategy_id} for {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
-                        else:
-                            # Fallback for old trades without a strategy_id
-                            log.warning(f"Could not apply strategy-specific cooldown for {sym} because strategy_id was not found in trade metadata. Applying symbol-wide cooldown as a fallback.")
-                            # This path should not be taken for new trades, but it's here for safety.
-                            # The old check logic is gone, so this won't actually do anything unless we add a default key.
-                            # For now, we just log it. A better fallback might be to cooldown all strategies.
-                            pass
+                        cooldown_end_time = close_time + timedelta(hours=CONFIG['LOSS_COOLDOWN_HOURS'])
+                        symbol_loss_cooldown[sym] = cooldown_end_time
+                        log.info(f"Symbol {sym} has been placed on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown (until {cooldown_end_time}). PnL: {unreal:.4f}.")
+                        send_telegram(f"🧊 {sym} is on a {CONFIG['LOSS_COOLDOWN_HOURS']}h cooldown after a loss.")
 
 
                     log.info(f"TRADE_CLOSE_EVENT: ID={tid}, Symbol={sym}, PnL={unreal:.4f}, Reason={exit_reason}. Preparing to record and remove from managed trades.")
@@ -3951,14 +3957,16 @@ def monitor_thread_func():
                         if target_sl is None:
                             log.warning(f"S4 TSL logic for {tid} resulted in no target_sl. Skipping.")
                             continue
+                        
+                        current_price = df_with_indicators['close'].iloc[-1]
 
                         # Check if the new SL is a valid trailing move
                         new_sl = None
                         current_sl = meta['sl']
                         
-                        if side == 'BUY' and target_sl > current_sl:
+                        if side == 'BUY' and target_sl > current_sl and target_sl < current_price:
                             new_sl = target_sl
-                        elif side == 'SELL' and target_sl < current_sl:
+                        elif side == 'SELL' and target_sl < current_sl and target_sl > current_price:
                             new_sl = target_sl
                         
                         # If we have a valid new SL, update the order
