@@ -3099,6 +3099,12 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         
     log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
 
+    # --- NEW DIAGNOSTIC LOGGING ---
+    main_st_value = signal_candle['s4_st']
+    tsl_st_value = signal_candle['s4_tsl_st']
+    log.info(f"S4 DIAGNOSTIC ({symbol}): Main ST Value = {main_st_value}, TSL ST Value = {tsl_st_value}")
+    # --- END NEW LOGGING ---
+
     # --- NEW: 3-Minute Signal Expiry ---
     signal_candle_close_time = signal_candle.name.to_pydatetime()
     # Ensure it's timezone-aware if it's not already
@@ -3120,6 +3126,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
 
     # --- Stop Loss and Sizing ---
     stop_loss_price = signal_candle['s4_st']
+    log.info(f"S4 DIAGNOSTIC ({symbol}): Initial Stop Loss is set to: {stop_loss_price}")
     risk_usd = s4_params['RISK_USD']
     
     price_distance = abs(entry_price - stop_loss_price)
@@ -3134,7 +3141,22 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
 
-    final_qty = max(ideal_qty, qty_min)
+    if ideal_qty < qty_min:
+        _record_rejection(
+            symbol, 
+            "S4 Risk Too Low", 
+            {
+                "risk_usd": risk_usd, 
+                "ideal_qty": ideal_qty, 
+                "min_qty": qty_min,
+                "entry_price": entry_price,
+                "sl_price": stop_loss_price
+            },
+            signal_candle=signal_candle
+        )
+        return
+
+    final_qty = ideal_qty
     notional = final_qty * entry_price
 
     if final_qty <= 0:
@@ -3921,6 +3943,17 @@ def monitor_thread_func():
                         # --- DEMA+SuperTrend (S4) Trailing Stop Logic ---
                         if not meta.get('trailing', True):
                             continue # Skip if trailing is manually disabled for this trade
+
+                        # --- NEW: 1-Minute TSL Delay ---
+                        open_time = datetime.fromisoformat(meta['open_time'])
+                        # Ensure open_time is timezone-aware for correct comparison
+                        if open_time.tzinfo is None:
+                            open_time = open_time.replace(tzinfo=timezone.utc)
+                        
+                        if (datetime.now(timezone.utc) - open_time).total_seconds() < 60:
+                            log.info(f"S4 TSL for {tid} is in 1-minute grace period. Skipping TSL check.")
+                            continue
+                        # --- END NEW LOGIC ---
 
                         # Ensure we have enough data and indicators are calculated
                         df_with_indicators = calculate_all_indicators(df_monitor.copy())
