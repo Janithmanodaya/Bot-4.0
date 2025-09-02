@@ -117,7 +117,7 @@ CONFIG = {
         "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "6.0")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
         "TSL_ATR_PERIOD": int(os.getenv("S4_TSL_ATR_PERIOD", "10")),
-        "TSL_ATR_MULTIPLIER": float(os.getenv("S4_TSL_ATR_MULTIPLIER", "3.0")),
+        "TSL_ATR_MULTIPLIER": float(os.getenv("S4_TSL_ATR_MULTIPLIER", "4.6")),
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
