@@ -315,38 +315,56 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
         notional = qty * entry_price
 
         try:
-            # default_sl_tp_for_import returns two values, we only need the first one.
-            stop_price, _ = await asyncio.to_thread(default_sl_tp_for_import, symbol, entry_price, side)
+            # default_sl_tp_for_import returns three values now
+            stop_price, _, current_price = await asyncio.to_thread(default_sl_tp_for_import, symbol, entry_price, side)
         except RuntimeError as e:
             log.error(f"Failed to calculate default SL for {symbol}: {e}")
             return None
+
+        # --- Safety Check for SL Placement ---
+        if side == 'BUY' and stop_price >= current_price:
+            log.warning(f"Rogue import for {symbol} calculated an invalid SL ({stop_price}) which is >= current price ({current_price}). Skipping SL placement.")
+            stop_price = None # Do not place an SL
+        elif side == 'SELL' and stop_price <= current_price:
+            log.warning(f"Rogue import for {symbol} calculated an invalid SL ({stop_price}) which is <= current price ({current_price}). Skipping SL placement.")
+            stop_price = None # Do not place an SL
 
         trade_id = f"{symbol}_imported_{int(time.time())}"
         meta = {
             "id": trade_id, "symbol": symbol, "side": side, "entry_price": entry_price,
             "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
-            "sl": stop_price, "tp": 0, "open_time": datetime.utcnow().isoformat(), # Set tp to 0
+            "sl": stop_price if stop_price is not None else 0, "tp": 0, "open_time": datetime.utcnow().isoformat(),
             "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
             "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
-            "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0
+            "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0,
+            "strategy_id": 4,
         }
 
         await asyncio.to_thread(add_managed_trade_to_db, meta)
 
         await asyncio.to_thread(cancel_close_orders_sync, symbol)
-        log.info(f"Attempting to place SL for imported trade {symbol}. SL={stop_price}, Qty={qty}")
-        # Pass tp_price=None to prevent placing a Take Profit order
-        await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=None, qty=qty)
         
-        msg = (f"ℹ️ **Position Imported**\n\n"
-               f"Found and imported a position for **{symbol}**.\n\n"
-               f"**Side:** {side}\n"
-               f"**Entry Price:** {entry_price}\n"
-               f"**Quantity:** {qty}\n\n"
-               f"A default SL has been calculated and placed:\n"
-               f"**SL:** `{round_price(symbol, stop_price)}`\n\n"
-               f"The bot will now manage this trade.")
-        await asyncio.to_thread(send_telegram, msg)
+        if stop_price is not None:
+            log.info(f"Attempting to place SL for imported trade {symbol}. SL={stop_price}, Qty={qty}")
+            # Pass tp_price=None to prevent placing a Take Profit order
+            await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_price, tp_price=None, qty=qty)
+            
+            msg = (f"ℹ️ **Position Imported**\n\n"
+                   f"Found and imported a position for **{symbol}**.\n\n"
+                   f"**Side:** {side}\n"
+                   f"**Entry Price:** {entry_price}\n"
+                   f"**Quantity:** {qty}\n\n"
+                   f"A default SL has been calculated and placed:\n"
+                   f"**SL:** `{round_price(symbol, stop_price)}`\n\n"
+                   f"The bot will now manage this trade.")
+            await asyncio.to_thread(send_telegram, msg)
+        else:
+            log.warning(f"No valid SL placed for imported trade {symbol}. Please manage manually.")
+            msg = (f"ℹ️ **Position Imported (No SL)**\n\n"
+                   f"Found and imported a position for **{symbol}** but could not place a valid SL.\n\n"
+                   f"**Please manage this trade manually.**")
+            await asyncio.to_thread(send_telegram, msg)
+
         return trade_id, meta
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"Failed to import rogue position for {symbol}. Please manage it manually.", e)
@@ -653,7 +671,7 @@ def get_public_ip() -> str:
     except Exception:
         return "unable-to-fetch-ip"
 
-def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float]:
+def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:
     # Fetch klines, enough for S4 indicators
     df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 250)
     if df is None or df.empty:
@@ -665,12 +683,13 @@ def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tupl
 
     # The stop price is the most recent Supertrend value
     stop_price = safe_last(df['s4_st'])
+    current_price = safe_last(df['close'])
 
     # We are no longer placing a TP, but the function signature requires returning two values.
     # The calling function (_import_rogue_position_async) ignores the second value.
     take_price = 0.0
 
-    return stop_price, take_price
+    return stop_price, take_price, current_price
 
 def timeframe_to_timedelta(tf: str) -> Optional[timedelta]:
     """Converts a timeframe string like '1m', '5m', '1h', '1d' to a timedelta object."""
