@@ -116,6 +116,8 @@ CONFIG = {
         "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "20")),
         "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "6.0")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
+        "TSL_ATR_PERIOD": int(os.getenv("S4_TSL_ATR_PERIOD", "10")),
+        "TSL_ATR_MULTIPLIER": float(os.getenv("S4_TSL_ATR_MULTIPLIER", "3.0")),
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
@@ -2378,6 +2380,15 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out['s4_dema'] = dema(out['close'], length=s4_params['DEMA_PERIOD'])
         out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
 
+        # ---- S4 Trailing Stop SuperTrend ----
+        # User requested specific settings for the TSL indicator.
+        # Note: Using 'low' as a source for both up and down trends is unconventional.
+        # For short trades, the upper band (stop) will be based on 'low', which might be tighter than intended.
+        tsl_atr_period = s4_params.get("TSL_ATR_PERIOD", 10)
+        tsl_atr_mult = s4_params.get("TSL_ATR_MULTIPLIER", 3.0)
+        tsl_atr = atr(out, length=tsl_atr_period)
+        out['s4_tsl_st'], out['s4_tsl_st_dir'] = supertrend(out, period=tsl_atr_period, multiplier=tsl_atr_mult, atr_series=tsl_atr, source=out['low'])
+
     return out
 
 async def evaluate_and_enter(symbol: str):
@@ -3906,36 +3917,71 @@ def monitor_thread_func():
                         continue # End of S3 logic
                     
                     elif strategy_id == '4':
-                        # --- DEMA+SuperTrend (S4) Exit Logic ---
-                        # Exit is triggered when a closed candle crosses the SuperTrend line.
-                        
+                        # --- DEMA+SuperTrend (S4) Trailing Stop Logic ---
+                        if not meta.get('trailing', True):
+                            continue # Skip if trailing is manually disabled for this trade
+
                         # Ensure we have enough data and indicators are calculated
                         df_with_indicators = calculate_all_indicators(df_monitor.copy())
-                        if df_with_indicators is None or df_with_indicators.empty or 's4_st' not in df_with_indicators.columns:
-                            log.warning(f"S4 Monitor: Could not calculate indicators for {sym}, skipping exit check.")
+                        if df_with_indicators is None or df_with_indicators.empty or 's4_tsl_st' not in df_with_indicators.columns:
+                            log.warning(f"S4 Monitor: Could not calculate indicators for {sym}, skipping TSL check.")
+                            continue
+                        
+                        # Get the latest indicator values from the most recent (still open) candle
+                        last_candle = df_with_indicators.iloc[-1]
+                        main_st_val = last_candle['s4_st']
+                        tsl_st_val = last_candle['s4_tsl_st']
+                        tsl_st_dir = last_candle['s4_tsl_st_dir']
+                        
+                        # Determine the target stop loss based on user's logic
+                        target_sl = None
+                        if side == 'BUY':
+                            # If TSL indicator is in a BUY trend, use it. Otherwise, use the main ST as fallback.
+                            if tsl_st_dir == 1:
+                                target_sl = tsl_st_val
+                            else:
+                                target_sl = main_st_val
+                        elif side == 'SELL':
+                            # If TSL indicator is in a SELL trend, use it. Otherwise, use the main ST as fallback.
+                            if tsl_st_dir == -1:
+                                target_sl = tsl_st_val
+                            else:
+                                target_sl = main_st_val
+
+                        if target_sl is None:
+                            log.warning(f"S4 TSL logic for {tid} resulted in no target_sl. Skipping.")
                             continue
 
-                        # The last closed candle is at index -2
-                        last_closed_candle = df_with_indicators.iloc[-2]
-                        close_price = last_closed_candle['close']
-                        supertrend_value = last_closed_candle['s4_st']
+                        # Check if the new SL is a valid trailing move
+                        new_sl = None
+                        current_sl = meta['sl']
                         
-                        close_trade = False
-                        if side == 'BUY' and close_price < supertrend_value:
-                            log.info(f"S4 Exit Triggered for {tid} (BUY). Close ({close_price}) < SuperTrend ({supertrend_value}).")
-                            close_trade = True
-                        elif side == 'SELL' and close_price > supertrend_value:
-                            log.info(f"S4 Exit Triggered for {tid} (SELL). Close ({close_price}) > SuperTrend ({supertrend_value}).")
-                            close_trade = True
+                        if side == 'BUY' and target_sl > current_sl:
+                            new_sl = target_sl
+                        elif side == 'SELL' and target_sl < current_sl:
+                            new_sl = target_sl
                         
-                        if close_trade:
-                            exit_reason = 'S4_SUPERTREND_CROSS'
-                            log.info(f"Closing trade {tid} for reason: {exit_reason}")
+                        # If we have a valid new SL, update the order
+                        if new_sl:
+                            log.info(f"S4 Trailing SL for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
                             cancel_trade_sltp_orders_sync(meta)
-                            close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
+                            # S4 has no TP, so we only place a new SL order
+                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                            
+                            trade_to_update_in_db = None
                             with managed_trades_lock:
                                 if tid in managed_trades:
-                                    managed_trades[tid]['exit_reason'] = exit_reason
+                                    managed_trades[tid].update({
+                                        'sl': new_sl, 
+                                        'sltp_orders': new_orders
+                                    })
+                                    trade_to_update_in_db = managed_trades[tid].copy()
+                            
+                            if trade_to_update_in_db:
+                                add_managed_trade_to_db(trade_to_update_in_db)
+                            
+                            send_telegram(f"📈 S4 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
+
                         continue # End of S4 logic
 
                     # --- Generic BE & Trailing Logic ---
