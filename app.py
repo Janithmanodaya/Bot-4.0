@@ -230,7 +230,7 @@ session_freeze_active = False
 session_freeze_override = False
 notified_frozen_session: Optional[str] = None
 
-rejected_trades = deque(maxlen=5)
+rejected_trades = deque(maxlen=20)
 last_attention_alert_time: Dict[str, datetime] = {}
 symbol_loss_cooldown: Dict[str, datetime] = {}
 
@@ -4025,41 +4025,41 @@ def monitor_thread_func():
                         tsl_st_val = last_candle['s4_tsl_st']
                         tsl_st_dir = last_candle['s4_tsl_st_dir']
                         
-                        # Determine the target stop loss based on user's logic
-                        target_sl = None
-                        if side == 'BUY':
-                            # If TSL indicator is in a BUY trend, use it. Otherwise, use the main ST as fallback.
-                            if tsl_st_dir == 1:
-                                target_sl = tsl_st_val
-                            else:
-                                target_sl = main_st_val
-                        elif side == 'SELL':
-                            # If TSL indicator is in a SELL trend, use it. Otherwise, use the main ST as fallback.
-                            if tsl_st_dir == -1:
-                                target_sl = tsl_st_val
-                            else:
-                                target_sl = main_st_val
-
-                        if target_sl is None:
-                            log.warning(f"S4 TSL logic for {tid} resulted in no target_sl. Skipping.")
-                            continue
-                        
-                        current_price = df_with_indicators['close'].iloc[-1]
-
-                        # Check if the new SL is a valid trailing move
-                        new_sl = None
+                        # --- Corrected Trailing Stop Application Logic ---
+                        last_candle = df_with_indicators.iloc[-1]
+                        main_st_val = last_candle['s4_st']
+                        tsl_st_val = last_candle['s4_tsl_st']
+                        tsl_st_dir = last_candle['s4_tsl_st_dir']
+                        current_price = last_candle['close']
                         current_sl = meta['sl']
-                        
-                        if side == 'BUY' and target_sl > current_sl and target_sl < current_price:
-                            new_sl = target_sl
-                        elif side == 'SELL' and target_sl < current_sl and target_sl > current_price:
-                            new_sl = target_sl
-                        
-                        # If we have a valid new SL, update the order
+
+                        # Determine if the TSL indicator agrees with the trade direction
+                        tsl_agrees = (side == 'BUY' and tsl_st_dir == 1) or \
+                                     (side == 'SELL' and tsl_st_dir == -1)
+
+                        new_sl = None
+                        if tsl_agrees:
+                            # State B: TSL is active. Only trail the stop loss.
+                            if side == 'BUY' and tsl_st_val > current_sl and tsl_st_val < current_price:
+                                new_sl = tsl_st_val
+                                log.info(f"S4 TSL Update (Active): Trailing SL for {tid} from {current_sl:.4f} to {new_sl:.4f}")
+                            elif side == 'SELL' and tsl_st_val < current_sl and tsl_st_val > current_price:
+                                new_sl = tsl_st_val
+                                log.info(f"S4 TSL Update (Active): Trailing SL for {tid} from {current_sl:.4f} to {new_sl:.4f}")
+                        else:
+                            # State A: Fallback to Main ST. Update SL to main ST value if it's different.
+                            if main_st_val != current_sl:
+                                # Ensure the new SL doesn't stop out the position immediately
+                                if side == 'BUY' and main_st_val < current_price:
+                                    new_sl = main_st_val
+                                    log.info(f"S4 TSL Update (Fallback): Updating SL for {tid} from {current_sl:.4f} to main ST value {new_sl:.4f}")
+                                elif side == 'SELL' and main_st_val > current_price:
+                                    new_sl = main_st_val
+                                    log.info(f"S4 TSL Update (Fallback): Updating SL for {tid} from {current_sl:.4f} to main ST value {new_sl:.4f}")
+
+                        # If a valid new SL was determined, update the trade
                         if new_sl:
-                            log.info(f"S4 Trailing SL for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
                             cancel_trade_sltp_orders_sync(meta)
-                            # S4 has no TP, so we only place a new SL order
                             new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
                             
                             trade_to_update_in_db = None
@@ -5489,7 +5489,7 @@ def handle_update_sync(update, loop):
                         await asyncio.to_thread(send_telegram, "No rejected trades have been recorded yet.")
                         return
 
-                    report_lines = ["*Last 5 Rejected Trades*"]
+                    report_lines = ["*Last 20 Rejected Trades*"]
                     # Using list() to create a copy for safe iteration
                     for reject in reversed(list(rejected_trades)):
                         ts = datetime.fromisoformat(reject['timestamp']).strftime('%Y-%m-%d %H:%M:%S UTC')
