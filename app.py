@@ -1106,6 +1106,16 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # --- Ensure rejections file exists ---
+    try:
+        # "touch" the file to ensure it's created on startup if it doesn't exist
+        with open("rejections.jsonl", "a"):
+            pass
+        log.info("Ensured rejections.jsonl file exists.")
+    except Exception as e:
+        log.error(f"Could not create rejections.jsonl file: {e}")
+
+
 def add_pending_order_to_db(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cur = conn.cursor()
