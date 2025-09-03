@@ -119,8 +119,8 @@ CONFIG = {
     },
     "STRATEGY_4": { # DEMA+SuperTrend strategy
         "DEMA_PERIOD": int(os.getenv("S4_DEMA_PERIOD", "200")),
-        "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "20")),
-        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "6.0")),
+        "SUPERTREND_PERIOD": int(os.getenv("S4_ST_PERIOD", "2")),
+        "SUPERTREND_MULTIPLIER": float(os.getenv("S4_ST_MULTIPLIER", "3.0")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
         "TSL_ATR_PERIOD": int(os.getenv("S4_TSL_ATR_PERIOD", "2")),
         "TSL_ATR_MULTIPLIER": float(os.getenv("S4_TSL_ATR_MULTIPLIER", "4.6")),
