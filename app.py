@@ -23,6 +23,7 @@ import io
 import re
 import traceback
 import psutil
+import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
@@ -206,6 +207,7 @@ CONFIG = {
     "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "true").lower() in ("true", "1", "yes"),
     "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "25")),
     "AUTO_RESTART_ON_IP_ERROR": os.getenv("AUTO_RESTART_ON_IP_ERROR", "true").lower() in ("true", "1", "yes"),
+    "TELEGRAM_NOTIFY_REJECTIONS": os.getenv("TELEGRAM_NOTIFY_REJECTIONS", "false").lower() in ("true", "1", "yes"),
 }
 
 # --- Parse STRATEGY_MODE into a list of ints ---
@@ -796,6 +798,17 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
     rejected_trades.append(record)
     # Use info level for rejection logs to make them visible.
     log.info(f"Rejected trade for {symbol}. Reason: {reason}, Details: {formatted_details}")
+
+    # --- Conditional Telegram Notification ---
+    if CONFIG.get("TELEGRAM_NOTIFY_REJECTIONS", False):
+        details_str = ", ".join([f"{k}: {v}" for k, v in formatted_details.items()])
+        msg = (
+            f"🚫 *Trade Rejected*\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Reason:** {reason}\n"
+            f"**Details:** `{details_str}`"
+        )
+        send_telegram(msg, parse_mode='Markdown')
 
 
 SESSION_FREEZE_WINDOWS = {
@@ -2564,30 +2577,60 @@ def simulate_strategy_bb(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, An
     }
 
 
-async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
+async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str | None = None, full_test: bool = False):
     """
-    Simple Bollinger strategy:
-      - Uses closed candle at -2 as signal_candle and -3 as prev_candle.
-      - BUY when close <= lower band (bbl). SELL when close >= upper band (bbu).
-      - Require previous candle confirmation (strict).
-      - Use ATR-based SL if available, otherwise fallback to percent SL.
-      - Size by risk = calculate_risk_amount(..., strategy_id=1).
+    Simple Bollinger strategy. Now includes logic for placing test orders.
     """
-    # Defensive checks
-    if df is None or len(df) < 20:
-        _record_rejection(symbol, "S1-Not enough bars for S1", {"len": len(df) if df is not None else 0})
+    if df is None or df.empty:
         return
 
-    # Indicator parameters (pick from CONFIG if present)
-    adx_threshold = CONFIG.get("S1_ADX_MAX", 25)  # only allow mean-reversion when ADX is below this
-    atr_mult_for_sl = CONFIG.get("S1_ATR_SL_MULT", 1.5)
-    fallback_sl_pct = CONFIG.get("S1_FALLBACK_SL_PCT", 0.01)  # 1% as conservative fallback
+    if test_signal:
+        side = test_signal
+        current_price = safe_last(df['close'])
+        if current_price == 0:
+            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
+            return
 
-    # Use closed candle as signal
+        # Place order 99% away from current price
+        test_entry_price = current_price * 0.01 if side == 'BUY' else current_price * 1.99
+        
+        # Use a minimal but valid quantity for the test order
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
+        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
+
+        if test_qty <= 0:
+            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
+            return
+
+        log.info(f"S1 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
+        try:
+            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
+            order_id = order_resp.get('orderId')
+            msg = (
+                f"✅ *S1 Test Order Placed*\n\n"
+                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
+                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
+                f"**Order ID:** `{order_id}`\n\n"
+                f"This is a real order. Please cancel it manually on the exchange."
+            )
+            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to place S1 test order for {symbol}", e)
+        return
+
+    # --- Normal Signal Logic ---
+    if len(df) < 20:
+        _record_rejection(symbol, "S1-Not enough bars for S1", {"len": len(df)})
+        return
+
+    adx_threshold = CONFIG.get("S1_ADX_MAX", 25)
+    atr_mult_for_sl = CONFIG.get("S1_ATR_SL_MULT", 1.5)
+    fallback_sl_pct = CONFIG.get("S1_FALLBACK_SL_PCT", 0.01)
+
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
 
-    # Determine side
     side = None
     if signal_candle['close'] <= signal_candle['s1_bbl']:
         side = 'BUY'
@@ -2597,7 +2640,6 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
         _record_rejection(symbol, "S1-Not a BB signal", {"close": signal_candle['close'], "bbu": signal_candle['s1_bbu'], "bbl": signal_candle['s1_bbl']}, signal_candle=signal_candle)
         return
 
-    # Previous candle confirmation (strict)
     if side == 'BUY' and prev_candle['close'] <= prev_candle['open']:
         _record_rejection(symbol, "S1-Prev candle not bullish", {"close": prev_candle['close'], "open": prev_candle['open']})
         return
@@ -2605,29 +2647,18 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
         _record_rejection(symbol, "S1-Prev candle not bearish", {"close": prev_candle['close'], "open": prev_candle['open']})
         return
 
-    # ADX filter for mean-reversion: only trade when ADX is low (non-trending)
     adx_value = float(df['adx'].iloc[-2]) if 'adx' in df.columns else None
     if adx_value is not None and adx_value >= adx_threshold:
         _record_rejection(symbol, "S1-ADX too strong", {"adx": adx_value, "threshold": adx_threshold}, signal_candle=signal_candle)
         return
 
-    # Entry and SL
     entry_price = float(signal_candle['close'])
-    # Prefer ATR-based SL if available
     atr_val = float(df['atr'].iloc[-2]) if 'atr' in df.columns else None
     if atr_val and atr_val > 0:
-        if side == 'BUY':
-            sl_price = entry_price - atr_mult_for_sl * atr_val
-        else:
-            sl_price = entry_price + atr_mult_for_sl * atr_val
+        sl_price = entry_price - atr_mult_for_sl * atr_val if side == 'BUY' else entry_price + atr_mult_for_sl * atr_val
     else:
-        # fallback percent SL
-        if side == 'BUY':
-            sl_price = entry_price * (1 - fallback_sl_pct)
-        else:
-            sl_price = entry_price * (1 + fallback_sl_pct)
+        sl_price = entry_price * (1 - fallback_sl_pct) if side == 'BUY' else entry_price * (1 + fallback_sl_pct)
 
-    # Quantity / sizing (risk-based)
     distance = abs(entry_price - sl_price)
     if distance <= 0:
         _record_rejection(symbol, "S1-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=signal_candle)
@@ -2635,34 +2666,24 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str |
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
     risk_usdt = calculate_risk_amount(balance, strategy_id=1)
-
     ideal_qty = risk_usdt / distance
-    # round down to be conservative
     ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
-    # ensure min notional
     min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
-
     final_qty = max(ideal_qty, qty_min)
+
     if final_qty <= 0:
         _record_rejection(symbol, "S1-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=signal_candle)
         return
 
-    # --- Recalculate final notional and leverage ---
     notional = final_qty * entry_price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
-
-    # --- Place Order ---
     take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
-    
-    if test_signal:
-        log.info(f"S1 TEST MODE: Would place limit order for {final_qty} {symbol} at {entry_price:.4f}")
-        return
 
     limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
     order_id = str(limit_order_resp.get('orderId'))
@@ -2723,27 +2744,58 @@ def simulate_strategy_supertrend(symbol: str, df: pd.DataFrame) -> Optional[Dict
     take_price = entry_price + tp_distance if side == 'BUY' else entry_price - tp_distance
     return {"strategy": "S2-ST", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": take_price, "timestamp": signal_candle.name.isoformat()}
 
-async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
+async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: str | None = None, full_test: bool = False):
     """
-    Simple SuperTrend strategy:
-      - Compute supertrend on close (supertrend() should create df['supertrend']).
-      - Signal when closed candle crosses the supertrend line compared to previous candle (flip).
-      - Require previous candle confirmation for color.
-      - Place SL at the supertrend value (or small ATR buffer).
-      - Sizing uses strategy_id=2 risk.
+    Simple SuperTrend strategy. Now includes logic for placing test orders.
     """
-    if df is None or len(df) < 30:
-        _record_rejection(symbol, "S2-Not enough bars for S2", {"len": len(df) if df is not None else 0})
+    if df is None or df.empty:
+        return
+
+    if test_signal:
+        side = test_signal
+        current_price = safe_last(df['close'])
+        if current_price == 0:
+            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
+            return
+
+        # Place order 99% away from current price
+        test_entry_price = current_price * 0.01 if side == 'BUY' else current_price * 1.99
+        
+        # Use a minimal but valid quantity for the test order
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
+        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
+
+        if test_qty <= 0:
+            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
+            return
+
+        log.info(f"S2 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
+        try:
+            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
+            order_id = order_resp.get('orderId')
+            msg = (
+                f"✅ *S2 Test Order Placed*\n\n"
+                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
+                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
+                f"**Order ID:** `{order_id}`\n\n"
+                f"This is a real order. Please cancel it manually on the exchange."
+            )
+            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to place S2 test order for {symbol}", e)
+        return
+
+    # --- Normal Signal Logic ---
+    if len(df) < 30:
+        _record_rejection(symbol, "S2-Not enough bars for S2", {"len": len(df)})
         return
 
     atr_buf = CONFIG.get("S2_ATR_BUFFER_MULT", 0.5)
 
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
-    prev_prev = df.iloc[-4] if len(df) >= 4 else None
 
-    # Detect flip: if previous closed candle was below ST and signal_candle is above => BUY
-    # or vice versa for SELL. Simpler approach: compare closes to supertrend lines.
     prev_close_vs_st = float(prev_candle['close']) - float(prev_candle['s2_st'])
     sig_close_vs_st = float(signal_candle['close']) - float(signal_candle['s2_st'])
 
@@ -2756,7 +2808,6 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         _record_rejection(symbol, "S2-No ST flip", {"prev_vs_st": prev_close_vs_st, "sig_vs_st": sig_close_vs_st}, signal_candle=signal_candle)
         return
 
-    # Previous-candle confirmation (strict)
     if side == 'BUY' and prev_candle['close'] <= prev_candle['open']:
         _record_rejection(symbol, "S2-Prev candle not bullish", {"close": prev_candle['close'], "open": prev_candle['open']})
         return
@@ -2764,14 +2815,10 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         _record_rejection(symbol, "S2-Prev candle not bearish", {"close": prev_candle['close'], "open": prev_candle['open']})
         return
 
-    # Use supertrend as first SL (plus ATR buffer if available)
     base_sl = float(signal_candle['s2_st'])
     atr_val = float(df['atr'].iloc[-2]) if 'atr' in df.columns else None
     if atr_val and atr_val > 0:
-        if side == 'BUY':
-            sl_price = base_sl - atr_buf * atr_val
-        else:
-            sl_price = base_sl + atr_buf * atr_val
+        sl_price = base_sl - atr_buf * atr_val if side == 'BUY' else base_sl + atr_buf * atr_val
     else:
         sl_price = base_sl
 
@@ -2783,33 +2830,25 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
     risk_usdt = calculate_risk_amount(balance, strategy_id=2)
-
     ideal_qty = risk_usdt / distance
     ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
     min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
-
     final_qty = max(ideal_qty, qty_min)
+
     if final_qty <= 0:
         _record_rejection(symbol, "S2-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=signal_candle)
         return
 
-    # --- Recalculate final notional and leverage ---
     notional = final_qty * entry_price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
-
-    # --- Place Order ---
     tp_distance = atr_val * CONFIG["STRATEGY_EXIT_PARAMS"]['2']["ATR_MULTIPLIER"] * 1.5
     take_price = entry_price + tp_distance if side == 'BUY' else entry_price - tp_distance
-    
-    if test_signal:
-        log.info(f"S2 TEST MODE: Would place limit order for {final_qty} {symbol} at {entry_price:.4f}")
-        return
 
     limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
     order_id = str(limit_order_resp.get('orderId'))
@@ -2827,7 +2866,7 @@ async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signa
         "expiry_time": expiry_time.isoformat(),
         "strategy_id": 2,
         "atr_at_entry": atr_val,
-        "signal_confidence": 100.0, # Placeholder for simple strategy
+        "signal_confidence": 100.0,
         "trailing": CONFIG["TRAILING_ENABLED"]
     }
     
@@ -2871,26 +2910,56 @@ def simulate_strategy_3(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
     return {"strategy": "S3-MA", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": take_price, "timestamp": sig.name.isoformat()}
 
-async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | None = None):
+async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | None = None, full_test: bool = False):
     """
-    Simple moving-average strategy (S3):
-      - Fast MA crossing above slow MA -> BUY; crossing below -> SELL.
-      - Use closed candle (-2) as signal, require prev candle confirmation.
-      - SL based on ATR multiplier or fallback percent.
-      - Sizing uses strategy_id=3.
+    Simple moving-average strategy (S3). Now includes logic for placing test orders.
     """
-    if df is None or len(df) < 50:
-        _record_rejection(symbol, "S3-Not enough bars for S3", {"len": len(df) if df is not None else 0})
+    if df is None or df.empty:
+        return
+
+    if test_signal:
+        side = test_signal
+        current_price = safe_last(df['close'])
+        if current_price == 0:
+            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
+            return
+
+        test_entry_price = current_price * 0.01 if side == 'BUY' else current_price * 1.99
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
+        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
+
+        if test_qty <= 0:
+            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
+            return
+
+        log.info(f"S3 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
+        try:
+            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
+            order_id = order_resp.get('orderId')
+            msg = (
+                f"✅ *S3 Test Order Placed*\n\n"
+                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
+                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
+                f"**Order ID:** `{order_id}`\n\n"
+                f"This is a real order. Please cancel it manually on the exchange."
+            )
+            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to place S3 test order for {symbol}", e)
+        return
+
+    # --- Normal Signal Logic ---
+    if len(df) < 50:
+        _record_rejection(symbol, "S3-Not enough bars for S3", {"len": len(df)})
         return
 
     atr_mult = CONFIG.get("S3_ATR_SL_MULT", 1.5)
     fallback_sl_pct = CONFIG.get("S3_FALLBACK_SL_PCT", 0.015)
 
-    # Need at least two MA values for prev & signal bars
     sig = df.iloc[-2]
     prev = df.iloc[-3]
 
-    # Detect cross: prev fast below prev slow, signal fast above signal slow -> BUY
     side = None
     if prev['s3_ma_fast'] < prev['s3_ma_slow'] and sig['s3_ma_fast'] > sig['s3_ma_slow']:
         side = 'BUY'
@@ -2900,7 +2969,6 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
         _record_rejection(symbol, "S3-No MA cross", {"prev_fast": prev['s3_ma_fast'], "prev_slow": prev['s3_ma_slow'], "sig_fast": sig['s3_ma_fast'], "sig_slow": sig['s3_ma_slow']}, signal_candle=sig)
         return
 
-    # Prev candle confirmation
     if side == 'BUY' and prev['close'] <= prev['open']:
         _record_rejection(symbol, "S3-Prev candle not bullish", {"close": prev['close'], "open": prev['open']})
         return
@@ -2908,19 +2976,12 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
         _record_rejection(symbol, "S3-Prev candle not bearish", {"close": prev['close'], "open": prev['open']})
         return
 
-    # SL: use ATR if available, else fallback percent
     atr_val = float(df['atr'].iloc[-2]) if 'atr' in df.columns else None
     entry_price = float(sig['close'])
     if atr_val and atr_val > 0:
-        if side == 'BUY':
-            sl_price = entry_price - atr_mult * atr_val
-        else:
-            sl_price = entry_price + atr_mult * atr_val
+        sl_price = entry_price - atr_mult * atr_val if side == 'BUY' else entry_price + atr_mult * atr_val
     else:
-        if side == 'BUY':
-            sl_price = entry_price * (1 - fallback_sl_pct)
-        else:
-            sl_price = entry_price * (1 + fallback_sl_pct)
+        sl_price = entry_price * (1 - fallback_sl_pct) if side == 'BUY' else entry_price * (1 + fallback_sl_pct)
 
     distance = abs(entry_price - sl_price)
     if distance <= 0:
@@ -2929,32 +2990,24 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | 
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
     risk_usdt = calculate_risk_amount(balance, strategy_id=3)
-
     ideal_qty = risk_usdt / distance
     ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
     min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
     qty_min = min_notional / entry_price if entry_price > 0 else 0.0
     qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
-
     final_qty = max(ideal_qty, qty_min)
+
     if final_qty <= 0:
         _record_rejection(symbol, "S3-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=sig)
         return
 
-    # --- Recalculate final notional and leverage ---
     notional = final_qty * entry_price
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
     leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
-
-    # --- Place Order ---
     take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
-    
-    if test_signal:
-        log.info(f"S3 TEST MODE: Would place limit order for {final_qty} {symbol} at {entry_price:.4f}")
-        return
 
     limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
     order_id = str(limit_order_resp.get('orderId'))
@@ -3062,58 +3115,87 @@ def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the DEMA+SuperTrend strategy (S4).
+    Now includes logic for placing test orders.
     """
+    if df is None or df.empty:
+        return
+
+    if test_signal:
+        side = test_signal
+        current_price = safe_last(df['close'])
+        if current_price == 0:
+            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
+            return
+
+        # For S4, a 50% distance is safer than 99% for some assets.
+        test_entry_price = current_price * 0.5 if side == 'BUY' else current_price * 1.5
+        
+        # Use a minimal but valid quantity for the test order
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
+        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
+
+        if test_qty <= 0:
+            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
+            return
+
+        log.info(f"S4 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
+        try:
+            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
+            order_id = order_resp.get('orderId')
+            msg = (
+                f"✅ *S4 Test Order Placed*\n\n"
+                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
+                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
+                f"**Order ID:** `{order_id}`\n\n"
+                f"This is a real order. Please cancel it manually on the exchange."
+            )
+            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to place S4 test order for {symbol}", e)
+        return
+
+    # --- Normal Signal Logic ---
     global managed_trades
 
-    # --- Timeframe Check ---
-    if CONFIG["TIMEFRAME"] != "15m" and not test_signal:
+    if CONFIG["TIMEFRAME"] != "15m":
         if not hasattr(evaluate_strategy_4, 'has_warned'):
             log.warning("S4 is designed for 15m timeframe only. Current timeframe is not 15m. S4 will not execute.")
             _record_rejection(symbol, "S4 Invalid Timeframe", {"timeframe": CONFIG["TIMEFRAME"]})
-            evaluate_strategy_4.has_warned = True # Prevent spamming logs
+            evaluate_strategy_4.has_warned = True
         return
 
     s4_params = CONFIG['STRATEGY_4']
     
-    # --- Pre-trade checks ---
-    if not test_signal:
-        async with managed_trades_lock:
-            if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
-                log.info(f"S4: Skipping evaluation for {symbol} as a trade is already open and hedging is disabled.")
-                return
-        async with pending_limit_orders_lock:
-            if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
-                log.info(f"S4: Skipping evaluation for {symbol} as a pending limit order already exists.")
-                return
+    async with managed_trades_lock:
+        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+            log.info(f"S4: Skipping evaluation for {symbol} as a trade is already open and hedging is disabled.")
+            return
+    async with pending_limit_orders_lock:
+        if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
+            log.info(f"S4: Skipping evaluation for {symbol} as a pending limit order already exists.")
+            return
     
-    # --- Indicator & Data Check ---
     required_cols = ['s4_dema', 's4_st', 's4_st_dir', 'open', 'close']
     if len(df) < 4 or any(col not in df.columns for col in required_cols):
         log.warning(f"S4: DataFrame for {symbol} is missing required columns or data. Need at least 4 bars.")
         return
 
-    # --- Define Candles ---
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
     current_candle = df.iloc[-1] 
     entry_price = current_candle['open']
 
-    # --- Signal Detection ---
     side = None
-    if test_signal:
-        side = test_signal
-        log.info(f"S4 TEST MODE: Bypassing signal logic for {symbol}, using side: {side}")
-    else:
-        if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
-            side = 'BUY'
-        elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
-            side = 'SELL'
-        
-        if not side:
-            log.info(f"S4: No signal detected for {symbol} on the last closed candle.")
-            return # No signal
+    if signal_candle['s4_st_dir'] == 1 and prev_candle['s4_st_dir'] == -1:
+        side = 'BUY'
+    elif signal_candle['s4_st_dir'] == -1 and prev_candle['s4_st_dir'] == 1:
+        side = 'SELL'
+    
+    if not side:
+        log.info(f"S4: No signal detected for {symbol} on the last closed candle.")
+        return
 
-    # --- Entry Rule 1: DEMA Trend Filter ---
     dema_value_signal = signal_candle['s4_dema']
     if side == 'BUY' and entry_price <= dema_value_signal:
         _record_rejection(symbol, "S4 DEMA Filter", {"side": "BUY", "price": entry_price, "dema": dema_value_signal}, signal_candle=signal_candle)
@@ -3122,7 +3204,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         _record_rejection(symbol, "S4 DEMA Filter", {"side": "SELL", "price": entry_price, "dema": dema_value_signal}, signal_candle=signal_candle)
         return
         
-    # --- Entry Rule 2: DEMA Cross Rejection ---
     if candle_body_crosses_dema(signal_candle, dema_value_signal):
         _record_rejection(symbol, "S4 DEMA Cross", {"candle": "signal", "dema": dema_value_signal}, signal_candle=signal_candle)
         return
@@ -3131,7 +3212,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         _record_rejection(symbol, "S4 DEMA Cross", {"candle": "previous", "dema": prev_dema_value})
         return
 
-    # --- Entry Rule 3: Candle Size Rejection ---
     signal_body_size = abs(signal_candle['close'] - signal_candle['open'])
     prev_body_size = abs(prev_candle['close'] - prev_candle['open'])
     if prev_body_size > 0 and signal_body_size > (3 * prev_body_size):
@@ -3140,15 +3220,11 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         
     log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
 
-    # --- NEW DIAGNOSTIC LOGGING ---
     main_st_value = signal_candle['s4_st']
     tsl_st_value = signal_candle['s4_tsl_st']
     log.info(f"S4 DIAGNOSTIC ({symbol}): Main ST Value = {main_st_value}, TSL ST Value = {tsl_st_value}")
-    # --- END NEW LOGGING ---
 
-    # --- NEW: 3-Minute Signal Expiry ---
     signal_candle_close_time = signal_candle.name.to_pydatetime()
-    # Ensure it's timezone-aware if it's not already
     if signal_candle_close_time.tzinfo is None:
         signal_candle_close_time = signal_candle_close_time.replace(tzinfo=timezone.utc)
     
@@ -3163,9 +3239,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             signal_candle=signal_candle,
         )
         return
-    # --- End of new logic ---
 
-    # --- Stop Loss and Sizing ---
     stop_loss_price = signal_candle['s4_st']
     log.info(f"S4 DIAGNOSTIC ({symbol}): Initial Stop Loss is set to: {stop_loss_price}")
     risk_usd = s4_params['RISK_USD']
@@ -3211,22 +3285,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
     max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
     leverage = max(1, min(leverage, max_leverage))
-
-    # --- Place Order ---
-    if test_signal:
-        log.info(f"S4 TEST MODE: Would place MARKET order for {final_qty} {symbol} at ~{entry_price}. SL: {stop_loss_price}")
-        test_msg = (
-            f"🧪 *S4 Test Signal Passed*\n\n"
-            f"**Symbol:** `{symbol}`\n"
-            f"**Side:** `{side}`\n"
-            f"**Entry Price:** `~{entry_price:.4f}`\n"
-            f"**Qty:** `{final_qty}`\n"
-            f"**Stop Loss:** `{stop_loss_price:.4f}`\n"
-            f"**Sized Risk:** `{actual_risk_usdt:.2f} USDT`\n"
-            f"**Leverage:** `{leverage}x`"
-        )
-        await asyncio.to_thread(send_telegram, test_msg, parse_mode='Markdown')
-        return
 
     try:
         log.info(f"S4: Placing MARKET {side} order for {final_qty} {symbol} at ~{entry_price}")
@@ -5128,18 +5186,17 @@ async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
         df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
         df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
         
-        # We'll use a dummy 'BUY' signal for all tests. The side doesn't matter much,
-        # as we're just testing the calculation pipeline.
-        test_params = {'test_signal': 'BUY', 'full_test': full_test}
+        # Use a random side for the test signal
+        side = random.choice(['BUY', 'SELL'])
+        log.info(f"Running test order with random side: {side}")
+        test_params = {'test_signal': side, 'full_test': full_test}
 
         # Dispatch to the correct strategy evaluation function with test parameters
         if strategy_id == 1:
-            # S1 and S2 are limit order strategies, which are simpler to test.
             await evaluate_strategy_bb(symbol, df, **test_params)
         elif strategy_id == 2:
             await evaluate_strategy_supertrend(symbol, df, **test_params)
         elif strategy_id == 3:
-            # S3 and S4 are market order strategies, so the test will place a far-limit order instead.
             await evaluate_strategy_3(symbol, df, **test_params)
         elif strategy_id == 4:
             await evaluate_strategy_4(symbol, df, **test_params)
@@ -5147,8 +5204,6 @@ async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
             # This case should ideally not be hit due to checks in the command handler
             await asyncio.to_thread(send_telegram, f"Invalid strategy ID {strategy_id} for test order.")
             return
-            
-        await asyncio.to_thread(send_telegram, f"✅ Test order process completed for S{strategy_id} on {symbol}. Check for new orders on the exchange.")
 
     except Exception as e:
         log.exception(f"Error during run_test_order for S{strategy_id} on {symbol}")
