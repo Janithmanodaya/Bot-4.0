@@ -1729,15 +1729,18 @@ def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int)
     if CONFIG["DRY_RUN"]:
         log.info(f"[DRY RUN] Would open market {side} order for {qty} {symbol}.")
         return {"status": "FILLED"}
-    
+
     if client is None:
         raise RuntimeError("Binance client not initialized")
-    
+
     try:
         log.info(f"Attempting to change leverage to {leverage}x for {symbol}")
         client.futures_change_leverage(symbol=symbol, leverage=leverage)
     except Exception as e:
         log.warning("Failed to change leverage (non-fatal, may use previous leverage): %s", e)
+
+    # Generate a unique client order ID to make the order idempotent
+    client_order_id = f"ema_bb_{symbol}_{int(time.time() * 1000)}"
 
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
 
@@ -1746,6 +1749,7 @@ def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int)
         'side': side,
         'type': 'MARKET',
         'quantity': str(qty),
+        'newClientOrderId': client_order_id,
     }
 
     if IS_HEDGE_MODE:
@@ -1760,6 +1764,12 @@ def open_market_position_sync(symbol: str, side: str, qty: float, leverage: int)
             log.info(f"Market order placement successful for {symbol}. Response: {order_response}")
             return order_response # Success
         except BinanceAPIException as e:
+            # -4003: Quantity less than zero. This is a final error.
+            # -1111: Precision is over the maximum defined for this asset. Final error.
+            # -4164: Order's notional must be no less than... Final error.
+            if e.code in [-4003, -1111, -4164]:
+                 log.error(f"Unrecoverable Binance API error: {e}. Aborting retries.")
+                 raise e
             log.exception(f"BinanceAPIException on attempt {attempt + 1} placing market order: {e}")
             last_exception = e
             if attempt < max_retries - 1:
