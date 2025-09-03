@@ -111,6 +111,11 @@ CONFIG = {
         "SLOW_MA": int(os.getenv("S3_SLOW_MA", 21)),
         "ATR_SL_MULT": float(os.getenv("S3_ATR_SL_MULT", 1.5)),
         "FALLBACK_SL_PCT": float(os.getenv("S3_FALLBACK_SL_PCT", 0.015)),
+        # --- New Trailing Stop parameters for S3 ---
+        "TRAILING_ENABLED": os.getenv("S3_TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
+        "TRAILING_ATR_PERIOD": int(os.getenv("S3_TRAILING_ATR_PERIOD", "14")),
+        "TRAILING_ATR_MULTIPLIER": float(os.getenv("S3_TRAILING_ATR_MULTIPLIER", "3.0")),
+        "TRAILING_ACTIVATION_PROFIT_PCT": float(os.getenv("S3_TRAILING_ACTIVATION_PROFIT_PCT", "0.01")), # 1% profit
     },
     "STRATEGY_4": { # DEMA+SuperTrend strategy
         "DEMA_PERIOD": int(os.getenv("S4_DEMA_PERIOD", "200")),
@@ -777,7 +782,7 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
 
 
 def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Optional[pd.Series] = None):
-    """Adds a rejected trade event to the deque with enriched details."""
+    """Adds a rejected trade event to the deque and persists it to a file."""
     global rejected_trades
 
     # Enrich details with key indicator values from the signal candle if available
@@ -795,7 +800,17 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
         "reason": reason,
         "details": formatted_details
     }
+    
+    # 1. Append to in-memory deque
     rejected_trades.append(record)
+    
+    # 2. Persist to file
+    try:
+        with open("rejections.jsonl", "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        log.error(f"Failed to write rejection to file: {e}")
+
     # Use info level for rejection logs to make them visible.
     log.info(f"Rejected trade for {symbol}. Reason: {reason}, Details: {formatted_details}")
 
@@ -809,6 +824,41 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
             f"**Details:** `{details_str}`"
         )
         send_telegram(msg, parse_mode='Markdown')
+
+
+def handle_reject_cmd():
+    """Reads the last 20 rejections from the file and formats them for Telegram."""
+    try:
+        with open("rejections.jsonl", "r") as f:
+            lines = f.readlines()
+        
+        last_20_lines = lines[-20:]
+        if not last_20_lines:
+            send_telegram("No rejected trades have been recorded in rejections.jsonl.")
+            return
+
+        report_lines = ["*Last 20 Rejected Trades (from file)*"]
+        for line in reversed(last_20_lines):
+            try:
+                reject = json.loads(line)
+                ts = datetime.fromisoformat(reject['timestamp']).strftime('%Y-%m-%d %H:%M:%S UTC')
+                details_str = ", ".join([f"{k}: {v}" for k, v in reject.get('details', {}).items()])
+                
+                line_report = (
+                    f"\n*Symbol:* {reject['symbol']} at {ts}\n"
+                    f"  - *Reason:* {reject['reason']}\n"
+                    f"  - *Details:* `{details_str}`"
+                )
+                report_lines.append(line_report)
+            except (json.JSONDecodeError, KeyError) as e:
+                log.warning(f"Could not parse rejection line: {line}. Error: {e}")
+        
+        send_telegram("\n".join(report_lines), parse_mode='Markdown')
+
+    except FileNotFoundError:
+        send_telegram("`rejections.jsonl` not found. No rejections have been persisted yet.")
+    except Exception as e:
+        log_and_send_error("Failed to handle /reject command", e)
 
 
 SESSION_FREEZE_WINDOWS = {
@@ -2436,13 +2486,12 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out['s4_st'], out['s4_st_dir'] = supertrend(out, period=s4_params['SUPERTREND_PERIOD'], multiplier=s4_params['SUPERTREND_MULTIPLIER'])
 
         # ---- S4 Trailing Stop SuperTrend ----
-        # User requested specific settings for the TSL indicator.
-        # Note: Using 'low' as a source for both up and down trends is unconventional.
-        # For short trades, the upper band (stop) will be based on 'low', which might be tighter than intended.
+        # This SuperTrend is used for the Trailing Stop Loss mechanism in S4.
+        # It uses a shorter period and a wider multiplier, with hl2 as the source.
         tsl_atr_period = s4_params.get("TSL_ATR_PERIOD", 2)
         tsl_atr_mult = s4_params.get("TSL_ATR_MULTIPLIER", 4.6)
         tsl_atr = atr(out, length=tsl_atr_period)
-        out['s4_tsl_st'], out['s4_tsl_st_dir'] = supertrend(out, period=tsl_atr_period, multiplier=tsl_atr_mult, atr_series=tsl_atr, source=out['low'])
+        out['s4_tsl_st'], out['s4_tsl_st_dir'] = supertrend(out, period=tsl_atr_period, multiplier=tsl_atr_mult, atr_series=tsl_atr, source=(out['high'] + out['low']) / 2)
 
     return out
 
@@ -3391,43 +3440,52 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
 
         elif strategy_id == 3:
             s_params = CONFIG['STRATEGY_3']
-            stop_pct = s_params.get('FALLBACK_SL_PCT', 0.015) # S3 does not have this param, fallback
-            sl_price = current_price * (1 - stop_pct) if side == 'BUY' else current_price * (1 + stop_pct)
+            df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
+            atr_now = safe_last(df['atr'])
             
+            atr_mult = s_params.get("ATR_SL_MULT", 1.5)
+            fallback_sl_pct = s_params.get("FALLBACK_SL_PCT", 0.015)
+            
+            if atr_now > 0:
+                sl_price = current_price - atr_mult * atr_now if side == 'BUY' else current_price + atr_mult * atr_now
+            else:
+                sl_price = current_price * (1 - fallback_sl_pct) if side == 'BUY' else current_price * (1 + fallback_sl_pct)
+
             balance = await asyncio.to_thread(get_account_balance_usdt)
-            risk_usdt = s_params.get('MAX_LOSS_USD_SMALL_BALANCE', 0.5) if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else s_params.get('MAX_LOSS_USD_LARGE_BALANCE', 1.0)
+            risk_usdt = calculate_risk_amount(balance, strategy_id=3) # Use the central function
             price_distance = abs(current_price - sl_price)
             qty = risk_usdt / price_distance if price_distance > 0 else 0.0
             
-            df['atr2'] = atr_wilder(df, length=s_params.get('TRAILING_ATR_PERIOD', 14))
             trade_meta_extra = {
-                "atr_at_entry": safe_last(df['atr2']),
+                "atr_at_entry": atr_now,
                 "s3_trailing_active": False,
-                "s3_trailing_stop": sl_price,
+                "s3_trailing_stop": sl_price, # Initialize trailing stop to the initial SL
             }
 
         elif strategy_id == 4:
             s_params = CONFIG['STRATEGY_4']
             
-            # Calculate the initial trail stop to use as the SL
-            df['atr2'] = atr_wilder(df, length=s_params['TRAILING_ATR_PERIOD'])
-            df['hhv10'] = hhv(df['high'], length=s_params['TRAILING_HHV_PERIOD'])
-            df['llv10'] = llv(df['low'], length=s_params['TRAILING_HHV_PERIOD'])
-            trail_dist = s_params['TRAILING_ATR_MULTIPLIER'] * safe_last(df['atr2'])
-            if side == 'BUY':
-                initial_trail_stop = max(safe_last(df['hhv10']) - trail_dist, current_price - trail_dist)
-            else:
-                initial_trail_stop = min(safe_last(df['llv10']) + trail_dist, current_price + trail_dist)
-            
-            sl_price = initial_trail_stop
+            # --- Correct logic: Calculate indicators and use the main SuperTrend for initial SL ---
+            df = calculate_all_indicators(df.copy()) # Get all indicators
+            # For a forced entry, we should use the most recent available data for the SL.
+            sl_price = safe_last(df['s4_st'])
+
+            # Safety check: Ensure SL is not triggering an immediate stop-out on a forced entry
+            if side == 'BUY' and sl_price >= current_price:
+                log.warning(f"S4 Force Trade: Calculated SL {sl_price} is above current price {current_price}. Using 2% fallback SL.")
+                sl_price = current_price * 0.98 
+            elif side == 'SELL' and sl_price <= current_price:
+                log_warning(f"S4 Force Trade: Calculated SL {sl_price} is below current price {current_price}. Using 2% fallback SL.")
+                sl_price = current_price * 1.02
+
             risk_usdt = s_params['RISK_USD']
             price_distance = abs(current_price - sl_price)
             qty = risk_usdt / price_distance if price_distance > 0 else 0.0
 
             trade_meta_extra = {
-                "s4_trailing_stop": initial_trail_stop,
+                "s4_trailing_stop": sl_price, # Initialize with the initial SL
                 "s4_last_candle_ts": df.index[-1].isoformat(),
-                "s4_trailing_active": False,
+                "s4_trailing_active": False, # This is managed by the monitor thread
             }
         
         else:
@@ -3963,96 +4021,55 @@ def monitor_thread_func():
                         continue # End of S2 logic
                     
                     elif strategy_id == '3':
-                        # --- Advanced SuperTrend (S3) Exit & Management Logic ---
-                        if not meta.get('trailing', True):
-                            continue # Skip if trailing is manually disabled
-
+                        # --- Strategy 3: Simple ATR Trailing Stop ---
                         s3_params = CONFIG['STRATEGY_3']
-                        
-                        # Calculate indicators needed for S3 logic
-                        df_monitor['atr2'] = atr_wilder(df_monitor, length=s3_params['TRAILING_ATR_PERIOD'])
-                        df_monitor['atr20'] = atr_wilder(df_monitor, length=s3_params['SUPERTREND_ATR_PERIOD'])
-                        supertrend(df_monitor, period=s3_params['SUPERTREND_ATR_PERIOD'], multiplier=s3_params['SUPERTREND_MULTIPLIER'], atr_series=df_monitor['atr20'])
-                        df_monitor['hhv10'] = hhv(df_monitor['high'], length=s3_params['TRAILING_HHV_PERIOD'])
-                        df_monitor['llv10'] = llv(df_monitor['low'], length=s3_params['TRAILING_HHV_PERIOD'])
+                        if not meta.get('trailing', True) or not s3_params.get('TRAILING_ENABLED', True):
+                            continue # Skip if trailing is disabled for the trade or globally for S3
 
-                        atr2_now = safe_last(df_monitor['atr2'])
-                        
-                        close_trade = False
-                        exit_reason = None
-
-                        # Exit Rule 1: Volatility Closure
-                        atr2_pct = (atr2_now / current_price) * 100 if current_price > 0 else 0
-                        if atr2_pct > s3_params['VOLATILITY_MAX_ATR2_PCT']:
-                            log.warning(f"S3 Volatility Exit for {tid}. ATR% {atr2_pct:.2f} > {s3_params['VOLATILITY_MAX_ATR2_PCT']}%")
-                            close_trade = True
-                            exit_reason = 'VOLATILITY_CLOSE'
-
-                        # Exit Rule 2: SuperTrend Flip
-                        if not close_trade:
-                            st_direction = safe_last(df_monitor.get('supertrend_direction'))
-                            if (side == 'BUY' and st_direction == -1) or (side == 'SELL' and st_direction == 1):
-                                log.info(f"S3 SuperTrend Flip Exit for {tid}.")
-                                close_trade = True
-                                exit_reason = 'SUPERTREND_FLIP'
-                        
-                        if close_trade:
-                            log.info(f"Closing trade {tid} for reason: {exit_reason}")
-                            cancel_trade_sltp_orders_sync(meta)
-                            close_partial_market_position_sync(sym, side, qty_to_close=meta['qty'])
-                            with managed_trades_lock:
-                                if tid in managed_trades:
-                                    managed_trades[tid]['exit_reason'] = exit_reason
-                            continue
-
-                        # Trailing Stop Management
                         is_trailing_active = meta.get('s3_trailing_active', False)
                         
+                        # Activate trailing if profit target is hit
                         if not is_trailing_active:
                             profit_pct = (current_price / entry_price - 1) if side == 'BUY' else (1 - current_price / entry_price)
                             if profit_pct >= s3_params['TRAILING_ACTIVATION_PROFIT_PCT']:
                                 log.info(f"S3: Activating trailing stop for {tid} at {profit_pct:.2f}% profit.")
                                 is_trailing_active = True
-                                trade_to_update_in_db = None
                                 with managed_trades_lock:
                                     if tid in managed_trades:
                                         managed_trades[tid]['s3_trailing_active'] = True
-                                        trade_to_update_in_db = managed_trades[tid].copy()
-                                if trade_to_update_in_db:
-                                    add_managed_trade_to_db(trade_to_update_in_db)
-
+                                        add_managed_trade_to_db(managed_trades[tid]) # Persist the state change
+                        
+                        # If trailing is active, calculate and update the SL
                         if is_trailing_active:
-                            trail_dist = s3_params['TRAILING_ATR_MULTIPLIER'] * atr2_now
-                            current_trailing_stop = meta.get('s3_trailing_stop', meta['sl'])
-                            new_sl = None
-
-                            if side == 'BUY':
-                                candidate_trail = safe_last(df_monitor.get('hhv10')) - trail_dist
-                                price_based_trail = current_price - trail_dist
-                                effective_candidate = min(candidate_trail, price_based_trail)
-                                if effective_candidate > current_trailing_stop: new_sl = effective_candidate
-                            else: # SELL
-                                candidate_trail = safe_last(df_monitor.get('llv10')) + trail_dist
-                                price_based_trail = current_price + trail_dist
-                                effective_candidate = max(candidate_trail, price_based_trail)
-                                if effective_candidate < current_trailing_stop: new_sl = effective_candidate
+                            # Calculate ATR for trailing
+                            df_monitor['atr_trail'] = atr(df_monitor, length=s3_params['TRAILING_ATR_PERIOD'])
+                            atr_now = safe_last(df_monitor['atr_trail'])
                             
-                            if new_sl:
-                                log.info(f"S3 Trailing SL for {tid}. Old: {current_trailing_stop:.4f}, New: {new_sl:.4f}")
-                                cancel_trade_sltp_orders_sync(meta)
-                                new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
-                                trade_to_update_in_db = None
-                                with managed_trades_lock:
-                                    if tid in managed_trades:
-                                        managed_trades[tid].update({
-                                            'sl': new_sl, 
-                                            'sltp_orders': new_orders, 
-                                            's3_trailing_stop': new_sl
-                                        })
-                                        trade_to_update_in_db = managed_trades[tid].copy()
-                                if trade_to_update_in_db:
-                                    add_managed_trade_to_db(trade_to_update_in_db)
-                                send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
+                            if atr_now > 0:
+                                trail_dist = s3_params['TRAILING_ATR_MULTIPLIER'] * atr_now
+                                current_sl = meta.get('s3_trailing_stop', meta['sl'])
+                                new_sl = None
+
+                                if side == 'BUY':
+                                    potential_sl = current_price - trail_dist
+                                    if potential_sl > current_sl: new_sl = potential_sl
+                                else: # SELL
+                                    potential_sl = current_price + trail_dist
+                                    if potential_sl < current_sl: new_sl = potential_sl
+                                
+                                if new_sl:
+                                    log.info(f"S3 Trailing SL for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
+                                    cancel_trade_sltp_orders_sync(meta)
+                                    new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                                    with managed_trades_lock:
+                                        if tid in managed_trades:
+                                            managed_trades[tid].update({
+                                                'sl': new_sl,
+                                                'sltp_orders': new_orders,
+                                                's3_trailing_stop': new_sl
+                                            })
+                                            add_managed_trade_to_db(managed_trades[tid])
+                                    send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
                         continue # End of S3 logic
                     
                     elif strategy_id == '4':
@@ -5120,7 +5137,7 @@ def build_control_keyboard():
         [KeyboardButton("/listorders"), KeyboardButton("/listpending")],
         [KeyboardButton("/status"), KeyboardButton("/showparams")],
         [KeyboardButton("/usage"), KeyboardButton("/report"), KeyboardButton("/stratreport")],
-        [KeyboardButton("/rejects"), KeyboardButton("/help"), KeyboardButton("/simulate")]
+        [KeyboardButton("/reject"), KeyboardButton("/help"), KeyboardButton("/simulate")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -5538,35 +5555,9 @@ def handle_update_sync(update, loop):
                     except Exception as e:
                         log.error(f"Failed to execute /chart action for {symbol}: {e}")
                         send_telegram(f"Failed to generate chart for {symbol}: {e}")
-            elif text.startswith("/rejects"):
-                async def _task():
-                    if not rejected_trades:
-                        await asyncio.to_thread(send_telegram, "No rejected trades have been recorded yet.")
-                        return
-
-                    report_lines = ["*Last 20 Rejected Trades*"]
-                    # Using list() to create a copy for safe iteration
-                    for reject in reversed(list(rejected_trades)):
-                        ts = datetime.fromisoformat(reject['timestamp']).strftime('%Y-%m-%d %H:%M:%S UTC')
-                        details_str = ", ".join([f"{k}: {v}" for k, v in reject['details'].items()])
-                        
-                        line = (
-                            f"\n*Symbol:* {reject['symbol']} at {ts}\n"
-                            f"  - *Reason:* {reject['reason']}\n"
-                            f"  - *Details:* `{details_str}`"
-                        )
-                        report_lines.append(line)
-                    
-                    await asyncio.to_thread(send_telegram, "\n".join(report_lines), parse_mode='Markdown')
-
-                log.info("Scheduling /rejects task.")
-                fut = asyncio.run_coroutine_threadsafe(_task(), loop)
-                try:
-                    log.info("Waiting for /rejects task future...")
-                    fut.result(timeout=10)
-                    log.info("/rejects task finished waiting for future.")
-                except Exception as e:
-                    log.error("Failed to execute /rejects action: %s", e, exc_info=True)
+            elif text.startswith("/reject"):
+                # Note: This is a synchronous call within an async context
+                handle_reject_cmd()
             elif text.startswith("/trail"):
                 parts = text.split()
                 if len(parts) != 3:
@@ -5629,7 +5620,7 @@ def handle_update_sync(update, loop):
                     "- `/listorders`: Lists all currently open trades with details.\n"
                     "- `/listpending`: Lists all pending limit orders that have not been filled.\n"
                     "- `/sessions`: Reports the current session freeze status.\n"
-                    "- `/rejects`: Shows a report of the last 5 rejected trade opportunities.\n"
+                    "- `/reject`: Shows a report of the last 20 persisted rejected trade opportunities.\n"
                     "- `/report`: Generates an overall performance report.\n"
                     "- `/stratreport`: Generates a side-by-side strategy performance report.\n"
                     "- `/chart <SYMBOL>`: Generates a detailed chart for a symbol.\n\n"
@@ -5644,7 +5635,6 @@ def handle_update_sync(update, loop):
                     "*Testing*\n"
                     "- `/simulate [STRAT] [SYM] [DAYS]`: Runs a simulation (all args optional).\n"
                     "- `/testorder <S1|S2|S3|S4> [SYMBOL]`: Places a non-executable test limit order.\n"
-                    "- `/fulltestorder <S1|S2|S3|S4> [SYMBOL]`: Places a test order with SL/TP.\n"
                     "- `/testrun`: Runs a full end-to-end test on the Binance testnet."
                 )
                 async def _task():
@@ -5707,7 +5697,7 @@ def handle_update_sync(update, loop):
                     f"    - Used: {mem_data['used_gb']:.2f} GB"
                 )
                 send_telegram(usage_report, parse_mode='Markdown')
-            elif text.startswith(("/testorder", "/fulltestorder")):
+            elif text.startswith("/testorder"):
                 import random
                 parts = text.split()
                 if len(parts) < 2:
@@ -5730,9 +5720,10 @@ def handle_update_sync(update, loop):
                 else:
                     symbol = random.choice(CONFIG["SYMBOLS"])
 
-                full_test = text.startswith("/fulltestorder")
+                # The `full_test` parameter is no longer needed.
+                full_test = False
                 
-                send_telegram(f"🚀 Initiating {'full' if full_test else 'simple'} test order for Strategy {strategy_id} on {symbol}...")
+                send_telegram(f"🚀 Initiating simple test order for Strategy {strategy_id} on {symbol}...")
                 
                 async def _task():
                     await run_test_order(strategy_id, symbol, full_test)
