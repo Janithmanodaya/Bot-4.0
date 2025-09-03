@@ -818,12 +818,12 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
     if CONFIG.get("TELEGRAM_NOTIFY_REJECTIONS", False):
         details_str = ", ".join([f"{k}: {v}" for k, v in formatted_details.items()])
         msg = (
-            f"🚫 *Trade Rejected*\n\n"
-            f"**Symbol:** `{symbol}`\n"
-            f"**Reason:** {reason}\n"
-            f"**Details:** `{details_str}`"
+            f"🚫 Trade Rejected\n\n"
+            f"Symbol: {symbol}\n"
+            f"Reason: {reason}\n"
+            f"Details: {details_str}"
         )
-        send_telegram(msg, parse_mode='Markdown')
+        send_telegram(msg)
 
 
 def handle_reject_cmd():
@@ -837,7 +837,7 @@ def handle_reject_cmd():
             send_telegram("No rejected trades have been recorded in rejections.jsonl.")
             return
 
-        report_lines = ["*Last 20 Rejected Trades (from file)*"]
+        report_lines = ["Last 20 Rejected Trades (from file)"]
         for line in reversed(last_20_lines):
             try:
                 reject = json.loads(line)
@@ -845,15 +845,15 @@ def handle_reject_cmd():
                 details_str = ", ".join([f"{k}: {v}" for k, v in reject.get('details', {}).items()])
                 
                 line_report = (
-                    f"\n*Symbol:* {reject['symbol']} at {ts}\n"
-                    f"  - *Reason:* {reject['reason']}\n"
-                    f"  - *Details:* `{details_str}`"
+                    f"\nSymbol: {reject['symbol']} at {ts}\n"
+                    f"  - Reason: {reject['reason']}\n"
+                    f"  - Details: {details_str}"
                 )
                 report_lines.append(line_report)
             except (json.JSONDecodeError, KeyError) as e:
                 log.warning(f"Could not parse rejection line: {line}. Error: {e}")
         
-        send_telegram("\n".join(report_lines), parse_mode='Markdown')
+        send_telegram("\n".join(report_lines))
 
     except FileNotFoundError:
         send_telegram("`rejections.jsonl` not found. No rejections have been persisted yet.")
