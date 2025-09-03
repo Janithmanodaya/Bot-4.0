@@ -5568,6 +5568,14 @@ def handle_update_sync(update, loop):
             elif text.startswith("/reject"):
                 # Note: This is a synchronous call within an async context
                 handle_reject_cmd()
+            elif text.startswith("/testreject"):
+                log.info("Manual rejection test triggered.")
+                _record_rejection(
+                    symbol="TEST/USDT",
+                    reason="MANUAL_TEST",
+                    details={"price": "12345", "note": "This is a test entry"},
+                )
+                send_telegram("✅ Dummy rejection has been recorded. Use /reject to view it.")
             elif text.startswith("/trail"):
                 parts = text.split()
                 if len(parts) != 3:
