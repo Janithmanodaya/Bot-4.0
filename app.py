@@ -3144,7 +3144,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             log.info(f"S4 CONFIRM (BUY): ST1 (slow) flipped for {symbol}. Level -> 1.")
             state['buy_confirmation_level'] = 1
             state['sell_confirmation_level'] = 0  # Invalidate opposite direction
-        elif st2_flipped_buy:
+        if st2_flipped_buy:
             if state['buy_confirmation_level'] == 1:
                 log.info(f"S4 CONFIRM (BUY): ST2 (medium) flipped for {symbol}. Level -> 2.")
                 state['buy_confirmation_level'] = 2
@@ -3152,7 +3152,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 log.info(f"S4 CONFIRM (BUY): ST2 (medium) flipped for {symbol} out of sequence. Resetting.")
                 _record_rejection(symbol, "S4_SEQ_FAIL", {"reason": "ST2 flipped BUY out of sequence", "level": state['buy_confirmation_level']}, signal_candle)
                 state['buy_confirmation_level'] = 0
-        elif st3_flipped_buy:
+        if st3_flipped_buy:
             if state['buy_confirmation_level'] == 2:
                 log.info(f"S4 CONFIRM (BUY): ST3 (fast) flipped for {symbol}. TRADE TRIGGERED.")
                 side = 'BUY'
@@ -3167,7 +3167,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             log.info(f"S4 CONFIRM (SELL): ST1 (slow) flipped for {symbol}. Level -> 1.")
             state['sell_confirmation_level'] = 1
             state['buy_confirmation_level'] = 0  # Invalidate opposite direction
-        elif st2_flipped_sell:
+        if st2_flipped_sell:
             if state['sell_confirmation_level'] == 1:
                 log.info(f"S4 CONFIRM (SELL): ST2 (medium) flipped for {symbol}. Level -> 2.")
                 state['sell_confirmation_level'] = 2
@@ -3175,7 +3175,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 log.info(f"S4 CONFIRM (SELL): ST2 (medium) flipped for {symbol} out of sequence. Resetting.")
                 _record_rejection(symbol, "S4_SEQ_FAIL", {"reason": "ST2 flipped SELL out of sequence", "level": state['sell_confirmation_level']}, signal_candle)
                 state['sell_confirmation_level'] = 0
-        elif st3_flipped_sell:
+        if st3_flipped_sell:
             if state['sell_confirmation_level'] == 2:
                 log.info(f"S4 CONFIRM (SELL): ST3 (fast) flipped for {symbol}. TRADE TRIGGERED.")
                 side = 'SELL'
