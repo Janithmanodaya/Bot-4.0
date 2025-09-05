@@ -282,6 +282,8 @@ pending_limit_orders_lock = DualLock()
 symbol_regimes: Dict[str, str] = {}
 symbol_regimes_lock = threading.Lock()
 
+symbol_evaluation_locks: Dict[str, asyncio.Lock] = {}
+
 last_trade_close_time: Dict[str, datetime] = {}
 
 telegram_thread: Optional[threading.Thread] = None
@@ -567,6 +569,12 @@ async def lifespan(app: FastAPI):
         await reconcile_open_trades()
 
     await asyncio.to_thread(validate_and_sanity_check_sync, True)
+
+    # --- Initialize per-symbol evaluation locks ---
+    global symbol_evaluation_locks
+    for symbol in CONFIG.get("SYMBOLS", []):
+        symbol_evaluation_locks[symbol] = asyncio.Lock()
+    log.info(f"Initialized evaluation locks for {len(symbol_evaluation_locks)} symbols.")
 
     if client is not None:
         scan_task = main_loop.create_task(scanning_loop())
@@ -2514,75 +2522,86 @@ async def evaluate_and_enter(symbol: str):
     Main evaluation function. Fetches data, calculates all indicators once,
     and then dispatches to the strategy evaluation functions.
     """
-    log.info("Evaluating symbol: %s", symbol)
-    global running, frozen, indicator_cache, symbol_loss_cooldown
-    if frozen or not running:
+    # --- Per-symbol lock to prevent race conditions ---
+    lock = symbol_evaluation_locks.get(symbol)
+    if not lock:
+        log.warning(f"No evaluation lock found for symbol {symbol}. Skipping evaluation.")
         return
 
-    # --- Loss Cooldown Check ---
-    if symbol in symbol_loss_cooldown:
-        cooldown_end_time = symbol_loss_cooldown[symbol]
-        if datetime.now(timezone.utc) < cooldown_end_time:
-            log.info(f"Skipping evaluation for {symbol} due to loss cooldown. Ends at {cooldown_end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}.")
-            return
-        else:
-            # Cooldown has expired, remove it and allow trading again
-            log.info(f"Loss cooldown for {symbol} has expired. Resuming evaluation.")
-            del symbol_loss_cooldown[symbol]
+    if lock.locked():
+        log.info(f"Evaluation for {symbol} is already in progress. Skipping.")
+        return
 
-    # Pre-trade checks that apply to all strategies
-    async with managed_trades_lock, pending_limit_orders_lock:
-        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
-            return
-        if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
-            return
-        if len(managed_trades) + len(pending_limit_orders) >= CONFIG["MAX_CONCURRENT_TRADES"]:
+    async with lock:
+        log.info("Evaluating symbol: %s", symbol)
+        global running, frozen, indicator_cache, symbol_loss_cooldown
+        if frozen or not running:
             return
 
-    try:
-        df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 250)
-        if df_raw is None or df_raw.empty:
-            log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping evaluation.")
-            return
-        
-        last_ts = df_raw.index[-1]
-        cache_key = (symbol, CONFIG["TIMEFRAME"])
-        
-        # Simple cache: recompute only when last_ts changed
-        cached_data = indicator_cache.get(cache_key)
-        if cached_data and cached_data.get('last_ts') == last_ts:
-            df = cached_data['df']
-            log.debug(f"Using cached indicators for {symbol}")
-        else:
-            log.info(f"Calculating new indicators for {symbol}")
-            df = await asyncio.to_thread(calculate_all_indicators, df_raw)
-            indicator_cache[cache_key] = {'last_ts': last_ts, 'df': df}
+        # --- Loss Cooldown Check ---
+        if symbol in symbol_loss_cooldown:
+            cooldown_end_time = symbol_loss_cooldown[symbol]
+            if datetime.now(timezone.utc) < cooldown_end_time:
+                log.info(f"Skipping evaluation for {symbol} due to loss cooldown. Ends at {cooldown_end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}.")
+                return
+            else:
+                # Cooldown has expired, remove it and allow trading again
+                log.info(f"Loss cooldown for {symbol} has expired. Resuming evaluation.")
+                del symbol_loss_cooldown[symbol]
 
-            # --- Cache Management to prevent memory leak ---
-            # A simple cache eviction strategy: if cache grows too large, remove the oldest entry.
-            # Assumes Python 3.7+ where dicts are insertion ordered.
-            MAX_CACHE_SIZE = len(CONFIG.get("SYMBOLS", [])) * 2 + 5 # Buffer
-            if len(indicator_cache) > MAX_CACHE_SIZE:
-                oldest_key = next(iter(indicator_cache))
-                indicator_cache.pop(oldest_key)
-                log.info(f"Indicator cache full (size > {MAX_CACHE_SIZE}). Evicted oldest item: {oldest_key}")
-        
-        modes = CONFIG["STRATEGY_MODE"]
-        
-        if 0 in modes or 1 in modes:
-            await evaluate_strategy_bb(symbol, df)
-        
-        if 0 in modes or 2 in modes:
-            await evaluate_strategy_supertrend(symbol, df)
+        # Pre-trade checks that apply to all strategies
+        async with managed_trades_lock, pending_limit_orders_lock:
+            if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+                return
+            if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
+                return
+            if len(managed_trades) + len(pending_limit_orders) >= CONFIG["MAX_CONCURRENT_TRADES"]:
+                return
 
-        if 0 in modes or 3 in modes:
-            await evaluate_strategy_3(symbol, df)
+        try:
+            df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 250)
+            if df_raw is None or df_raw.empty:
+                log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping evaluation.")
+                return
+            
+            last_ts = df_raw.index[-1]
+            cache_key = (symbol, CONFIG["TIMEFRAME"])
+            
+            # Simple cache: recompute only when last_ts changed
+            cached_data = indicator_cache.get(cache_key)
+            if cached_data and cached_data.get('last_ts') == last_ts:
+                df = cached_data['df']
+                log.debug(f"Using cached indicators for {symbol}")
+            else:
+                log.info(f"Calculating new indicators for {symbol}")
+                df = await asyncio.to_thread(calculate_all_indicators, df_raw)
+                indicator_cache[cache_key] = {'last_ts': last_ts, 'df': df}
 
-        if 0 in modes or 4 in modes:
-            await evaluate_strategy_4(symbol, df)
+                # --- Cache Management to prevent memory leak ---
+                # A simple cache eviction strategy: if cache grows too large, remove the oldest entry.
+                # Assumes Python 3.7+ where dicts are insertion ordered.
+                MAX_CACHE_SIZE = len(CONFIG.get("SYMBOLS", [])) * 2 + 5 # Buffer
+                if len(indicator_cache) > MAX_CACHE_SIZE:
+                    oldest_key = next(iter(indicator_cache))
+                    indicator_cache.pop(oldest_key)
+                    log.info(f"Indicator cache full (size > {MAX_CACHE_SIZE}). Evicted oldest item: {oldest_key}")
+            
+            modes = CONFIG["STRATEGY_MODE"]
+            
+            if 0 in modes or 1 in modes:
+                await evaluate_strategy_bb(symbol, df)
+            
+            if 0 in modes or 2 in modes:
+                await evaluate_strategy_supertrend(symbol, df)
 
-    except Exception as e:
-        await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
+            if 0 in modes or 3 in modes:
+                await evaluate_strategy_3(symbol, df)
+
+            if 0 in modes or 4 in modes:
+                await evaluate_strategy_4(symbol, df)
+
+        except Exception as e:
+            await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
 
 def simulate_strategy_bb(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -2640,46 +2659,11 @@ def simulate_strategy_bb(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, An
     }
 
 
-async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame, test_signal: str | None = None, full_test: bool = False):
+async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
     """
     Simple Bollinger strategy. Now includes logic for placing test orders.
     """
     if df is None or df.empty:
-        return
-
-    if test_signal:
-        side = test_signal
-        current_price = safe_last(df['close'])
-        if current_price == 0:
-            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
-            return
-
-        # Place order 99% away from current price
-        test_entry_price = current_price * 0.01 if side == 'BUY' else current_price * 1.99
-        
-        # Use a minimal but valid quantity for the test order
-        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
-        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
-
-        if test_qty <= 0:
-            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
-            return
-
-        log.info(f"S1 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
-        try:
-            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
-            order_id = order_resp.get('orderId')
-            msg = (
-                f"✅ *S1 Test Order Placed*\n\n"
-                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
-                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
-                f"**Order ID:** `{order_id}`\n\n"
-                f"This is a real order. Please cancel it manually on the exchange."
-            )
-            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
-        except Exception as e:
-            await asyncio.to_thread(log_and_send_error, f"Failed to place S1 test order for {symbol}", e)
         return
 
     # --- Normal Signal Logic ---
@@ -2807,46 +2791,11 @@ def simulate_strategy_supertrend(symbol: str, df: pd.DataFrame) -> Optional[Dict
     take_price = entry_price + tp_distance if side == 'BUY' else entry_price - tp_distance
     return {"strategy": "S2-ST", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": take_price, "timestamp": signal_candle.name.isoformat()}
 
-async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame, test_signal: str | None = None, full_test: bool = False):
+async def evaluate_strategy_supertrend(symbol: str, df: pd.DataFrame):
     """
     Simple SuperTrend strategy. Now includes logic for placing test orders.
     """
     if df is None or df.empty:
-        return
-
-    if test_signal:
-        side = test_signal
-        current_price = safe_last(df['close'])
-        if current_price == 0:
-            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
-            return
-
-        # Place order 99% away from current price
-        test_entry_price = current_price * 0.01 if side == 'BUY' else current_price * 1.99
-        
-        # Use a minimal but valid quantity for the test order
-        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
-        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
-
-        if test_qty <= 0:
-            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
-            return
-
-        log.info(f"S2 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
-        try:
-            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
-            order_id = order_resp.get('orderId')
-            msg = (
-                f"✅ *S2 Test Order Placed*\n\n"
-                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
-                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
-                f"**Order ID:** `{order_id}`\n\n"
-                f"This is a real order. Please cancel it manually on the exchange."
-            )
-            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
-        except Exception as e:
-            await asyncio.to_thread(log_and_send_error, f"Failed to place S2 test order for {symbol}", e)
         return
 
     # --- Normal Signal Logic ---
@@ -2973,43 +2922,11 @@ def simulate_strategy_3(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
     take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
     return {"strategy": "S3-MA", "side": side, "entry_price": entry_price, "sl_price": sl_price, "tp_price": take_price, "timestamp": sig.name.isoformat()}
 
-async def evaluate_strategy_3(symbol: str, df: pd.DataFrame, test_signal: str | None = None, full_test: bool = False):
+async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
     """
     Simple moving-average strategy (S3). Now includes logic for placing test orders.
     """
     if df is None or df.empty:
-        return
-
-    if test_signal:
-        side = test_signal
-        current_price = safe_last(df['close'])
-        if current_price == 0:
-            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
-            return
-
-        test_entry_price = current_price * 0.01 if side == 'BUY' else current_price * 1.99
-        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
-        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
-
-        if test_qty <= 0:
-            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
-            return
-
-        log.info(f"S3 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
-        try:
-            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
-            order_id = order_resp.get('orderId')
-            msg = (
-                f"✅ *S3 Test Order Placed*\n\n"
-                f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
-                f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
-                f"**Order ID:** `{order_id}`\n\n"
-                f"This is a real order. Please cancel it manually on the exchange."
-            )
-            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
-        except Exception as e:
-            await asyncio.to_thread(log_and_send_error, f"Failed to place S3 test order for {symbol}", e)
         return
 
     # --- Normal Signal Logic ---
@@ -3168,40 +3085,11 @@ def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
         "timestamp": signal_candle.name.isoformat()
     }
 
-async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
+async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
     """
     Evaluates and executes trades based on the 3x SuperTrend strategy (S4).
     """
     if df is None or df.empty:
-        return
-
-    if test_signal:
-        # This test logic is for the old strategy and can be updated later if needed.
-        # For now, it will not be triggered by any command.
-        side = test_signal
-        current_price = safe_last(df['close'])
-        if current_price == 0:
-            await asyncio.to_thread(send_telegram, f"❌ Cannot place test order for {symbol}, current price is zero.")
-            return
-        test_entry_price = current_price * 0.5 if side == 'BUY' else current_price * 1.5
-        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-        test_qty = min_notional / test_entry_price if test_entry_price > 0 else 0.01
-        test_qty = await asyncio.to_thread(round_qty, symbol, test_qty, rounding=ROUND_CEILING)
-        if test_qty <= 0:
-            await asyncio.to_thread(send_telegram, f"❌ Calculated test quantity for {symbol} is zero. Not placing order.")
-            return
-        log.info(f"S4 TEST MODE: Placing real limit order for {test_qty} {symbol} at {test_entry_price:.4f}")
-        try:
-            order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, test_qty, test_entry_price)
-            order_id = order_resp.get('orderId')
-            msg = (f"✅ *S4 Test Order Placed*\n\n"
-                   f"**Symbol:** `{symbol}`\n**Side:** `{side}`\n"
-                   f"**Price:** `{test_entry_price:.4f}`\n**Qty:** `{test_qty}`\n"
-                   f"**Order ID:** `{order_id}`\n\n"
-                   f"This is a real order. Please cancel it manually on the exchange.")
-            await asyncio.to_thread(send_telegram, msg, parse_mode='Markdown')
-        except Exception as e:
-            await asyncio.to_thread(log_and_send_error, f"Failed to place S4 test order for {symbol}", e)
         return
 
     # --- Normal Signal Logic ---
@@ -3247,9 +3135,19 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         side = 'SELL'
     
     if not side:
-        log.info(f"S4: No 3-SuperTrend signal detected for {symbol}.")
+        # This is not a signal, so we can return silently.
+        # log.info(f"S4: No 3-SuperTrend signal detected for {symbol}.")
         return
         
+    # --- START: Diagnostic Logging for S4 ---
+    log.info(
+        f"S4 Signal Verification for {symbol} | Side: {side}\n"
+        f"  - Conditions: all_buy_now={all_buy_now}, any_sell_before={any_sell_before}, all_sell_now={all_sell_now}, any_buy_before={any_buy_before}\n"
+        f"  - Signal Candle ST Dirs: [ST1: {signal_candle['s4_st1_dir']}, ST2: {signal_candle['s4_st2_dir']}, ST3: {signal_candle['s4_st3_dir']}]\n"
+        f"  - Previous Candle ST Dirs: [ST1: {prev_candle['s4_st1_dir']}, ST2: {prev_candle['s4_st2_dir']}, ST3: {prev_candle['s4_st3_dir']}]"
+    )
+    # --- END: Diagnostic Logging for S4 ---
+    
     log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
 
     stop_loss_price = signal_candle['s4_st2']
@@ -3286,9 +3184,23 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     actual_risk_usdt = final_qty * price_distance
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
     
-    leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
-    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
-    leverage = max(1, min(leverage, max_leverage))
+    # --- START: Leverage Calculation & Logging ---
+    uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+    max_leverage_exchange = get_max_leverage(symbol)
+    max_leverage_config = CONFIG.get("MAX_BOT_LEVERAGE", 30)
+    max_leverage = min(max_leverage_config, max_leverage_exchange)
+    leverage = max(1, min(uncapped_leverage, max_leverage))
+
+    log.info(
+        f"Leverage Calculation for {symbol} | Side: {side}\n"
+        f"  - Notional Value: {notional:.4f}\n"
+        f"  - Margin to Use (Risk): {margin_to_use:.4f}\n"
+        f"  - Uncapped Leverage (Notional / Margin): {uncapped_leverage}x\n"
+        f"  - Max Leverage (Bot Config): {max_leverage_config}x\n"
+        f"  - Max Leverage (Exchange): {max_leverage_exchange}x\n"
+        f"  - Final Capped Leverage: {leverage}x"
+    )
+    # --- END: Leverage Calculation & Logging ---
 
     try:
         log.info(f"S4: Placing MARKET {side} order for {final_qty} {symbol} at ~{entry_price}")
@@ -4553,19 +4465,30 @@ async def scanning_loop():
             next_candle_open_dt = datetime.fromtimestamp(next_candle_open_ts, tz=timezone.utc)
             seconds_to_next_candle = (next_candle_open_dt - now).total_seconds()
             
-            # --- Pre-candle Pause Logic ---
+            # --- Pre-candle Pause Logic (with interruptible sleep) ---
             if seconds_to_next_candle < 120: # 2 minutes
                 sync_buffer = CONFIG.get("CANDLE_SYNC_BUFFER_SEC", 10)
                 sleep_duration = seconds_to_next_candle + sync_buffer
                 
                 log.info(f"Approaching new {timeframe_str} candle. Pausing all scanning for {sleep_duration:.2f} seconds to sync.")
                 next_scan_time = datetime.now(timezone.utc) + timedelta(seconds=sleep_duration)
-                await asyncio.sleep(sleep_duration)
-                continue # Restart the loop to scan immediately after sync
+
+                end_time = datetime.now(timezone.utc) + timedelta(seconds=sleep_duration)
+                while datetime.now(timezone.utc) < end_time:
+                    if not running:
+                        log.info("Bot stopped during pre-candle pause.")
+                        break  # Exit the sleep loop
+                    await asyncio.sleep(1)  # Sleep in 1-second increments
+                
+                continue # Restart the loop (will immediately check the 'running' flag at the top)
 
             # --- Continuous Scanning Logic ---
             log.info(f"Continuous scan cycle starting. Stopping in {seconds_to_next_candle - 120:.2f} seconds.")
             while seconds_to_next_candle >= 120:
+                if not running:
+                    log.info("Bot stopped during continuous scan cycle.")
+                    break
+
                 await run_scan_cycle()
                 
                 # Short sleep to prevent CPU pegging and allow other tasks to run
