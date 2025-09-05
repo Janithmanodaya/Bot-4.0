@@ -125,7 +125,7 @@ CONFIG = {
         "ST3_PERIOD": int(os.getenv("S4_ST3_PERIOD", "10")),
         "ST3_MULT": float(os.getenv("S4_ST3_MULT", "1.0")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
-        "PANIC_EXIT_ATR_MULT": float(os.getenv("S4_PANIC_EXIT_ATR_MULT", "3.0")),
+        "VOLATILITY_EXIT_ATR_MULT": float(os.getenv("S4_VOLATILITY_EXIT_ATR_MULT", "3.0")),
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
@@ -197,7 +197,7 @@ CONFIG = {
     "RISK_PCT_LARGE": float(os.getenv("RISK_PCT_LARGE", "0.02")),
     "RISK_PCT_STRATEGY_2": float(os.getenv("RISK_PCT_S2", "0.025")),
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
-    "MAX_BOT_LEVERAGE": int(os.getenv("MAX_BOT_LEVERAGE", "30")),
+    "MAX_BOT_LEVERAGE": int(os.getenv("MAX_BOT_LEVERAGE", "20")),
 
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
@@ -283,6 +283,9 @@ symbol_regimes: Dict[str, str] = {}
 symbol_regimes_lock = threading.Lock()
 
 symbol_evaluation_locks: Dict[str, asyncio.Lock] = {}
+
+# S4 Sequential Confirmation State
+s4_confirmation_state: Dict[str, Dict[str, Any]] = {}
 
 last_trade_close_time: Dict[str, datetime] = {}
 
@@ -575,6 +578,15 @@ async def lifespan(app: FastAPI):
     for symbol in CONFIG.get("SYMBOLS", []):
         symbol_evaluation_locks[symbol] = asyncio.Lock()
     log.info(f"Initialized evaluation locks for {len(symbol_evaluation_locks)} symbols.")
+
+    # --- Initialize S4 confirmation state ---
+    global s4_confirmation_state
+    for symbol in CONFIG.get("SYMBOLS", []):
+        s4_confirmation_state[symbol] = {
+            'buy_confirmation_level': 0,
+            'sell_confirmation_level': 0,
+        }
+    log.info(f"Initialized S4 sequential confirmation state for {len(s4_confirmation_state)} symbols.")
 
     if client is not None:
         scan_task = main_loop.create_task(scanning_loop())
@@ -3087,69 +3099,101 @@ def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
 
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
     """
-    Evaluates and executes trades based on the 3x SuperTrend strategy (S4).
+    Evaluates and executes trades based on the 3x SuperTrend strategy (S4)
+    using a sequential confirmation logic.
     """
+    global s4_confirmation_state, managed_trades
     if df is None or df.empty:
         return
 
-    # --- Normal Signal Logic ---
-    global managed_trades
+    # --- Pre-Trade Checks ---
     s4_params = CONFIG['STRATEGY_4']
-    
-    async with managed_trades_lock:
+    async with managed_trades_lock, pending_limit_orders_lock:
         if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
             return
-    async with pending_limit_orders_lock:
         if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
             return
     
     required_cols = ['s4_st1_dir', 's4_st2_dir', 's4_st3_dir', 's4_st2', 'open', 'close']
     if len(df) < 4 or any(col not in df.columns for col in required_cols):
-        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data.")
+        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data for sequential logic.")
         return
 
+    # --- Sequential Confirmation Logic ---
+    state = s4_confirmation_state[symbol]
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
-    current_candle = df.iloc[-1] 
-    entry_price = current_candle['open']
+    
+    # --- Define Flip Conditions ---
+    st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
+    st2_flipped_buy = prev_candle['s4_st2_dir'] == -1 and signal_candle['s4_st2_dir'] == 1
+    st3_flipped_buy = prev_candle['s4_st3_dir'] == -1 and signal_candle['s4_st3_dir'] == 1
+    st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and signal_candle['s4_st1_dir'] == -1
+    st2_flipped_sell = prev_candle['s4_st2_dir'] == 1 and signal_candle['s4_st2_dir'] == -1
+    st3_flipped_sell = prev_candle['s4_st3_dir'] == 1 and signal_candle['s4_st3_dir'] == -1
 
     side = None
-    # Check for BUY signal: All three STs are bullish now, and at least one was bearish before.
-    all_buy_now = (signal_candle['s4_st1_dir'] == 1 and 
-                   signal_candle['s4_st2_dir'] == 1 and 
-                   signal_candle['s4_st3_dir'] == 1)
-    any_sell_before = (prev_candle['s4_st1_dir'] == -1 or 
-                       prev_candle['s4_st2_dir'] == -1 or 
-                       prev_candle['s4_st3_dir'] == -1)
-    if all_buy_now and any_sell_before:
-        side = 'BUY'
-    
-    # Check for SELL signal: All three STs are bearish now, and at least one was bullish before.
-    all_sell_now = (signal_candle['s4_st1_dir'] == -1 and 
-                    signal_candle['s4_st2_dir'] == -1 and 
-                    signal_candle['s4_st3_dir'] == -1)
-    any_buy_before = (prev_candle['s4_st1_dir'] == 1 or 
-                      prev_candle['s4_st2_dir'] == 1 or 
-                      prev_candle['s4_st3_dir'] == 1)
-    if all_sell_now and any_buy_before:
-        side = 'SELL'
-    
-    if not side:
-        # This is not a signal, so we can return silently.
-        # log.info(f"S4: No 3-SuperTrend signal detected for {symbol}.")
-        return
-        
-    # --- START: Diagnostic Logging for S4 ---
-    log.info(
-        f"S4 Signal Verification for {symbol} | Side: {side}\n"
-        f"  - Conditions: all_buy_now={all_buy_now}, any_sell_before={any_sell_before}, all_sell_now={all_sell_now}, any_buy_before={any_buy_before}\n"
-        f"  - Signal Candle ST Dirs: [ST1: {signal_candle['s4_st1_dir']}, ST2: {signal_candle['s4_st2_dir']}, ST3: {signal_candle['s4_st3_dir']}]\n"
-        f"  - Previous Candle ST Dirs: [ST1: {prev_candle['s4_st1_dir']}, ST2: {prev_candle['s4_st2_dir']}, ST3: {prev_candle['s4_st3_dir']}]"
-    )
-    # --- END: Diagnostic Logging for S4 ---
-    
-    log.info(f"S4 Signal PASSED for {symbol}, side: {side}")
 
+    # --- BUY Confirmation State Machine (Slow -> Medium -> Fast) ---
+    if st1_flipped_buy:
+        log.info(f"S4 CONFIRM (BUY): ST1 (slow) flipped for {symbol}. Level -> 1.")
+        state['buy_confirmation_level'] = 1
+        state['sell_confirmation_level'] = 0  # Invalidate opposite direction
+    elif st2_flipped_buy:
+        if state['buy_confirmation_level'] == 1:
+            log.info(f"S4 CONFIRM (BUY): ST2 (medium) flipped for {symbol}. Level -> 2.")
+            state['buy_confirmation_level'] = 2
+        else:
+            log.info(f"S4 CONFIRM (BUY): ST2 (medium) flipped for {symbol} out of sequence. Resetting.")
+            state['buy_confirmation_level'] = 0
+    elif st3_flipped_buy:
+        if state['buy_confirmation_level'] == 2:
+            log.info(f"S4 CONFIRM (BUY): ST3 (fast) flipped for {symbol}. TRADE TRIGGERED.")
+            side = 'BUY'
+            state['buy_confirmation_level'] = 0  # Reset after signal
+        else:
+            log.info(f"S4 CONFIRM (BUY): ST3 (fast) flipped for {symbol} out of sequence. Resetting.")
+            state['buy_confirmation_level'] = 0
+    
+    # --- SELL Confirmation State Machine (Slow -> Medium -> Fast) ---
+    if st1_flipped_sell:
+        log.info(f"S4 CONFIRM (SELL): ST1 (slow) flipped for {symbol}. Level -> 1.")
+        state['sell_confirmation_level'] = 1
+        state['buy_confirmation_level'] = 0  # Invalidate opposite direction
+    elif st2_flipped_sell:
+        if state['sell_confirmation_level'] == 1:
+            log.info(f"S4 CONFIRM (SELL): ST2 (medium) flipped for {symbol}. Level -> 2.")
+            state['sell_confirmation_level'] = 2
+        else:
+            log.info(f"S4 CONFIRM (SELL): ST2 (medium) flipped for {symbol} out of sequence. Resetting.")
+            state['sell_confirmation_level'] = 0
+    elif st3_flipped_sell:
+        if state['sell_confirmation_level'] == 2:
+            log.info(f"S4 CONFIRM (SELL): ST3 (fast) flipped for {symbol}. TRADE TRIGGERED.")
+            side = 'SELL'
+            state['sell_confirmation_level'] = 0  # Reset after signal
+        else:
+            log.info(f"S4 CONFIRM (SELL): ST3 (fast) flipped for {symbol} out of sequence. Resetting.")
+            state['sell_confirmation_level'] = 0
+            
+    # --- Invalidation Logic ---
+    # If a buy sequence is in progress and a sell flip occurs on ST1 or ST2, invalidate it.
+    if state['buy_confirmation_level'] > 0 and (st1_flipped_sell or st2_flipped_sell):
+        log.info(f"S4 CONFIRM (BUY): Sequence for {symbol} invalidated by a SELL flip. Resetting.")
+        state['buy_confirmation_level'] = 0
+    # If a sell sequence is in progress and a buy flip occurs on ST1 or ST2, invalidate it.
+    if state['sell_confirmation_level'] > 0 and (st1_flipped_buy or st2_flipped_buy):
+        log.info(f"S4 CONFIRM (SELL): Sequence for {symbol} invalidated by a BUY flip. Resetting.")
+        state['sell_confirmation_level'] = 0
+
+    # --- Trade Execution ---
+    if not side:
+        return # No trade signal on this candle, exit.
+        
+    log.info(f"S4 Sequential Signal PASSED for {symbol}, side: {side}")
+    
+    current_candle = df.iloc[-1] 
+    entry_price = current_candle['open']
     stop_loss_price = signal_candle['s4_st2']
     risk_usd = s4_params['RISK_USD']
     
@@ -3174,17 +3218,15 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
         return
 
     final_qty = ideal_qty
-    notional = final_qty * entry_price
-
     if final_qty <= 0:
         _record_rejection(symbol, "S4 Qty Zero", {"ideal_qty": ideal_qty, "min_qty": qty_min}, signal_candle=signal_candle)
         return
 
+    notional = final_qty * entry_price
     balance = await asyncio.to_thread(get_account_balance_usdt)
     actual_risk_usdt = final_qty * price_distance
     margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
     
-    # --- START: Leverage Calculation & Logging ---
     uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
     max_leverage_exchange = get_max_leverage(symbol)
     max_leverage_config = CONFIG.get("MAX_BOT_LEVERAGE", 30)
@@ -3193,14 +3235,9 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
 
     log.info(
         f"Leverage Calculation for {symbol} | Side: {side}\n"
-        f"  - Notional Value: {notional:.4f}\n"
-        f"  - Margin to Use (Risk): {margin_to_use:.4f}\n"
-        f"  - Uncapped Leverage (Notional / Margin): {uncapped_leverage}x\n"
-        f"  - Max Leverage (Bot Config): {max_leverage_config}x\n"
-        f"  - Max Leverage (Exchange): {max_leverage_exchange}x\n"
-        f"  - Final Capped Leverage: {leverage}x"
+        f"  - Notional Value: {notional:.4f} | Margin to Use (Risk): {margin_to_use:.4f}\n"
+        f"  - Uncapped Leverage: {uncapped_leverage}x | Final Capped Leverage: {leverage}x"
     )
-    # --- END: Leverage Calculation & Logging ---
 
     try:
         log.info(f"S4: Placing MARKET {side} order for {final_qty} {symbol} at ~{entry_price}")
@@ -3238,7 +3275,7 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame):
         await asyncio.to_thread(add_managed_trade_to_db, meta)
 
         new_trade_msg = (
-            f"✅ *New Trade Opened: S4 (3xST)*\n\n"
+            f"✅ *New Trade Opened: S4 (Sequential)*\n\n"
             f"**Symbol:** `{symbol}`\n"
             f"**Side:** `{side}`\n"
             f"**Entry:** `{actual_entry_price:.4f}`\n"
@@ -3953,7 +3990,7 @@ def monitor_thread_func():
                         # Check if forming_candle has valid data for panic check
                         if pd.notna(forming_candle['high']) and pd.notna(forming_candle['low']) and pd.notna(forming_candle['atr']):
                             candle_size = forming_candle['high'] - forming_candle['low']
-                            atr_threshold = forming_candle['atr'] * s4_params['PANIC_EXIT_ATR_MULT']
+                            atr_threshold = forming_candle['atr'] * s4_params['VOLATILITY_EXIT_ATR_MULT']
                             
                             price_cross_st = False
                             current_price = forming_candle['close'] # Use the latest close price from the forming candle
@@ -3974,7 +4011,7 @@ def monitor_thread_func():
                                     send_telegram(f"🚨 S4 PANIC EXIT for {sym} due to high volatility against the trend.")
                                     with managed_trades_lock:
                                         if tid in managed_trades:
-                                            managed_trades[tid]['exit_reason'] = "PANIC_EXIT_ATR"
+                                            managed_trades[tid]['exit_reason'] = "VOLATILITY_EXIT"
                                             add_managed_trade_to_db(managed_trades[tid])
                                 except Exception as e:
                                     log_and_send_error(f"Failed to execute S4 panic exit for {tid}", e)
