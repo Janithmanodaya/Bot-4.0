@@ -123,7 +123,7 @@ CONFIG = {
         "ST2_PERIOD": int(os.getenv("S4_ST2_PERIOD", "11")),
         "ST2_MULT": float(os.getenv("S4_ST2_MULT", "2.0")),
         "ST3_PERIOD": int(os.getenv("S4_ST3_PERIOD", "10")),
-        "ST3_MULT": float(os.getenv("S4_ST3_MULT", "1.0")),
+        "ST3_MULT": float(os.getenv("S4_ST3_MULT", "1.4")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
         "VOLATILITY_EXIT_ATR_MULT": float(os.getenv("S4_VOLATILITY_EXIT_ATR_MULT", "3.0")),
     },
@@ -3244,6 +3244,11 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
 
     try:
         log.info(f"S4: Placing MARKET {side} order for {final_qty} {symbol} at ~{entry_price}")
+
+        # --- Set post-trade cooldown immediately to prevent duplicates ---
+        symbol_trade_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=16)
+        log.info(f"S4: Set 16-minute post-trade cooldown for {symbol} to prevent duplicates before placing order.")
+
         await asyncio.to_thread(open_market_position_sync, symbol, side, final_qty, leverage)
 
         pos = None
@@ -3276,10 +3281,6 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         async with managed_trades_lock:
             managed_trades[trade_id] = meta
         await asyncio.to_thread(add_managed_trade_to_db, meta)
-
-        # --- Set post-trade cooldown ---
-        symbol_trade_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=2)
-        log.info(f"Set 2-minute post-trade cooldown for {symbol}.")
 
         new_trade_msg = (
             f"✅ *New Trade Opened: S4 (Sequential)*\n\n"
@@ -3627,8 +3628,8 @@ def monitor_thread_func():
                                 managed_trades[trade_id] = meta
 
                             # --- Set post-trade cooldown ---
-                            symbol_trade_cooldown[p_meta['symbol']] = datetime.now(timezone.utc) + timedelta(minutes=2)
-                            log.info(f"Set 2-minute post-trade cooldown for {p_meta['symbol']} after limit order fill.")
+                            symbol_trade_cooldown[p_meta['symbol']] = datetime.now(timezone.utc) + timedelta(minutes=16)
+                            log.info(f"Set 16-minute post-trade cooldown for {p_meta['symbol']} after limit order fill.")
                             
                             # Use a simplified record_trade call, as many fields are for the new management style
                             record_trade({
@@ -3823,7 +3824,36 @@ def monitor_thread_func():
                 if is_closed:
                     close_time = datetime.utcnow().replace(tzinfo=timezone.utc)
                     meta['close_time'] = close_time.isoformat()
-                    exit_reason = meta.get('exit_reason', 'SL/TP') 
+                    exit_reason = meta.get('exit_reason', 'SL/TP')
+
+                    # --- Reliable PnL Fetching for Closed Trades ---
+                    final_pnl = 0.0
+                    exit_price = meta.get('entry_price')  # Fallback exit price
+
+                    if pos and pos.get('unRealizedProfit') is not None and float(pos.get('unRealizedProfit')) != 0.0:
+                        final_pnl = float(pos.get('unRealizedProfit'))
+                        if pos.get('entryPrice') is not None and float(pos.get('entryPrice')) != 0.0:
+                           exit_price = float(pos.get('entryPrice'))
+                        log.info(f"Trade PnL for {tid} from position info: {final_pnl:.4f}")
+                    else:
+                        log.warning(f"Position info for closed trade {tid} is missing/stale. Fetching from income history...")
+                        try:
+                            open_time_dt = datetime.fromisoformat(meta['open_time'])
+                            open_time_ms = int(open_time_dt.timestamp() * 1000)
+                            income_history = client.futures_income_history(symbol=sym, incomeType='REALIZED_PNL', startTime=open_time_ms, limit=10)
+                            if income_history:
+                                last_pnl_record = income_history[0]
+                                final_pnl = float(last_pnl_record['income'])
+                                log.info(f"PnL for {tid} from income history: {final_pnl:.4f}")
+                            else:
+                                log.warning(f"No REALIZED_PNL found in income history for {tid} since it opened. PnL is 0.")
+                                final_pnl = 0.0
+                        except Exception as e:
+                            log.exception(f"Failed to fetch income history for {tid}. PnL is 0.")
+                            final_pnl = 0.0
+                    
+                    unreal_pnl_for_trade = final_pnl
+                    # --- End of PnL Fetching ---
 
                     # --- Post-Loss Cooldown Logic ---
                     if unreal_pnl_for_trade < 0:
@@ -3836,7 +3866,7 @@ def monitor_thread_func():
                     
                     trade_record = meta.copy()
                     trade_record.update({
-                        'exit_price': float(pos.get('entryPrice') or 0.0) if pos else meta['entry_price'],
+                        'exit_price': exit_price,
                         'pnl': unreal_pnl_for_trade,
                         'close_time': meta['close_time'],
                         'exit_reason': exit_reason
