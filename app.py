@@ -3100,9 +3100,9 @@ def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the 3x SuperTrend strategy (S4)
-    using a sequential confirmation logic.
+    using a confluence logic, matching the simulation.
     """
-    global s4_confirmation_state, managed_trades
+    global managed_trades
     if df is None or df.empty:
         return
 
@@ -3116,92 +3116,60 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     
     required_cols = ['s4_st1_dir', 's4_st2_dir', 's4_st3_dir', 's4_st2', 'open', 'close']
     if len(df) < 4 or any(col not in df.columns for col in required_cols):
-        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data for sequential logic.")
+        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data for evaluation.")
         return
 
     side = None
-    signal_candle = df.iloc[-2] # Default signal candle
+    signal_candle = df.iloc[-2]
+    prev_candle = df.iloc[-3]
 
     # --- Test Order Logic ---
     if test_signal:
         side = test_signal
         log.info(f"S4 TEST ORDER: Bypassing signal logic for side: {side}")
     else:
-        # --- Sequential Confirmation Logic ---
-        state = s4_confirmation_state[symbol]
-        prev_candle = df.iloc[-3]
+        # --- Confluence Signal Logic (from simulation) ---
         
-        # --- Define Flip Conditions ---
-        st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
-        st2_flipped_buy = prev_candle['s4_st2_dir'] == -1 and signal_candle['s4_st2_dir'] == 1
-        st3_flipped_buy = prev_candle['s4_st3_dir'] == -1 and signal_candle['s4_st3_dir'] == 1
-        st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and signal_candle['s4_st1_dir'] == -1
-        st2_flipped_sell = prev_candle['s4_st2_dir'] == 1 and signal_candle['s4_st2_dir'] == -1
-        st3_flipped_sell = prev_candle['s4_st3_dir'] == 1 and signal_candle['s4_st3_dir'] == -1
+        # BUY Signal: All three STs are bullish now, and at least one was bearish before.
+        all_buy_now = (signal_candle['s4_st1_dir'] == 1 and 
+                       signal_candle['s4_st2_dir'] == 1 and 
+                       signal_candle['s4_st3_dir'] == 1)
+        any_sell_before = (prev_candle['s4_st1_dir'] == -1 or 
+                           prev_candle['s4_st2_dir'] == -1 or 
+                           prev_candle['s4_st3_dir'] == -1)
 
-        # --- BUY Confirmation State Machine (Slow -> Medium -> Fast) ---
-        if st1_flipped_buy:
-            log.info(f"S4 CONFIRM (BUY): ST1 (slow) flipped for {symbol}. Level -> 1.")
-            state['buy_confirmation_level'] = 1
-            state['sell_confirmation_level'] = 0  # Invalidate opposite direction
-        if st2_flipped_buy:
-            if state['buy_confirmation_level'] == 1:
-                log.info(f"S4 CONFIRM (BUY): ST2 (medium) flipped for {symbol}. Level -> 2.")
-                state['buy_confirmation_level'] = 2
-            else:
-                log.info(f"S4 CONFIRM (BUY): ST2 (medium) flipped for {symbol} out of sequence. Resetting.")
-                _record_rejection(symbol, "S4_SEQ_FAIL", {"reason": "ST2 flipped BUY out of sequence", "level": state['buy_confirmation_level']}, signal_candle)
-                state['buy_confirmation_level'] = 0
-        if st3_flipped_buy:
-            if state['buy_confirmation_level'] == 2:
-                log.info(f"S4 CONFIRM (BUY): ST3 (fast) flipped for {symbol}. TRADE TRIGGERED.")
-                side = 'BUY'
-                state['buy_confirmation_level'] = 0  # Reset after signal
-            else:
-                log.info(f"S4 CONFIRM (BUY): ST3 (fast) flipped for {symbol} out of sequence. Resetting.")
-                _record_rejection(symbol, "S4_SEQ_FAIL", {"reason": "ST3 flipped BUY out of sequence", "level": state['buy_confirmation_level']}, signal_candle)
-                state['buy_confirmation_level'] = 0
+        if all_buy_now and any_sell_before:
+            side = 'BUY'
+            log.info(f"S4 Signal: BUY confluence detected for {symbol}.")
         
-        # --- SELL Confirmation State Machine (Slow -> Medium -> Fast) ---
-        if st1_flipped_sell:
-            log.info(f"S4 CONFIRM (SELL): ST1 (slow) flipped for {symbol}. Level -> 1.")
-            state['sell_confirmation_level'] = 1
-            state['buy_confirmation_level'] = 0  # Invalidate opposite direction
-        if st2_flipped_sell:
-            if state['sell_confirmation_level'] == 1:
-                log.info(f"S4 CONFIRM (SELL): ST2 (medium) flipped for {symbol}. Level -> 2.")
-                state['sell_confirmation_level'] = 2
-            else:
-                log.info(f"S4 CONFIRM (SELL): ST2 (medium) flipped for {symbol} out of sequence. Resetting.")
-                _record_rejection(symbol, "S4_SEQ_FAIL", {"reason": "ST2 flipped SELL out of sequence", "level": state['sell_confirmation_level']}, signal_candle)
-                state['sell_confirmation_level'] = 0
-        if st3_flipped_sell:
-            if state['sell_confirmation_level'] == 2:
-                log.info(f"S4 CONFIRM (SELL): ST3 (fast) flipped for {symbol}. TRADE TRIGGERED.")
-                side = 'SELL'
-                state['sell_confirmation_level'] = 0  # Reset after signal
-            else:
-                log.info(f"S4 CONFIRM (SELL): ST3 (fast) flipped for {symbol} out of sequence. Resetting.")
-                _record_rejection(symbol, "S4_SEQ_FAIL", {"reason": "ST3 flipped SELL out of sequence", "level": state['sell_confirmation_level']}, signal_candle)
-                state['sell_confirmation_level'] = 0
-                
-        # --- Invalidation Logic ---
-        # If a buy sequence is in progress and a sell flip occurs on ST1 or ST2, invalidate it.
-        if state['buy_confirmation_level'] > 0 and (st1_flipped_sell or st2_flipped_sell):
-            log.info(f"S4 CONFIRM (BUY): Sequence for {symbol} invalidated by a SELL flip. Resetting.")
-            _record_rejection(symbol, "S4_SEQ_INVALIDATED", {"reason": "BUY sequence invalidated by opposing flip", "level": state['buy_confirmation_level']}, signal_candle)
-            state['buy_confirmation_level'] = 0
-        # If a sell sequence is in progress and a buy flip occurs on ST1 or ST2, invalidate it.
-        if state['sell_confirmation_level'] > 0 and (st1_flipped_buy or st2_flipped_buy):
-            log.info(f"S4 CONFIRM (SELL): Sequence for {symbol} invalidated by a BUY flip. Resetting.")
-            _record_rejection(symbol, "S4_SEQ_INVALIDATED", {"reason": "SELL sequence invalidated by opposing flip", "level": state['sell_confirmation_level']}, signal_candle)
-            state['sell_confirmation_level'] = 0
+        # SELL Signal: All three STs are bearish now, and at least one was bullish before.
+        all_sell_now = (signal_candle['s4_st1_dir'] == -1 and 
+                        signal_candle['s4_st2_dir'] == -1 and 
+                        signal_candle['s4_st3_dir'] == -1)
+        any_buy_before = (prev_candle['s4_st1_dir'] == 1 or 
+                          prev_candle['s4_st2_dir'] == 1 or 
+                          prev_candle['s4_st3_dir'] == 1)
+        
+        if all_sell_now and any_buy_before:
+            side = 'SELL'
+            log.info(f"S4 Signal: SELL confluence detected for {symbol}.")
 
     # --- Trade Execution ---
     if not side:
-        return # No trade signal on this candle, exit.
+        # Record a rejection if there's no signal, for diagnostic purposes
+        # This helps confirm the function is running but no signal was found
+        details = {
+            "s4_st1_dir": signal_candle.get('s4_st1_dir'),
+            "s4_st2_dir": signal_candle.get('s4_st2_dir'),
+            "s4_st3_dir": signal_candle.get('s4_st3_dir'),
+            "prev_s4_st1_dir": prev_candle.get('s4_st1_dir'),
+            "prev_s4_st2_dir": prev_candle.get('s4_st2_dir'),
+            "prev_s4_st3_dir": prev_candle.get('s4_st3_dir'),
+        }
+        _record_rejection(symbol, "S4_NO_CONFLUENCE", details, signal_candle)
+        return
         
-    log.info(f"S4 Sequential Signal PASSED for {symbol}, side: {side}")
+    log.info(f"S4 Confluence Signal PASSED for {symbol}, side: {side}")
     
     current_candle = df.iloc[-1] 
     entry_price = current_candle['open']
