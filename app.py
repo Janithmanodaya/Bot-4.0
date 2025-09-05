@@ -118,10 +118,10 @@ CONFIG = {
         "TRAILING_ACTIVATION_PROFIT_PCT": float(os.getenv("S3_TRAILING_ACTIVATION_PROFIT_PCT", "0.01")), # 1% profit
     },
     "STRATEGY_4": { # 3x SuperTrend strategy
-        "ST1_PERIOD": int(os.getenv("S4_ST1_PERIOD", "50")),
-        "ST1_MULT": float(os.getenv("S4_ST1_MULT", "1.1")),
-        "ST2_PERIOD": int(os.getenv("S4_ST2_PERIOD", "15")),
-        "ST2_MULT": float(os.getenv("S4_ST2_MULT", "3.0")),
+        "ST1_PERIOD": int(os.getenv("S4_ST1_PERIOD", "12")),
+        "ST1_MULT": float(os.getenv("S4_ST1_MULT", "3")),
+        "ST2_PERIOD": int(os.getenv("S4_ST2_PERIOD", "11")),
+        "ST2_MULT": float(os.getenv("S4_ST2_MULT", "2.0")),
         "ST3_PERIOD": int(os.getenv("S4_ST3_PERIOD", "10")),
         "ST3_MULT": float(os.getenv("S4_ST3_MULT", "1.0")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
@@ -242,6 +242,7 @@ notified_frozen_session: Optional[str] = None
 rejected_trades = deque(maxlen=20)
 last_attention_alert_time: Dict[str, datetime] = {}
 symbol_loss_cooldown: Dict[str, datetime] = {}
+symbol_trade_cooldown: Dict[str, datetime] = {}
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
@@ -583,10 +584,12 @@ async def lifespan(app: FastAPI):
     global s4_confirmation_state
     for symbol in CONFIG.get("SYMBOLS", []):
         s4_confirmation_state[symbol] = {
-            'buy_confirmation_level': 0,
-            'sell_confirmation_level': 0,
+            'buy_sequence_started': False,
+            'sell_sequence_started': False,
+            'buy_trade_taken': False,
+            'sell_trade_taken': False,
         }
-    log.info(f"Initialized S4 sequential confirmation state for {len(s4_confirmation_state)} symbols.")
+    log.info(f"Initialized S4 stateful confirmation state for {len(s4_confirmation_state)} symbols.")
 
     if client is not None:
         scan_task = main_loop.create_task(scanning_loop())
@@ -2546,9 +2549,21 @@ async def evaluate_and_enter(symbol: str):
 
     async with lock:
         log.info("Evaluating symbol: %s", symbol)
-        global running, frozen, indicator_cache, symbol_loss_cooldown
+        global running, frozen, indicator_cache, symbol_loss_cooldown, symbol_trade_cooldown
         if frozen or not running:
             return
+
+        # --- Post-Trade Cooldown Check ---
+        if symbol in symbol_trade_cooldown:
+            cooldown_end_time = symbol_trade_cooldown[symbol]
+            if datetime.now(timezone.utc) < cooldown_end_time:
+                # Log this only once per minute to avoid spam
+                if cooldown_end_time.second % 10 == 0:
+                     log.info(f"Skipping evaluation for {symbol} due to post-trade cooldown. Ends at {cooldown_end_time.strftime('%H:%M:%S UTC')}.")
+                return
+            else:
+                # Cooldown has expired
+                del symbol_trade_cooldown[symbol]
 
         # --- Loss Cooldown Check ---
         if symbol in symbol_loss_cooldown:
@@ -3100,9 +3115,9 @@ def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any
 async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Optional[str] = None, full_test: bool = False):
     """
     Evaluates and executes trades based on the 3x SuperTrend strategy (S4)
-    using a confluence logic, matching the simulation.
+    using a new stateful logic to only take the first signal in a sequence.
     """
-    global managed_trades
+    global s4_confirmation_state, managed_trades, symbol_trade_cooldown
     if df is None or df.empty:
         return
 
@@ -3128,48 +3143,57 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         side = test_signal
         log.info(f"S4 TEST ORDER: Bypassing signal logic for side: {side}")
     else:
-        # --- Confluence Signal Logic (from simulation) ---
+        # --- Stateful Confluence Logic ---
+        state = s4_confirmation_state[symbol]
         
-        # BUY Signal: All three STs are bullish now, and at least one was bearish before.
+        st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
+        st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and signal_candle['s4_st1_dir'] == -1
+
+        # --- Trend Reset Logic ---
+        # If slow ST flips against a started sequence, reset that sequence.
+        if state['buy_sequence_started'] and st1_flipped_sell:
+            log.info(f"S4 Sequence Reset (BUY): Slow ST flipped to SELL for {symbol}.")
+            state['buy_sequence_started'] = False
+            state['buy_trade_taken'] = False
+        if state['sell_sequence_started'] and st1_flipped_buy:
+            log.info(f"S4 Sequence Reset (SELL): Slow ST flipped to BUY for {symbol}.")
+            state['sell_sequence_started'] = False
+            state['sell_trade_taken'] = False
+
+        # --- Sequence Start Logic ---
+        if st1_flipped_buy:
+            log.info(f"S4 Sequence Start (BUY): Slow ST flipped to BUY for {symbol}.")
+            state['buy_sequence_started'] = True
+            state['buy_trade_taken'] = False  # Reset flag on new sequence
+        if st1_flipped_sell:
+            log.info(f"S4 Sequence Start (SELL): Slow ST flipped to SELL for {symbol}.")
+            state['sell_sequence_started'] = True
+            state['sell_trade_taken'] = False # Reset flag on new sequence
+
+        # --- Trade Trigger Logic ---
+        # Check for BUY signal: sequence started, first trade, and all indicators aligned
         all_buy_now = (signal_candle['s4_st1_dir'] == 1 and 
                        signal_candle['s4_st2_dir'] == 1 and 
                        signal_candle['s4_st3_dir'] == 1)
-        any_sell_before = (prev_candle['s4_st1_dir'] == -1 or 
-                           prev_candle['s4_st2_dir'] == -1 or 
-                           prev_candle['s4_st3_dir'] == -1)
-
-        if all_buy_now and any_sell_before:
+        if state['buy_sequence_started'] and not state['buy_trade_taken'] and all_buy_now:
             side = 'BUY'
-            log.info(f"S4 Signal: BUY confluence detected for {symbol}.")
-        
-        # SELL Signal: All three STs are bearish now, and at least one was bullish before.
+            state['buy_trade_taken'] = True  # Mark trade as taken for this sequence
+            log.info(f"S4 Signal: First BUY confluence detected for {symbol} in sequence.")
+
+        # Check for SELL signal: sequence started, first trade, and all indicators aligned
         all_sell_now = (signal_candle['s4_st1_dir'] == -1 and 
                         signal_candle['s4_st2_dir'] == -1 and 
                         signal_candle['s4_st3_dir'] == -1)
-        any_buy_before = (prev_candle['s4_st1_dir'] == 1 or 
-                          prev_candle['s4_st2_dir'] == 1 or 
-                          prev_candle['s4_st3_dir'] == 1)
-        
-        if all_sell_now and any_buy_before:
+        if state['sell_sequence_started'] and not state['sell_trade_taken'] and all_sell_now:
             side = 'SELL'
-            log.info(f"S4 Signal: SELL confluence detected for {symbol}.")
+            state['sell_trade_taken'] = True  # Mark trade as taken for this sequence
+            log.info(f"S4 Signal: First SELL confluence detected for {symbol} in sequence.")
 
     # --- Trade Execution ---
     if not side:
-        # Record a rejection if there's no signal, for diagnostic purposes
-        # This helps confirm the function is running but no signal was found
-        details = {
-            "s4_st1_dir": signal_candle.get('s4_st1_dir'),
-            "s4_st2_dir": signal_candle.get('s4_st2_dir'),
-            "s4_st3_dir": signal_candle.get('s4_st3_dir'),
-            "prev_s4_st1_dir": prev_candle.get('s4_st1_dir'),
-            "prev_s4_st2_dir": prev_candle.get('s4_st2_dir'),
-            "prev_s4_st3_dir": prev_candle.get('s4_st3_dir'),
-        }
-        _record_rejection(symbol, "S4_NO_CONFLUENCE", details, signal_candle)
-        return
+        return # No trade signal on this candle, exit.
         
-    log.info(f"S4 Confluence Signal PASSED for {symbol}, side: {side}")
+    log.info(f"S4 Stateful Signal PASSED for {symbol}, side: {side}")
     
     current_candle = df.iloc[-1] 
     entry_price = current_candle['open']
@@ -3252,6 +3276,10 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         async with managed_trades_lock:
             managed_trades[trade_id] = meta
         await asyncio.to_thread(add_managed_trade_to_db, meta)
+
+        # --- Set post-trade cooldown ---
+        symbol_trade_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=2)
+        log.info(f"Set 2-minute post-trade cooldown for {symbol}.")
 
         new_trade_msg = (
             f"✅ *New Trade Opened: S4 (Sequential)*\n\n"
@@ -3597,6 +3625,10 @@ def monitor_thread_func():
 
                             with managed_trades_lock:
                                 managed_trades[trade_id] = meta
+
+                            # --- Set post-trade cooldown ---
+                            symbol_trade_cooldown[p_meta['symbol']] = datetime.now(timezone.utc) + timedelta(minutes=2)
+                            log.info(f"Set 2-minute post-trade cooldown for {p_meta['symbol']} after limit order fill.")
                             
                             # Use a simplified record_trade call, as many fields are for the new management style
                             record_trade({
