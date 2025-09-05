@@ -3984,7 +3984,7 @@ def monitor_thread_func():
                                                 's3_trailing_stop': new_sl
                                             })
                                             add_managed_trade_to_db(managed_trades[tid])
-                                    send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
+                                    # send_telegram(f"📈 S3 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
                         continue # End of S3 logic
                     
                     elif strategy_id == '4':
@@ -4085,7 +4085,7 @@ def monitor_thread_func():
                                         trade_to_update_in_db = managed_trades[tid].copy()
                                 if trade_to_update_in_db:
                                     add_managed_trade_to_db(trade_to_update_in_db)
-                                send_telegram(f"📈 S4 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
+                                    # send_telegram(f"📈 S4 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
                         continue
 
                     # --- Generic BE & Trailing Logic ---
@@ -4145,7 +4145,7 @@ def monitor_thread_func():
                                     trade_to_update_in_db = managed_trades[tid].copy()
                             if trade_to_update_in_db:
                                 add_managed_trade_to_db(trade_to_update_in_db)
-                            send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
+                                # send_telegram(f"📈 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`")
                 
                 except Exception as e:
                     log_and_send_error(f"Failed to process in-trade management logic for {tid}", e)
