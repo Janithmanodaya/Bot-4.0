@@ -3139,6 +3139,11 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     prev_candle = df.iloc[-3]
     state = s4_confirmation_state[symbol]
 
+    # --- Diagnostic Logging ---
+    log.info(f"--- S4 Diag: {symbol} | Time: {signal_candle.name} ---")
+    log.info(f"Current State: {state}")
+    log.info(f"ST Dirs (Prev -> Sig): S3({prev_candle['s4_st1_dir']}->{signal_candle['s4_st1_dir']}), S2({prev_candle['s4_st2_dir']}->{signal_candle['s4_st2_dir']}), S1({prev_candle['s4_st3_dir']}->{signal_candle['s4_st3_dir']})")
+
     # --- Define Flip Conditions ---
     s3_flipped_to_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
     s2_flipped_to_buy = prev_candle['s4_st2_dir'] == -1 and signal_candle['s4_st2_dir'] == 1
@@ -3151,60 +3156,51 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     # --- State Machine Logic ---
 
     # --- Buy Sequence ---
-    # Reset condition: If S3 flips to sell, invalidate any ongoing buy sequence.
     if s3_flipped_to_sell and (state['buy_s3_confirmed'] or state['buy_s2_confirmed']):
-        log.info(f"S4 BUY Sequence Reset for {symbol}: S3 flipped to SELL.")
+        log.info(f"S4 Diag: BUY Sequence Reset for {symbol}: S3 flipped to SELL.")
         state['buy_s3_confirmed'] = False
         state['buy_s2_confirmed'] = False
 
-    # Step 1: S3 (slow) flips to BUY. This (re)starts the sequence.
     if s3_flipped_to_buy:
-        log.info(f"S4 BUY Sequence Step 1 for {symbol}: S3 confirmed.")
+        log.info(f"S4 Diag: BUY Sequence Step 1 for {symbol}: S3 confirmed.")
         state['buy_s3_confirmed'] = True
-        state['buy_s2_confirmed'] = False # Reset S2 confirmation on a new S3 flip
+        state['buy_s2_confirmed'] = False
 
-    # Step 2: S2 (mid) flips to BUY, but only if S3 is already confirmed.
     if state['buy_s3_confirmed'] and not state['buy_s2_confirmed'] and s2_flipped_to_buy:
-        log.info(f"S4 BUY Sequence Step 2 for {symbol}: S2 confirmed.")
+        log.info(f"S4 Diag: BUY Sequence Step 2 for {symbol}: S2 confirmed.")
         state['buy_s2_confirmed'] = True
 
-    # Step 3: S1 (fast) flips to BUY, but only if S2 is already confirmed. This is the trade trigger.
     if state['buy_s2_confirmed'] and s1_flipped_to_buy:
-        log.info(f"S4 BUY Sequence Step 3 for {symbol}: S1 confirmed. TRADE TRIGGERED.")
+        log.info(f"S4 Diag: BUY Sequence Step 3 for {symbol}: S1 confirmed. TRADE TRIGGERED.")
         side = 'BUY'
-        # Reset the sequence to wait for the next S3 flip.
         state['buy_s3_confirmed'] = False
         state['buy_s2_confirmed'] = False
     
     # --- Sell Sequence ---
-    # Reset condition: If S3 flips to buy, invalidate any ongoing sell sequence.
     if s3_flipped_to_buy and (state['sell_s3_confirmed'] or state['sell_s2_confirmed']):
-        log.info(f"S4 SELL Sequence Reset for {symbol}: S3 flipped to BUY.")
+        log.info(f"S4 Diag: SELL Sequence Reset for {symbol}: S3 flipped to BUY.")
         state['sell_s3_confirmed'] = False
         state['sell_s2_confirmed'] = False
 
-    # Step 1: S3 (slow) flips to SELL.
     if s3_flipped_to_sell:
-        log.info(f"S4 SELL Sequence Step 1 for {symbol}: S3 confirmed.")
+        log.info(f"S4 Diag: SELL Sequence Step 1 for {symbol}: S3 confirmed.")
         state['sell_s3_confirmed'] = True
         state['sell_s2_confirmed'] = False
 
-    # Step 2: S2 (mid) flips to SELL, only if S3 is confirmed.
     if state['sell_s3_confirmed'] and not state['sell_s2_confirmed'] and s2_flipped_to_sell:
-        log.info(f"S4 SELL Sequence Step 2 for {symbol}: S2 confirmed.")
+        log.info(f"S4 Diag: SELL Sequence Step 2 for {symbol}: S2 confirmed.")
         state['sell_s2_confirmed'] = True
 
-    # Step 3: S1 (fast) flips to SELL, only if S2 is confirmed. Trade trigger.
     if state['sell_s2_confirmed'] and s1_flipped_to_sell:
-        log.info(f"S4 SELL Sequence Step 3 for {symbol}: S1 confirmed. TRADE TRIGGERED.")
+        log.info(f"S4 Diag: SELL Sequence Step 3 for {symbol}: S1 confirmed. TRADE TRIGGERED.")
         side = 'SELL'
-        # Reset the sequence.
         state['sell_s3_confirmed'] = False
         state['sell_s2_confirmed'] = False
 
     # --- Trade Execution ---
     if not side:
-        return # No trade signal on this candle, exit.
+        log.info(f"--- S4 Diag End: No signal for {symbol} ---")
+        return
         
     log.info(f"S4 Sequential Signal PASSED for {symbol}, side: {side}")
     
