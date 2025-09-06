@@ -3152,26 +3152,21 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
         st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and signal_candle['s4_st1_dir'] == -1
 
-        # --- Trend Reset Logic ---
-        # If slow ST flips against a started sequence, reset that sequence.
-        if state['buy_sequence_started'] and st1_flipped_sell:
-            log.info(f"S4 Sequence Reset (BUY): Slow ST flipped to SELL for {symbol}.")
-            state['buy_sequence_started'] = False
+        # --- State Transition Logic ---
+        if st1_flipped_buy:
+            # A new BUY trend has started. Reset everything and prepare for a BUY.
+            log.info(f"S4: Slow ST flipped to BUY for {symbol}. Starting new BUY sequence.")
+            state['buy_sequence_started'] = True
             state['buy_trade_taken'] = False
-        if state['sell_sequence_started'] and st1_flipped_buy:
-            log.info(f"S4 Sequence Reset (SELL): Slow ST flipped to BUY for {symbol}.")
             state['sell_sequence_started'] = False
             state['sell_trade_taken'] = False
-
-        # --- Sequence Start Logic ---
-        if st1_flipped_buy:
-            log.info(f"S4 Sequence Start (BUY): Slow ST flipped to BUY for {symbol}.")
-            state['buy_sequence_started'] = True
-            state['buy_trade_taken'] = False  # Reset flag on new sequence
-        if st1_flipped_sell:
-            log.info(f"S4 Sequence Start (SELL): Slow ST flipped to SELL for {symbol}.")
+        elif st1_flipped_sell:
+            # A new SELL trend has started. Reset everything and prepare for a SELL.
+            log.info(f"S4: Slow ST flipped to SELL for {symbol}. Starting new SELL sequence.")
             state['sell_sequence_started'] = True
-            state['sell_trade_taken'] = False # Reset flag on new sequence
+            state['sell_trade_taken'] = False
+            state['buy_sequence_started'] = False
+            state['buy_trade_taken'] = False
 
         # --- Trade Trigger Logic ---
         # Check for BUY signal: sequence started, first trade, and all indicators aligned
