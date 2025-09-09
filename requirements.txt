@@ -16,6 +16,7 @@ requests
 matplotlib
 mplfinance
 psutil
+pandas-ta
 
 # Version constraints (to prevent dependency conflicts
 urllib3<2.0
