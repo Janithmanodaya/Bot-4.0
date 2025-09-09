@@ -245,6 +245,7 @@ rejected_trades = deque(maxlen=20)
 last_attention_alert_time: Dict[str, datetime] = {}
 symbol_loss_cooldown: Dict[str, datetime] = {}
 symbol_trade_cooldown: Dict[str, datetime] = {}
+last_env_rejection_log: Dict[tuple[str, str], float] = {}
 
 # Account state
 IS_HEDGE_MODE: Optional[bool] = None
@@ -854,38 +855,32 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
 
 
 def handle_reject_cmd():
-    """Reads the last 20 rejections from the file and formats them for Telegram."""
-    try:
-        with open("rejections.jsonl", "r") as f:
-            lines = f.readlines()
-        
-        last_20_lines = lines[-20:]
-        if not last_20_lines:
-            send_telegram("No rejected trades have been recorded in rejections.jsonl.")
-            return
+    """Formats the last 20 in-memory rejections for Telegram."""
+    global rejected_trades
+    if not rejected_trades:
+        send_telegram("No rejected trades have been recorded in memory since the last restart.")
+        return
 
-        report_lines = ["Last 20 Rejected Trades (from file)"]
-        for line in reversed(last_20_lines):
-            try:
-                reject = json.loads(line)
-                ts = datetime.fromisoformat(reject['timestamp']).strftime('%Y-%m-%d %H:%M:%S UTC')
-                details_str = ", ".join([f"{k}: {v}" for k, v in reject.get('details', {}).items()])
-                
-                line_report = (
-                    f"\nSymbol: {reject['symbol']} at {ts}\n"
-                    f"  - Reason: {reject['reason']}\n"
-                    f"  - Details: {details_str}"
-                )
-                report_lines.append(line_report)
-            except (json.JSONDecodeError, KeyError) as e:
-                log.warning(f"Could not parse rejection line: {line}. Error: {e}")
-        
-        send_telegram("\n".join(report_lines))
-
-    except FileNotFoundError:
-        send_telegram("`rejections.jsonl` not found. No rejections have been persisted yet.")
-    except Exception as e:
-        log_and_send_error("Failed to handle /reject command", e)
+    report_lines = ["*Last 20 Rejected Trades (from memory)*"]
+    # The deque stores the most recent items, so we iterate in reverse to show newest first.
+    for reject in reversed(list(rejected_trades)):
+        try:
+            ts = datetime.fromisoformat(reject['timestamp']).strftime('%H:%M:%S')
+            details = reject.get('details', {})
+            details_str = ", ".join([f"{k}: {v}" for k, v in details.items()])
+            
+            line_report = (
+                f"\n- - - - - - - - - - - - - - - - - -\n"
+                f"**Symbol:** `{reject['symbol']}`\n"
+                f"**Time:** `{ts} UTC`\n"
+                f"**Reason:** `{reject['reason']}`\n"
+                f"**Details:** `{details_str if details else 'N/A'}`"
+            )
+            report_lines.append(line_report)
+        except (KeyError) as e:
+            log.warning(f"Could not parse rejection record: {reject}. Error: {e}")
+    
+    send_telegram("\n".join(report_lines), parse_mode='Markdown')
 
 
 SESSION_FREEZE_WINDOWS = {
@@ -2524,6 +2519,19 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+def _log_env_rejection(symbol: str, reason: str, details: dict):
+    """
+    Records a rejection for an environmental/config reason, but only if it hasn't
+    been logged for the same symbol/reason in the last 5 minutes to avoid spam.
+    """
+    global last_env_rejection_log
+    now = time.time()
+    key = (symbol, reason)
+    # Log only once every 5 minutes (300 seconds) for the same symbol and reason
+    if now - last_env_rejection_log.get(key, 0) > 300:
+        _record_rejection(symbol, reason, details)
+        last_env_rejection_log[key] = now
+
 async def evaluate_and_enter(symbol: str):
     """
     Main evaluation function. Fetches data, calculates all indicators once,
@@ -2541,40 +2549,43 @@ async def evaluate_and_enter(symbol: str):
 
     async with lock:
         log.info("Evaluating symbol: %s", symbol)
-        global running, frozen, indicator_cache, symbol_loss_cooldown, symbol_trade_cooldown
+        global running, frozen, indicator_cache, symbol_loss_cooldown, symbol_trade_cooldown, managed_trades, pending_limit_orders
+        
+        # --- Pre-evaluation checks ---
         if frozen or not running:
+            _log_env_rejection(symbol, "Bot Paused", {"running": running, "frozen": frozen})
             return
 
         # --- Post-Trade Cooldown Check ---
         if symbol in symbol_trade_cooldown:
             cooldown_end_time = symbol_trade_cooldown[symbol]
             if datetime.now(timezone.utc) < cooldown_end_time:
-                # Log this only once per minute to avoid spam
-                if cooldown_end_time.second % 10 == 0:
-                     log.info(f"Skipping evaluation for {symbol} due to post-trade cooldown. Ends at {cooldown_end_time.strftime('%H:%M:%S UTC')}.")
+                _log_env_rejection(symbol, "Post-Trade Cooldown", {"ends_at": cooldown_end_time.strftime('%H:%M:%S')})
                 return
             else:
-                # Cooldown has expired
                 del symbol_trade_cooldown[symbol]
 
         # --- Loss Cooldown Check ---
         if symbol in symbol_loss_cooldown:
             cooldown_end_time = symbol_loss_cooldown[symbol]
             if datetime.now(timezone.utc) < cooldown_end_time:
-                log.info(f"Skipping evaluation for {symbol} due to loss cooldown. Ends at {cooldown_end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}.")
+                _log_env_rejection(symbol, "Loss Cooldown", {"ends_at": cooldown_end_time.strftime('%H:%M:%S')})
                 return
             else:
-                # Cooldown has expired, remove it and allow trading again
                 log.info(f"Loss cooldown for {symbol} has expired. Resuming evaluation.")
                 del symbol_loss_cooldown[symbol]
 
-        # Pre-trade checks that apply to all strategies
+        # --- Concurrent Trade Limit Checks ---
         async with managed_trades_lock, pending_limit_orders_lock:
             if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+                _log_env_rejection(symbol, "Position Already Open", {"symbol": symbol})
                 return
             if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
+                _log_env_rejection(symbol, "Pending Order Exists", {"symbol": symbol})
                 return
-            if len(managed_trades) + len(pending_limit_orders) >= CONFIG["MAX_CONCURRENT_TRADES"]:
+            open_trades = len(managed_trades) + len(pending_limit_orders)
+            if open_trades >= CONFIG["MAX_CONCURRENT_TRADES"]:
+                _log_env_rejection(symbol, "Max Trades Reached", {"open": open_trades, "max": CONFIG["MAX_CONCURRENT_TRADES"]})
                 return
 
         try:
@@ -3205,6 +3216,12 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
                 _record_rejection(symbol, "S4 Ignored Buy Signal (Below EMA)", {}, signal_candle=signal_candle)
 
     # --- Trade Execution ---
+    if not side and not test_signal:
+        # If no trade signal was generated, log the reason for clarity if it's due to waiting for a sequence start
+        state = s4_confirmation_state[symbol]
+        if not state['buy_sequence_started'] and not state['sell_sequence_started']:
+            _log_env_rejection(symbol, "S4 Awaiting Trend Flip", {"details": "Slow ST has not flipped to start a new sequence."})
+
     if not side:
         return # No trade signal on this candle, exit.
         
