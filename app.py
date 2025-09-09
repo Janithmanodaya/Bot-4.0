@@ -126,6 +126,7 @@ CONFIG = {
         "ST3_MULT": float(os.getenv("S4_ST3_MULT", "1.4")),
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
         "VOLATILITY_EXIT_ATR_MULT": float(os.getenv("S4_VOLATILITY_EXIT_ATR_MULT", "3.0")),
+        "EMA_FILTER_PERIOD": int(os.getenv("S4_EMA_FILTER_PERIOD", "200")),
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
@@ -1339,6 +1340,10 @@ def sma(series: pd.Series, length: int) -> pd.Series:
     """Calculates the Simple Moving Average (SMA)."""
     return series.rolling(window=length).mean()
 
+def ema(series: pd.Series, length: int) -> pd.Series:
+    """Calculates the Exponential Moving Average (EMA)."""
+    return series.ewm(span=length, adjust=False).mean()
+
 def rsi(series: pd.Series, length: int) -> pd.Series:
     """Calculates the Relative Strength Index (RSI)."""
     delta = series.diff()
@@ -2493,6 +2498,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         CONFIG.get("STRATEGY_2", {}).get("SUPERTREND_PERIOD", 7),
         CONFIG.get("STRATEGY_3", {}).get("SLOW_MA", 21),
         CONFIG.get("STRATEGY_4", {}).get("ST1_PERIOD", 50),
+        CONFIG.get("STRATEGY_4", {}).get("EMA_FILTER_PERIOD", 200),
     )
     if df is None or len(df) < max_lookback:
         log.warning(f"Not enough data for indicator calculation, need {max_lookback} have {len(df)}")
@@ -2529,6 +2535,8 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out['s4_st1'], out['s4_st1_dir'] = supertrend(out, period=s4_params['ST1_PERIOD'], multiplier=s4_params['ST1_MULT'])
         out['s4_st2'], out['s4_st2_dir'] = supertrend(out, period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
         out['s4_st3'], out['s4_st3_dir'] = supertrend(out, period=s4_params['ST3_PERIOD'], multiplier=s4_params['ST3_MULT'])
+        if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
+            out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
     return out
 
@@ -3186,6 +3194,31 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             side = 'SELL'
             state['sell_trade_taken'] = True  # Mark trade as taken for this sequence
             log.info(f"S4 Signal: First SELL confluence detected for {symbol} in sequence.")
+
+    # --- EMA Filter ---
+    if side:
+        s4_params = CONFIG['STRATEGY_4']
+        ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
+        if ema_period > 0 and 's4_ema_filter' in df.columns:
+            entry_price_check = df.iloc[-1]['open']
+            ema_value = signal_candle['s4_ema_filter']
+            
+            candle_open = signal_candle['open']
+            candle_close = signal_candle['close']
+            is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
+
+            if pd.isna(ema_value):
+                 _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period}, signal_candle=signal_candle)
+                 side = None
+            elif is_cross:
+                _record_rejection(symbol, "S4 EMA Cross Signal", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
+                side = None
+            elif side == 'BUY' and entry_price_check <= ema_value:
+                _record_rejection(symbol, "S4 Price not above EMA", {"price": entry_price_check, "ema": ema_value}, signal_candle=signal_candle)
+                side = None
+            elif side == 'SELL' and entry_price_check >= ema_value:
+                _record_rejection(symbol, "S4 Price not below EMA", {"price": entry_price_check, "ema": ema_value}, signal_candle=signal_candle)
+                side = None
 
     # --- Trade Execution ---
     if not side:
