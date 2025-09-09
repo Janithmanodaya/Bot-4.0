@@ -3178,22 +3178,36 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
 
         # --- Trade Trigger Logic ---
         # Check for BUY signal: sequence started, first trade, and all indicators aligned
-        all_buy_now = (signal_candle['s4_st1_dir'] == 1 and 
-                       signal_candle['s4_st2_dir'] == 1 and 
-                       signal_candle['s4_st3_dir'] == 1)
-        if state['buy_sequence_started'] and not state['buy_trade_taken'] and all_buy_now:
-            side = 'BUY'
-            state['buy_trade_taken'] = True  # Mark trade as taken for this sequence
-            log.info(f"S4 Signal: First BUY confluence detected for {symbol} in sequence.")
+        if state['buy_sequence_started'] and not state['buy_trade_taken']:
+            all_buy_now = (signal_candle['s4_st1_dir'] == 1 and 
+                           signal_candle['s4_st2_dir'] == 1 and 
+                           signal_candle['s4_st3_dir'] == 1)
+            if all_buy_now:
+                side = 'BUY'
+                state['buy_trade_taken'] = True
+                log.info(f"S4 Signal: First BUY confluence detected for {symbol} in sequence.")
+            else:
+                _record_rejection(symbol, "S4 Awaiting Buy Confluence", {
+                    "st1_dir": signal_candle['s4_st1_dir'], 
+                    "st2_dir": signal_candle['s4_st2_dir'], 
+                    "st3_dir": signal_candle['s4_st3_dir']
+                }, signal_candle=signal_candle)
 
         # Check for SELL signal: sequence started, first trade, and all indicators aligned
-        all_sell_now = (signal_candle['s4_st1_dir'] == -1 and 
-                        signal_candle['s4_st2_dir'] == -1 and 
-                        signal_candle['s4_st3_dir'] == -1)
-        if state['sell_sequence_started'] and not state['sell_trade_taken'] and all_sell_now:
-            side = 'SELL'
-            state['sell_trade_taken'] = True  # Mark trade as taken for this sequence
-            log.info(f"S4 Signal: First SELL confluence detected for {symbol} in sequence.")
+        if state['sell_sequence_started'] and not state['sell_trade_taken']:
+            all_sell_now = (signal_candle['s4_st1_dir'] == -1 and 
+                            signal_candle['s4_st2_dir'] == -1 and 
+                            signal_candle['s4_st3_dir'] == -1)
+            if all_sell_now:
+                side = 'SELL'
+                state['sell_trade_taken'] = True
+                log.info(f"S4 Signal: First SELL confluence detected for {symbol} in sequence.")
+            else:
+                _record_rejection(symbol, "S4 Awaiting Sell Confluence", {
+                    "st1_dir": signal_candle['s4_st1_dir'], 
+                    "st2_dir": signal_candle['s4_st2_dir'], 
+                    "st3_dir": signal_candle['s4_st3_dir']
+                }, signal_candle=signal_candle)
 
     # --- EMA Filter ---
     if side:
