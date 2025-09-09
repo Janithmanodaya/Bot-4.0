@@ -3179,49 +3179,47 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         # --- Stateful Confluence Logic ---
         state = s4_confirmation_state[symbol]
         
-        st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
-        st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and signal_candle['s4_st1_dir'] == -1
+        # Determine the current trend from the slow SuperTrend on the signal candle
+        slow_st_is_buy = signal_candle['s4_st1_dir'] == 1
+        slow_st_is_sell = signal_candle['s4_st1_dir'] == -1
 
+        # Check if the trend has changed since the previous candle
+        st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and slow_st_is_buy
+        st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and slow_st_is_sell
+        
+        # If the trend flips, we reset the `trade_taken` flag for the new trend direction,
+        # allowing one trade to be taken in this new trend cycle.
         if st1_flipped_buy:
-            log.info(f"S4: Slow ST flipped to BUY for {symbol}. Starting new BUY sequence.")
-            state.update({'buy_sequence_started': True, 'buy_trade_taken': False, 'sell_sequence_started': False, 'sell_trade_taken': False})
+            log.info(f"S4: Slow ST flipped to BUY for {symbol}. Resetting trade-taken flag.")
+            state['buy_trade_taken'] = False
         elif st1_flipped_sell:
-            log.info(f"S4: Slow ST flipped to SELL for {symbol}. Starting new SELL sequence.")
-            state.update({'sell_sequence_started': True, 'sell_trade_taken': False, 'buy_sequence_started': False, 'buy_trade_taken': False})
+            log.info(f"S4: Slow ST flipped to SELL for {symbol}. Resetting trade-taken flag.")
+            state['sell_trade_taken'] = False
 
         # --- Trade Trigger Logic ---
-        if allowed_side in ['BUY', 'BOTH'] and state['buy_sequence_started'] and not state['buy_trade_taken']:
+        # A trade can be taken if the trend is established and a trade for this trend hasn't been taken yet.
+        
+        # Check for BUY signal
+        if allowed_side in ['BUY', 'BOTH'] and slow_st_is_buy and not state.get('buy_trade_taken', False):
             all_buy_now = (signal_candle['s4_st1_dir'] == 1 and signal_candle['s4_st2_dir'] == 1 and signal_candle['s4_st3_dir'] == 1)
             if all_buy_now:
                 side = 'BUY'
-                state['buy_trade_taken'] = True
-                log.info(f"S4 Signal: BUY confluence detected for {symbol} in sequence.")
+                state['buy_trade_taken'] = True # Mark that we've taken a trade for this buy trend
+                log.info(f"S4 Signal: BUY confluence detected for {symbol}.")
             else:
                 _record_rejection(symbol, "S4 Awaiting Buy Confluence", {"st1": signal_candle['s4_st1_dir'], "st2": signal_candle['s4_st2_dir'], "st3": signal_candle['s4_st3_dir']}, signal_candle=signal_candle)
         
-        if allowed_side in ['SELL', 'BOTH'] and state['sell_sequence_started'] and not state['sell_trade_taken']:
+        # Check for SELL signal
+        elif allowed_side in ['SELL', 'BOTH'] and slow_st_is_sell and not state.get('sell_trade_taken', False):
             all_sell_now = (signal_candle['s4_st1_dir'] == -1 and signal_candle['s4_st2_dir'] == -1 and signal_candle['s4_st3_dir'] == -1)
             if all_sell_now:
                 side = 'SELL'
-                state['sell_trade_taken'] = True
-                log.info(f"S4 Signal: SELL confluence detected for {symbol} in sequence.")
+                state['sell_trade_taken'] = True # Mark that we've taken a trade for this sell trend
+                log.info(f"S4 Signal: SELL confluence detected for {symbol}.")
             else:
                 _record_rejection(symbol, "S4 Awaiting Sell Confluence", {"st1": signal_candle['s4_st1_dir'], "st2": signal_candle['s4_st2_dir'], "st3": signal_candle['s4_st3_dir']}, signal_candle=signal_candle)
 
-        # Log if a signal was ignored due to EMA direction
-        if not side:
-            if allowed_side == 'BUY' and state['sell_sequence_started'] and not state['sell_trade_taken']:
-                _record_rejection(symbol, "S4 Ignored Sell Signal (Above EMA)", {}, signal_candle=signal_candle)
-            if allowed_side == 'SELL' and state['buy_sequence_started'] and not state['buy_trade_taken']:
-                _record_rejection(symbol, "S4 Ignored Buy Signal (Below EMA)", {}, signal_candle=signal_candle)
-
     # --- Trade Execution ---
-    if not side and not test_signal:
-        # If no trade signal was generated, log the reason for clarity if it's due to waiting for a sequence start
-        state = s4_confirmation_state[symbol]
-        if not state['buy_sequence_started'] and not state['sell_sequence_started']:
-            _log_env_rejection(symbol, "S4 Awaiting Trend Flip", {"details": "Slow ST has not flipped to start a new sequence."})
-
     if not side:
         return # No trade signal on this candle, exit.
         
