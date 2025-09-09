@@ -1426,22 +1426,25 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_
     Returns two series: supertrend and supertrend_direction.
     """
     # Calculate SuperTrend using pandas_ta.
-    # The library handles ATR calculation internally.
     # It returns a DataFrame with columns like 'SUPERT_10_3.0', 'SUPERTd_10_3.0', etc.
     st_df = df.ta.supertrend(period=period, multiplier=multiplier)
 
-    # Construct the column names dynamically based on the parameters
-    supertrend_col = f'SUPERT_{period}_{multiplier}'
-    direction_col = f'SUPERTd_{period}_{multiplier}'
+    if st_df is None or st_df.empty:
+        log.error(f"Pandas-TA failed to generate SuperTrend for period={period}, mult={multiplier}.")
+        return pd.Series(dtype='float64', index=df.index), pd.Series(dtype='float64', index=df.index)
 
-    # Check if the expected columns were generated
-    if st_df is None or supertrend_col not in st_df.columns or direction_col not in st_df.columns:
-        # Log an error and return empty series to prevent crashes
-        log.error(f"Pandas-TA did not generate expected SuperTrend columns for period={period}, mult={multiplier}. Got columns: {st_df.columns if st_df is not None else 'None'}")
+    # --- Robustly find column names to avoid fragility with float formatting ---
+    # The main supertrend line, e.g., 'SUPERT_7_3.0'
+    supertrend_col = next((col for col in st_df.columns if col.startswith('SUPERT_') and 'd' not in col and 'l' not in col and 's' not in col), None)
+    # The direction column, e.g., 'SUPERTd_7_3.0'
+    direction_col = next((col for col in st_df.columns if col.startswith('SUPERTd_')), None)
+
+    # Check if the expected columns were found
+    if supertrend_col is None or direction_col is None:
+        log.error(f"Pandas-TA did not generate expected SuperTrend columns for period={period}, mult={multiplier}. Got columns: {st_df.columns}")
         return pd.Series(dtype='float64', index=df.index), pd.Series(dtype='float64', index=df.index)
 
     # Extract the required series.
-    # The original function returned the ST line and the direction (-1 or 1).
     st_series = st_df[supertrend_col]
     st_dir_series = st_df[direction_col]
     
@@ -2700,13 +2703,17 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
     if len(df) < 20:
         _record_rejection(symbol, "S1-Not enough bars for S1", {"len": len(df)})
         return
+    
+    signal_candle = df.iloc[-2]
+    prev_candle = df.iloc[-3]
+
+    if 's1_bbl' not in signal_candle or 's1_bbu' not in signal_candle or pd.isna(signal_candle['s1_bbl']) or pd.isna(signal_candle['s1_bbu']):
+        _record_rejection(symbol, "S1-BBands not ready", {}, signal_candle=signal_candle)
+        return
 
     adx_threshold = CONFIG.get("S1_ADX_MAX", 25)
     atr_mult_for_sl = CONFIG.get("S1_ATR_SL_MULT", 1.5)
     fallback_sl_pct = CONFIG.get("S1_FALLBACK_SL_PCT", 0.01)
-
-    signal_candle = df.iloc[-2]
-    prev_candle = df.iloc[-3]
 
     side = None
     if signal_candle['close'] <= signal_candle['s1_bbl']:
@@ -2803,6 +2810,10 @@ def simulate_strategy_supertrend(symbol: str, df: pd.DataFrame) -> Optional[Dict
     atr_buf = CONFIG.get("S2_ATR_BUFFER_MULT", 0.5)
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
+    if 's2_st' not in prev_candle or 's2_st' not in signal_candle or pd.isna(prev_candle['s2_st']) or pd.isna(signal_candle['s2_st']):
+        _record_rejection(symbol, "S2-SuperTrend not ready", {}, signal_candle=signal_candle)
+        return
+
     prev_close_vs_st = float(prev_candle['close']) - float(prev_candle['s2_st'])
     sig_close_vs_st = float(signal_candle['close']) - float(signal_candle['s2_st'])
     side = None
@@ -2971,6 +2982,11 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
     prev = df.iloc[-3]
 
     side = None
+    if 's3_ma_fast' not in prev or 's3_ma_slow' not in prev or 's3_ma_fast' not in sig or 's3_ma_slow' not in sig or \
+       pd.isna(prev['s3_ma_fast']) or pd.isna(prev['s3_ma_slow']) or pd.isna(sig['s3_ma_fast']) or pd.isna(sig['s3_ma_slow']):
+        _record_rejection(symbol, "S3-MAs not ready", {}, signal_candle=sig)
+        return
+
     if prev['s3_ma_fast'] < prev['s3_ma_slow'] and sig['s3_ma_fast'] > sig['s3_ma_slow']:
         side = 'BUY'
     elif prev['s3_ma_fast'] > prev['s3_ma_slow'] and sig['s3_ma_fast'] < sig['s3_ma_slow']:
@@ -3136,8 +3152,8 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
             return
     
     required_cols = ['s4_st1_dir', 's4_st2_dir', 's4_st3_dir', 's4_st2', 'open', 'close']
-    if len(df) < 4 or any(col not in df.columns for col in required_cols):
-        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data for evaluation.")
+    if len(df) < 4 or any(col not in df.columns for col in required_cols) or df[required_cols].iloc[-4:].isnull().values.any():
+        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data for evaluation. Kline len: {len(df)}")
         return
 
     side = None
@@ -3149,17 +3165,21 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
     allowed_side = None
     if ema_period > 0 and 's4_ema_filter' in df.columns:
+        # This is intentional: we check the CURRENT open price against the EMA
+        # of the CLOSED signal candle to ensure the trend is still valid for entry.
         entry_price_check = df.iloc[-1]['open']
         ema_value = signal_candle['s4_ema_filter']
         
         candle_open = signal_candle['open']
         candle_close = signal_candle['close']
+
+        if pd.isna(ema_value) or pd.isna(entry_price_check) or pd.isna(candle_open) or pd.isna(candle_close):
+            _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period, "ema_val": ema_value}, signal_candle=signal_candle)
+            return
+        
         is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
 
-        if pd.isna(ema_value):
-            _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period}, signal_candle=signal_candle)
-            return
-        elif is_cross:
+        if is_cross:
             _record_rejection(symbol, "S4 Price crossing EMA", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
             return
         elif entry_price_check > ema_value:
@@ -3410,14 +3430,14 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             # --- Correct logic: Calculate indicators and use the main SuperTrend for initial SL ---
             df = calculate_all_indicators(df.copy()) # Get all indicators
             # For a forced entry, we should use the most recent available data for the SL.
-            sl_price = safe_last(df['s4_st'])
+            sl_price = safe_last(df['s4_st2'])
 
             # Safety check: Ensure SL is not triggering an immediate stop-out on a forced entry
             if side == 'BUY' and sl_price >= current_price:
                 log.warning(f"S4 Force Trade: Calculated SL {sl_price} is above current price {current_price}. Using 2% fallback SL.")
                 sl_price = current_price * 0.98 
             elif side == 'SELL' and sl_price <= current_price:
-                log_warning(f"S4 Force Trade: Calculated SL {sl_price} is below current price {current_price}. Using 2% fallback SL.")
+                log.warning(f"S4 Force Trade: Calculated SL {sl_price} is below current price {current_price}. Using 2% fallback SL.")
                 sl_price = current_price * 1.02
 
             risk_usdt = s_params['RISK_USD']
@@ -4059,12 +4079,13 @@ def monitor_thread_func():
                         forming_candle = df_with_indicators.iloc[-1]
                         
                         # Check if forming_candle has valid data for panic check
-                        if pd.notna(forming_candle['high']) and pd.notna(forming_candle['low']) and pd.notna(forming_candle['atr']):
+                        panic_check_cols = ['high', 'low', 'atr', 'close', 's4_st1', 's4_st2', 's4_st3']
+                        if all(col in forming_candle and pd.notna(forming_candle[col]) for col in panic_check_cols):
                             candle_size = forming_candle['high'] - forming_candle['low']
                             atr_threshold = forming_candle['atr'] * s4_params['VOLATILITY_EXIT_ATR_MULT']
                             
                             price_cross_st = False
-                            current_price = forming_candle['close'] # Use the latest close price from the forming candle
+                            current_price = forming_candle['close']
                             st1 = forming_candle['s4_st1']
                             st2 = forming_candle['s4_st2']
                             st3 = forming_candle['s4_st3']
@@ -4092,6 +4113,13 @@ def monitor_thread_func():
                         
                         # Use the last closed candle for the normal exit signal check
                         exit_check_candle = df_with_indicators.iloc[-2]
+                        
+                        # --- Defensive check for exit signal columns ---
+                        exit_check_cols = ['s4_st1_dir', 's4_st2_dir', 's4_st3_dir']
+                        if not all(col in exit_check_candle and pd.notna(exit_check_candle[col]) for col in exit_check_cols):
+                            log.warning(f"S4 Monitor: Skipping exit check for {tid} due to missing indicator data on closed candle.")
+                            continue
+
                         st1_dir = exit_check_candle['s4_st1_dir']
                         st2_dir = exit_check_candle['s4_st2_dir']
                         st3_dir = exit_check_candle['s4_st3_dir']
@@ -4121,6 +4149,13 @@ def monitor_thread_func():
                         # 2. Trailing Stop with Middle SuperTrend (ST2) (based on latest data)
                         if meta.get('trailing', True):
                             last_candle = df_with_indicators.iloc[-1]
+                            
+                            # --- Defensive check for trailing stop columns ---
+                            trail_check_cols = ['s4_st2', 'close']
+                            if not all(col in last_candle and pd.notna(last_candle[col]) for col in trail_check_cols):
+                                log.warning(f"S4 Monitor: Skipping trailing stop check for {tid} due to missing indicator data on last candle.")
+                                continue
+
                             potential_sl = last_candle['s4_st2']
                             current_sl = meta['sl']
                             current_price = last_candle['close']
