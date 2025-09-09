@@ -3149,6 +3149,33 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     signal_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
 
+    # --- Primary EMA Trend Filter ---
+    s4_params = CONFIG['STRATEGY_4']
+    ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
+    allowed_side = None
+    if ema_period > 0 and 's4_ema_filter' in df.columns:
+        entry_price_check = df.iloc[-1]['open']
+        ema_value = signal_candle['s4_ema_filter']
+        
+        candle_open = signal_candle['open']
+        candle_close = signal_candle['close']
+        is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
+
+        if pd.isna(ema_value):
+            _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period}, signal_candle=signal_candle)
+            return
+        elif is_cross:
+            _record_rejection(symbol, "S4 Price crossing EMA", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
+            return
+        elif entry_price_check > ema_value:
+            allowed_side = 'BUY'
+        elif entry_price_check < ema_value:
+            allowed_side = 'SELL'
+    else:
+        # If no EMA filter, allow both sides
+        allowed_side = 'BOTH'
+
+    side = None
     # --- Test Order Logic ---
     if test_signal:
         side = test_signal
@@ -3160,79 +3187,38 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
         st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and signal_candle['s4_st1_dir'] == 1
         st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and signal_candle['s4_st1_dir'] == -1
 
-        # --- State Transition Logic ---
         if st1_flipped_buy:
-            # A new BUY trend has started. Reset everything and prepare for a BUY.
             log.info(f"S4: Slow ST flipped to BUY for {symbol}. Starting new BUY sequence.")
-            state['buy_sequence_started'] = True
-            state['buy_trade_taken'] = False
-            state['sell_sequence_started'] = False
-            state['sell_trade_taken'] = False
+            state.update({'buy_sequence_started': True, 'buy_trade_taken': False, 'sell_sequence_started': False, 'sell_trade_taken': False})
         elif st1_flipped_sell:
-            # A new SELL trend has started. Reset everything and prepare for a SELL.
             log.info(f"S4: Slow ST flipped to SELL for {symbol}. Starting new SELL sequence.")
-            state['sell_sequence_started'] = True
-            state['sell_trade_taken'] = False
-            state['buy_sequence_started'] = False
-            state['buy_trade_taken'] = False
+            state.update({'sell_sequence_started': True, 'sell_trade_taken': False, 'buy_sequence_started': False, 'buy_trade_taken': False})
 
         # --- Trade Trigger Logic ---
-        # Check for BUY signal: sequence started, first trade, and all indicators aligned
-        if state['buy_sequence_started'] and not state['buy_trade_taken']:
-            all_buy_now = (signal_candle['s4_st1_dir'] == 1 and 
-                           signal_candle['s4_st2_dir'] == 1 and 
-                           signal_candle['s4_st3_dir'] == 1)
+        if allowed_side in ['BUY', 'BOTH'] and state['buy_sequence_started'] and not state['buy_trade_taken']:
+            all_buy_now = (signal_candle['s4_st1_dir'] == 1 and signal_candle['s4_st2_dir'] == 1 and signal_candle['s4_st3_dir'] == 1)
             if all_buy_now:
                 side = 'BUY'
                 state['buy_trade_taken'] = True
-                log.info(f"S4 Signal: First BUY confluence detected for {symbol} in sequence.")
+                log.info(f"S4 Signal: BUY confluence detected for {symbol} in sequence.")
             else:
-                _record_rejection(symbol, "S4 Awaiting Buy Confluence", {
-                    "st1_dir": signal_candle['s4_st1_dir'], 
-                    "st2_dir": signal_candle['s4_st2_dir'], 
-                    "st3_dir": signal_candle['s4_st3_dir']
-                }, signal_candle=signal_candle)
-
-        # Check for SELL signal: sequence started, first trade, and all indicators aligned
-        if state['sell_sequence_started'] and not state['sell_trade_taken']:
-            all_sell_now = (signal_candle['s4_st1_dir'] == -1 and 
-                            signal_candle['s4_st2_dir'] == -1 and 
-                            signal_candle['s4_st3_dir'] == -1)
+                _record_rejection(symbol, "S4 Awaiting Buy Confluence", {"st1": signal_candle['s4_st1_dir'], "st2": signal_candle['s4_st2_dir'], "st3": signal_candle['s4_st3_dir']}, signal_candle=signal_candle)
+        
+        if allowed_side in ['SELL', 'BOTH'] and state['sell_sequence_started'] and not state['sell_trade_taken']:
+            all_sell_now = (signal_candle['s4_st1_dir'] == -1 and signal_candle['s4_st2_dir'] == -1 and signal_candle['s4_st3_dir'] == -1)
             if all_sell_now:
                 side = 'SELL'
                 state['sell_trade_taken'] = True
-                log.info(f"S4 Signal: First SELL confluence detected for {symbol} in sequence.")
+                log.info(f"S4 Signal: SELL confluence detected for {symbol} in sequence.")
             else:
-                _record_rejection(symbol, "S4 Awaiting Sell Confluence", {
-                    "st1_dir": signal_candle['s4_st1_dir'], 
-                    "st2_dir": signal_candle['s4_st2_dir'], 
-                    "st3_dir": signal_candle['s4_st3_dir']
-                }, signal_candle=signal_candle)
+                _record_rejection(symbol, "S4 Awaiting Sell Confluence", {"st1": signal_candle['s4_st1_dir'], "st2": signal_candle['s4_st2_dir'], "st3": signal_candle['s4_st3_dir']}, signal_candle=signal_candle)
 
-    # --- EMA Filter ---
-    if side:
-        s4_params = CONFIG['STRATEGY_4']
-        ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
-        if ema_period > 0 and 's4_ema_filter' in df.columns:
-            entry_price_check = df.iloc[-1]['open']
-            ema_value = signal_candle['s4_ema_filter']
-            
-            candle_open = signal_candle['open']
-            candle_close = signal_candle['close']
-            is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
-
-            if pd.isna(ema_value):
-                 _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period}, signal_candle=signal_candle)
-                 side = None
-            elif is_cross:
-                _record_rejection(symbol, "S4 EMA Cross Signal", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
-                side = None
-            elif side == 'BUY' and entry_price_check <= ema_value:
-                _record_rejection(symbol, "S4 Price not above EMA", {"price": entry_price_check, "ema": ema_value}, signal_candle=signal_candle)
-                side = None
-            elif side == 'SELL' and entry_price_check >= ema_value:
-                _record_rejection(symbol, "S4 Price not below EMA", {"price": entry_price_check, "ema": ema_value}, signal_candle=signal_candle)
-                side = None
+        # Log if a signal was ignored due to EMA direction
+        if not side:
+            if allowed_side == 'BUY' and state['sell_sequence_started'] and not state['sell_trade_taken']:
+                _record_rejection(symbol, "S4 Ignored Sell Signal (Above EMA)", {}, signal_candle=signal_candle)
+            if allowed_side == 'SELL' and state['buy_sequence_started'] and not state['buy_trade_taken']:
+                _record_rejection(symbol, "S4 Ignored Buy Signal (Below EMA)", {}, signal_candle=signal_candle)
 
     # --- Trade Execution ---
     if not side:
