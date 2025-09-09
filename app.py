@@ -35,6 +35,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
+import pandas_ta as ta
 import matplotlib
 matplotlib.use('Agg') # Use non-interactive backend for server-side plotting
 import matplotlib.pyplot as plt
@@ -1426,47 +1427,30 @@ def adx(df: pd.DataFrame, period: int = 14):
 
 def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0, atr_series: Optional[pd.Series] = None, source: Optional[pd.Series] = None) -> tuple[pd.Series, pd.Series]:
     """
-    Calculates the SuperTrend indicator.
+    Calculates the SuperTrend indicator using the pandas-ta library.
     Returns two series: supertrend and supertrend_direction.
     """
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    
-    # ATR
-    if atr_series is None:
-        atr_series = atr(df, period)
+    # Calculate SuperTrend using pandas_ta.
+    # The library handles ATR calculation internally.
+    # It returns a DataFrame with columns like 'SUPERT_10_3.0', 'SUPERTd_10_3.0', etc.
+    st_df = df.ta.supertrend(period=period, multiplier=multiplier)
 
-    # If no source is provided, default to hl2
-    if source is None:
-        source = (high + low) / 2
-    
-    upperband = source + multiplier * atr_series
-    lowerband = source - multiplier * atr_series
-    
-    # Initialize supertrend direction
-    in_uptrend = pd.Series(True, index=df.index)
+    # Construct the column names dynamically based on the parameters
+    supertrend_col = f'SUPERT_{period}_{multiplier}'
+    direction_col = f'SUPERTd_{period}_{multiplier}'
 
-    for current in range(1, len(df.index)):
-        previous = current - 1
-        
-        if close.iloc[current] < upperband.iloc[previous]:
-            in_uptrend.iloc[current] = False
-        elif close.iloc[current] > lowerband.iloc[previous]:
-            in_uptrend.iloc[current] = True
-        else:
-            in_uptrend.iloc[current] = in_uptrend.iloc[previous]
+    # Check if the expected columns were generated
+    if st_df is None or supertrend_col not in st_df.columns or direction_col not in st_df.columns:
+        # Log an error and return empty series to prevent crashes
+        log.error(f"Pandas-TA did not generate expected SuperTrend columns for period={period}, mult={multiplier}. Got columns: {st_df.columns if st_df is not None else 'None'}")
+        return pd.Series(dtype='float64', index=df.index), pd.Series(dtype='float64', index=df.index)
 
-        if in_uptrend.iloc[current] and in_uptrend.iloc[previous]:
-            lowerband.iloc[current] = max(lowerband.iloc[previous], lowerband.iloc[current])
-        
-        if not in_uptrend.iloc[current] and not in_uptrend.iloc[previous]:
-            upperband.iloc[current] = min(upperband.iloc[previous], upperband.iloc[current])
-
-    st = np.where(in_uptrend, lowerband, upperband)
-    st_dir = np.where(in_uptrend, 1, -1)
+    # Extract the required series.
+    # The original function returned the ST line and the direction (-1 or 1).
+    st_series = st_df[supertrend_col]
+    st_dir_series = st_df[direction_col]
     
-    return pd.Series(st, index=df.index), pd.Series(st_dir, index=df.index)
+    return st_series, st_dir_series
 
 
 def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9):
