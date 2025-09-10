@@ -48,6 +48,7 @@ import telegram
 from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 import mplfinance as mpf
+from stocktrends import Renko
 
 from dotenv import load_dotenv
 
@@ -128,6 +129,7 @@ CONFIG = {
         "RISK_USD": float(os.getenv("S4_RISK_USD", "0.50")), # Fixed risk amount
         "VOLATILITY_EXIT_ATR_MULT": float(os.getenv("S4_VOLATILITY_EXIT_ATR_MULT", "3.0")),
         "EMA_FILTER_PERIOD": int(os.getenv("S4_EMA_FILTER_PERIOD", "200")),
+        "EMA_FILTER_ENABLED": os.getenv("S4_EMA_FILTER_ENABLED", "false").lower() in ("true", "1", "yes"),
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
@@ -2276,6 +2278,55 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
     return df[['open','high','low','close','volume']]
 
 
+def get_renko_data(df_raw: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:
+    """
+    Converts OHLCV data to Renko bricks.
+    The brick size is determined by the ATR(14) of the input data.
+    """
+    if df_raw is None or df_raw.empty:
+        log.warning(f"Cannot generate Renko data for {symbol}, input DataFrame is empty.")
+        return None
+
+    try:
+        # 1. Calculate ATR for brick size from the raw data
+        atr_period = CONFIG.get("ATR_LENGTH", 14)
+        atr_series = atr(df_raw, length=atr_period)
+        brick_size = safe_last(atr_series)
+        
+        if brick_size <= 0:
+            log.warning(f"Calculated Renko brick size for {symbol} is {brick_size:.4f}. Cannot generate Renko chart.")
+            return None
+        log.info(f"Generating Renko chart for {symbol} with dynamic ATR({atr_period}) brick size: {brick_size:.4f}")
+
+        # 2. Prepare DataFrame for stocktrends library
+        df_for_renko = df_raw.copy()
+        df_for_renko.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        
+        # 3. Initialize Renko object and build bricks
+        renko_processor = Renko(df_for_renko)
+        renko_processor.set_brick_size(box_size=brick_size, auto=False)
+        renko_df = renko_processor.get_bricks()
+        
+        if renko_df.empty:
+            log.warning(f"Renko chart generation for {symbol} resulted in an empty DataFrame.")
+            return None
+
+        # 4. Format the Renko DataFrame for compatibility
+        renko_df.set_index('date', inplace=True)
+        if renko_df.index.tz is None:
+            renko_df.index = renko_df.index.tz_localize('UTC')
+        
+        renko_df['volume'] = 0
+        renko_df.index.name = 'close_time'
+        
+        # The library already returns 'open', 'high', 'low', 'close'.
+        return renko_df[['open', 'high', 'low', 'close', 'volume']]
+
+    except Exception as e:
+        log.exception(f"An error occurred during Renko chart generation for {symbol}: {e}")
+        return None
+
+
 def calculate_signal_confidence(signal_candle, side: str) -> tuple[float, dict]:
     """Calculate dynamic confidence score for potential signals."""
     st_settings = CONFIG['STRATEGY_2']
@@ -2539,11 +2590,12 @@ async def evaluate_and_enter(symbol: str):
     """
     Main evaluation function. Fetches data, calculates all indicators once,
     and then dispatches to the strategy evaluation functions.
+    Handles standard OHLCV and Renko data paths.
     """
     # --- Per-symbol lock to prevent race conditions ---
     lock = symbol_evaluation_locks.get(symbol)
     if not lock:
-        log.warning(f"No evaluation lock found for symbol {symbol}. Skipping evaluation.")
+        log.warning(f"No evaluation lock found for {symbol}. Skipping.")
         return
 
     if lock.locked():
@@ -2552,33 +2604,18 @@ async def evaluate_and_enter(symbol: str):
 
     async with lock:
         log.info("Evaluating symbol: %s", symbol)
-        global running, frozen, indicator_cache, symbol_loss_cooldown, symbol_trade_cooldown, managed_trades, pending_limit_orders
+        global running, frozen, symbol_loss_cooldown, symbol_trade_cooldown, managed_trades, pending_limit_orders
         
         # --- Pre-evaluation checks ---
         if frozen or not running:
             _log_env_rejection(symbol, "Bot Paused", {"running": running, "frozen": frozen})
             return
-
-        # --- Post-Trade Cooldown Check ---
-        if symbol in symbol_trade_cooldown:
-            cooldown_end_time = symbol_trade_cooldown[symbol]
-            if datetime.now(timezone.utc) < cooldown_end_time:
-                _log_env_rejection(symbol, "Post-Trade Cooldown", {"ends_at": cooldown_end_time.strftime('%H:%M:%S')})
-                return
-            else:
-                del symbol_trade_cooldown[symbol]
-
-        # --- Loss Cooldown Check ---
-        if symbol in symbol_loss_cooldown:
-            cooldown_end_time = symbol_loss_cooldown[symbol]
-            if datetime.now(timezone.utc) < cooldown_end_time:
-                _log_env_rejection(symbol, "Loss Cooldown", {"ends_at": cooldown_end_time.strftime('%H:%M:%S')})
-                return
-            else:
-                log.info(f"Loss cooldown for {symbol} has expired. Resuming evaluation.")
-                del symbol_loss_cooldown[symbol]
-
-        # --- Concurrent Trade Limit Checks ---
+        if symbol in symbol_trade_cooldown and datetime.now(timezone.utc) < symbol_trade_cooldown[symbol]:
+            _log_env_rejection(symbol, "Post-Trade Cooldown", {"ends_at": symbol_trade_cooldown[symbol].strftime('%H:%M:%S')})
+            return
+        if symbol in symbol_loss_cooldown and datetime.now(timezone.utc) < symbol_loss_cooldown[symbol]:
+            _log_env_rejection(symbol, "Loss Cooldown", {"ends_at": symbol_loss_cooldown[symbol].strftime('%H:%M:%S')})
+            return
         async with managed_trades_lock, pending_limit_orders_lock:
             if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
                 _log_env_rejection(symbol, "Position Already Open", {"symbol": symbol})
@@ -2592,46 +2629,40 @@ async def evaluate_and_enter(symbol: str):
                 return
 
         try:
-            df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 250)
-            if df_raw is None or df_raw.empty:
-                log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping evaluation.")
-                return
-            
-            last_ts = df_raw.index[-1]
-            cache_key = (symbol, CONFIG["TIMEFRAME"])
-            
-            # Simple cache: recompute only when last_ts changed
-            cached_data = indicator_cache.get(cache_key)
-            if cached_data and cached_data.get('last_ts') == last_ts:
-                df = cached_data['df']
-                log.debug(f"Using cached indicators for {symbol}")
-            else:
-                log.info(f"Calculating new indicators for {symbol}")
-                df = await asyncio.to_thread(calculate_all_indicators, df_raw)
-                indicator_cache[cache_key] = {'last_ts': last_ts, 'df': df}
-
-                # --- Cache Management to prevent memory leak ---
-                # A simple cache eviction strategy: if cache grows too large, remove the oldest entry.
-                # Assumes Python 3.7+ where dicts are insertion ordered.
-                MAX_CACHE_SIZE = len(CONFIG.get("SYMBOLS", [])) * 2 + 5 # Buffer
-                if len(indicator_cache) > MAX_CACHE_SIZE:
-                    oldest_key = next(iter(indicator_cache))
-                    indicator_cache.pop(oldest_key)
-                    log.info(f"Indicator cache full (size > {MAX_CACHE_SIZE}). Evicted oldest item: {oldest_key}")
-            
             modes = CONFIG["STRATEGY_MODE"]
-            
-            if 0 in modes or 1 in modes:
-                await evaluate_strategy_bb(symbol, df)
-            
-            if 0 in modes or 2 in modes:
-                await evaluate_strategy_supertrend(symbol, df)
+            run_s4 = 4 in modes or 0 in modes
+            run_others = any(m in modes for m in [1, 2, 3]) or 0 in modes
 
-            if 0 in modes or 3 in modes:
-                await evaluate_strategy_3(symbol, df)
+            # Fetch a larger dataset if S4/Renko is active, otherwise default.
+            limit = 1000 if run_s4 else 250
+            df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], limit)
+            
+            if df_raw is None or df_raw.empty:
+                log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping all evaluations.")
+                return
 
-            if 0 in modes or 4 in modes:
-                await evaluate_strategy_4(symbol, df)
+            # --- S4 Renko Path ---
+            if run_s4:
+                renko_df = await asyncio.to_thread(get_renko_data, df_raw.copy(), symbol)
+                if renko_df is not None and not renko_df.empty:
+                    df_s4 = await asyncio.to_thread(calculate_all_indicators, renko_df)
+                    if df_s4 is not None and not df_s4.empty:
+                        await evaluate_strategy_4(symbol, df_s4)
+                else:
+                    log.warning(f"Skipping S4 evaluation for {symbol} due to empty Renko data.")
+            
+            # --- Standard OHLCV Path for other strategies ---
+            if run_others:
+                df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)
+                if df_standard is not None and not df_standard.empty:
+                    if 1 in modes or 0 in modes:
+                        await evaluate_strategy_bb(symbol, df_standard)
+                    if 2 in modes or 0 in modes:
+                        await evaluate_strategy_supertrend(symbol, df_standard)
+                    if 3 in modes or 0 in modes:
+                        await evaluate_strategy_3(symbol, df_standard)
+                else:
+                    log.warning(f"Skipping S1/S2/S3 evaluation for {symbol} due to empty indicator data.")
 
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
@@ -3162,33 +3193,32 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
 
     # --- Primary EMA Trend Filter ---
     s4_params = CONFIG['STRATEGY_4']
-    ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
-    allowed_side = None
-    if ema_period > 0 and 's4_ema_filter' in df.columns:
-        # This is intentional: we check the CURRENT open price against the EMA
-        # of the CLOSED signal candle to ensure the trend is still valid for entry.
-        entry_price_check = df.iloc[-1]['open']
-        ema_value = signal_candle['s4_ema_filter']
-        
-        candle_open = signal_candle['open']
-        candle_close = signal_candle['close']
+    allowed_side = 'BOTH' # Default to allowing both sides
+    if s4_params.get('EMA_FILTER_ENABLED', False):
+        ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
+        if ema_period > 0 and 's4_ema_filter' in df.columns:
+            # This is intentional: we check the CURRENT open price against the EMA
+            # of the CLOSED signal candle to ensure the trend is still valid for entry.
+            entry_price_check = df.iloc[-1]['open']
+            ema_value = signal_candle['s4_ema_filter']
+            
+            candle_open = signal_candle['open']
+            candle_close = signal_candle['close']
 
-        if pd.isna(ema_value) or pd.isna(entry_price_check) or pd.isna(candle_open) or pd.isna(candle_close):
-            _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period, "ema_val": ema_value}, signal_candle=signal_candle)
-            return
-        
-        is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
+            if pd.isna(ema_value) or pd.isna(entry_price_check) or pd.isna(candle_open) or pd.isna(candle_close):
+                _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period, "ema_val": ema_value}, signal_candle=signal_candle)
+                return
+            
+            is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
 
-        if is_cross:
-            _record_rejection(symbol, "S4 Price crossing EMA", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
-            return
-        elif entry_price_check > ema_value:
-            allowed_side = 'BUY'
-        elif entry_price_check < ema_value:
-            allowed_side = 'SELL'
-    else:
-        # If no EMA filter, allow both sides
-        allowed_side = 'BOTH'
+            if is_cross:
+                _record_rejection(symbol, "S4 Price crossing EMA", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
+                return
+            elif entry_price_check > ema_value:
+                allowed_side = 'BUY'
+            elif entry_price_check < ema_value:
+                allowed_side = 'SELL'
+        # If filter is enabled but period is 0 or indicator is missing, we don't restrict the side.
 
     side = None
     # --- Test Order Logic ---
