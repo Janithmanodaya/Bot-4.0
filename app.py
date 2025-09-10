@@ -2568,8 +2568,10 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out['s4_st1'], out['s4_st1_dir'] = supertrend(out, period=s4_params['ST1_PERIOD'], multiplier=s4_params['ST1_MULT'])
         out['s4_st2'], out['s4_st2_dir'] = supertrend(out, period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
         out['s4_st3'], out['s4_st3_dir'] = supertrend(out, period=s4_params['ST3_PERIOD'], multiplier=s4_params['ST3_MULT'])
-        if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
-            out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
+        # Conditionally calculate the EMA filter only if it's enabled in the config
+        if s4_params.get('EMA_FILTER_ENABLED', False):
+            if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
+                out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
     return out
 
