@@ -24,6 +24,7 @@ urllib3<2.0
 # SSH Tunneling
 sshtunnel
 paramiko<3.0
+stocktrends==0.1.6
 
  Firebase
 firebase-admin
