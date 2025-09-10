@@ -2280,46 +2280,71 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
 
 def get_renko_data(df_raw: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:
     """
-    Converts OHLCV data to Renko bricks.
-    The brick size is determined by the ATR(14) of the input data.
+    Converts OHLCV data to Renko bricks using stocktrends.Renko.
+    The brick size is determined by ATR(length) of the input data.
+    This implementation is compatible with stocktrends==0.1.6.
     """
     if df_raw is None or df_raw.empty:
         log.warning(f"Cannot generate Renko data for {symbol}, input DataFrame is empty.")
         return None
 
     try:
-        # 1. Calculate ATR for brick size from the raw data
+        # 1) Calculate ATR for brick size from the raw data
         atr_period = CONFIG.get("ATR_LENGTH", 14)
         atr_series = atr(df_raw, length=atr_period)
-        brick_size = safe_last(atr_series)
-        
-        if brick_size <= 0:
-            log.warning(f"Calculated Renko brick size for {symbol} is {brick_size:.4f}. Cannot generate Renko chart.")
-            return None
-        log.info(f"Generating Renko chart for {symbol} with dynamic ATR({atr_period}) brick size: {brick_size:.4f}")
+        brick_size = float(safe_last(atr_series, default=0.0))
 
-        # 2. Prepare DataFrame for stocktrends library
-        df_for_renko = df_raw.copy()
-        df_for_renko.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-        
-        # 3. Initialize Renko object and build bricks
-        renko_processor = Renko(df_for_renko)
-        renko_processor.set_brick_size(box_size=brick_size, auto=False)
-        renko_df = renko_processor.get_bricks()
-        
-        if renko_df.empty:
+        if not np.isfinite(brick_size) or brick_size <= 0:
+            log.warning(f"Calculated Renko brick size for {symbol} is invalid ({brick_size}). Cannot generate Renko chart.")
+            return None
+
+        log.info(f"Generating Renko chart for {symbol} with dynamic ATR({atr_period}) brick size: {brick_size:.6f}")
+
+        # 2) Prepare DataFrame for stocktrends: requires columns ['date','open','high','low','close']
+        df_for_renko = df_raw[['open', 'high', 'low', 'close']].copy().reset_index()
+        df_for_renko.rename(columns={'close_time': 'date'}, inplace=True)
+
+        # 3) Initialize Renko object and build bricks (API for stocktrends==0.1.6)
+        renko_processor = Renko(df_for_renko[['date', 'open', 'high', 'low', 'close']])
+        try:
+            # Preferred way in stocktrends is setting the attribute
+            renko_processor.brick_size = brick_size
+        except Exception:
+            # Fallback in case attribute setting fails for some reason
+            if hasattr(renko_processor, "set_brick_size"):
+                try:
+                    renko_processor.set_brick_size(box_size=brick_size, auto=False)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        # Use get_ohlc_data if available; fallback to get_bricks for older/other variants
+        if hasattr(renko_processor, "get_ohlc_data"):
+            renko_df = renko_processor.get_ohlc_data()
+        elif hasattr(renko_processor, "get_bricks"):
+            renko_df = renko_processor.get_bricks()
+        else:
+            raise AttributeError("Renko object has neither get_ohlc_data nor get_bricks")
+
+        if renko_df is None or renko_df.empty:
             log.warning(f"Renko chart generation for {symbol} resulted in an empty DataFrame.")
             return None
 
-        # 4. Format the Renko DataFrame for compatibility
-        renko_df.set_index('date', inplace=True)
-        if renko_df.index.tz is None:
-            renko_df.index = renko_df.index.tz_localize('UTC')
-        
-        renko_df['volume'] = 0
+        # 4) Format the Renko DataFrame for downstream indicator calculations
+        if 'date' in renko_df.columns:
+            renko_df.set_index('date', inplace=True)
+
+        # Ensure timezone-aware index
+        try:
+            if getattr(renko_df.index, "tz", None) is None:
+                renko_df.index = pd.to_datetime(renko_df.index).tz_localize('UTC')
+        except Exception:
+            # If localization fails, continue with the existing index
+            pass
+
+        renko_df['volume'] = 0  # No true volume in Renko
         renko_df.index.name = 'close_time'
-        
-        # The library already returns 'open', 'high', 'low', 'close'.
+
+        # Keep only required columns
         return renko_df[['open', 'high', 'low', 'close', 'volume']]
 
     except Exception as e:
@@ -2520,58 +2545,114 @@ indicator_cache = {}
 
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Pure-like function: accepts df (OHLCV), returns df with added indicator columns.
-    Optimized to only calculate indicators for the selected strategy mode.
+    Accepts OHLCV df and returns a copy with indicator columns added.
+    Only computes indicators required by the active strategies (CONFIG['STRATEGY_MODE']).
+    Reduces unnecessary lookback requirements to avoid skipping calculations (especially for Renko/S4).
     """
-    max_lookback = max(
-        CONFIG.get("SMA_LEN", 200),
-        CONFIG.get("STRATEGY_1", {}).get("BB_LENGTH", 20),
-        CONFIG.get("ADX_PERIOD", 14),
-        CONFIG.get("ATR_LENGTH", 14),
-        CONFIG.get("STRATEGY_2", {}).get("SUPERTREND_PERIOD", 7),
-        CONFIG.get("STRATEGY_3", {}).get("SLOW_MA", 21),
-        CONFIG.get("STRATEGY_4", {}).get("ST1_PERIOD", 50),
-        CONFIG.get("STRATEGY_4", {}).get("EMA_FILTER_PERIOD", 200),
-    )
-    if df is None or len(df) < max_lookback:
-        log.warning(f"Not enough data for indicator calculation, need {max_lookback} have {len(df)}")
+    if df is None or df.empty:
         return df.copy()
 
     out = df.copy()
-    modes = CONFIG["STRATEGY_MODE"] # This is now a list
+    modes = CONFIG["STRATEGY_MODE"]  # list of ints
 
-    # ---- Common Indicators (calculated for most strategies) ----
-    out['atr'] = atr(out, CONFIG["ATR_LENGTH"])
-    adx(out, period=CONFIG['ADX_PERIOD'])
-    out['rsi'] = rsi(out['close'], length=CONFIG['RSI_LEN'])
-    macd(out)
+    need_s1 = (0 in modes) or (1 in modes)
+    need_s2 = (0 in modes) or (2 in modes)
+    need_s3 = (0 in modes) or (3 in modes)
+    need_s4 = (0 in modes) or (4 in modes)
 
-    if 0 in modes or 1 in modes:
-        # ---- Strategy 1 (BB) ----
+    # Compute the minimum required lookback dynamically, based on enabled strategies
+    common_lb = max(
+        CONFIG.get("ATR_LENGTH", 14),
+        CONFIG.get("ADX_PERIOD", 14),
+        CONFIG.get("RSI_LEN", 2),
+    )
+
+    required_lb = common_lb
+
+    if need_s1:
         s1_params = CONFIG['STRATEGY_1']
-        out['s1_bbu'], out['s1_bbl'] = bollinger_bands(out['close'], s1_params['BB_LENGTH'], s1_params['BB_STD'])
-    
-    if 0 in modes or 2 in modes:
-        # ---- Strategy 2 (SuperTrend) ----
-        s2_params = CONFIG['STRATEGY_2']
-        out['s2_st'], out['s2_st_dir'] = supertrend(out, period=s2_params['SUPERTREND_PERIOD'], multiplier=s2_params['SUPERTREND_MULTIPLIER'])
-    
-    if 0 in modes or 3 in modes:
-        # ---- Strategy 3 (MA Cross) ----
-        s3_params = CONFIG['STRATEGY_3']
-        out['s3_ma_fast'] = sma(out['close'], s3_params['FAST_MA'])
-        out['s3_ma_slow'] = sma(out['close'], s3_params['SLOW_MA'])
+        required_lb = max(required_lb, int(s1_params.get("BB_LENGTH", 20)))
 
-    if 0 in modes or 4 in modes:
-        # ---- Strategy 4 (3x SuperTrend) ----
+    if need_s2:
+        s2_params = CONFIG['STRATEGY_2']
+        required_lb = max(required_lb, int(s2_params.get("SUPERTREND_PERIOD", 7)))
+
+    if need_s3:
+        s3_params = CONFIG['STRATEGY_3']
+        required_lb = max(required_lb, int(s3_params.get("SLOW_MA", 21)), int(s3_params.get("FAST_MA", 9)))
+
+    if need_s4:
         s4_params = CONFIG['STRATEGY_4']
-        out['s4_st1'], out['s4_st1_dir'] = supertrend(out, period=s4_params['ST1_PERIOD'], multiplier=s4_params['ST1_MULT'])
-        out['s4_st2'], out['s4_st2_dir'] = supertrend(out, period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
-        out['s4_st3'], out['s4_st3_dir'] = supertrend(out, period=s4_params['ST3_PERIOD'], multiplier=s4_params['ST3_MULT'])
-        # Conditionally calculate the EMA filter only if it's enabled in the config
-        if s4_params.get('EMA_FILTER_ENABLED', False):
-            if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
+        required_lb = max(
+            required_lb,
+            int(s4_params.get("ST1_PERIOD", 12)),
+            int(s4_params.get("ST2_PERIOD", 11)),
+            int(s4_params.get("ST3_PERIOD", 10)),
+        )
+        if s4_params.get("EMA_FILTER_ENABLED", False):
+            required_lb = max(required_lb, int(s4_params.get("EMA_FILTER_PERIOD", 200)))
+
+    if len(out) < required_lb:
+        log.info(f"Indicator calc: have {len(out)} bars, required {required_lb}. Proceeding with available data.")
+
+    # ---- Common Indicators (used by multiple strategies) ----
+    try:
+        out['atr'] = atr(out, CONFIG["ATR_LENGTH"])
+    except Exception:
+        log.exception("ATR calculation failed")
+
+    try:
+        adx(out, period=CONFIG['ADX_PERIOD'])
+    except Exception:
+        log.exception("ADX calculation failed")
+
+    try:
+        out['rsi'] = rsi(out['close'], length=CONFIG['RSI_LEN'])
+    except Exception:
+        log.exception("RSI calculation failed")
+
+    try:
+        macd(out)
+    except Exception:
+        log.exception("MACD calculation failed")
+
+    if need_s1:
+        # ---- Strategy 1 (BB) ----
+        try:
+            s1_params = CONFIG['STRATEGY_1']
+            out['s1_bbu'], out['s1_bbl'] = bollinger_bands(out['close'], s1_params['BB_LENGTH'], s1_params['BB_STD'])
+        except Exception:
+            log.exception("Bollinger Bands calculation failed")
+
+    if need_s2:
+        # ---- Strategy 2 (SuperTrend) ----
+        try:
+            s2_params = CONFIG['STRATEGY_2']
+            out['s2_st'], out['s2_st_dir'] = supertrend(out, period=s2_params['SUPERTREND_PERIOD'], multiplier=s2_params['SUPERTREND_MULTIPLIER'])
+        except Exception:
+            log.exception("SuperTrend (S2) calculation failed")
+
+    if need_s3:
+        # ---- Strategy 3 (MA Cross) ----
+        try:
+            s3_params = CONFIG['STRATEGY_3']
+            out['s3_ma_fast'] = sma(out['close'], s3_params['FAST_MA'])
+            out['s3_ma_slow'] = sma(out['close'], s3_params['SLOW_MA'])
+        except Exception:
+            log.exception("S3 moving averages calculation failed")
+
+    if need_s4:
+        # ---- Strategy 4 (3x SuperTrend) ----
+        try:
+            s4_params = CONFIG['STRATEGY_4']
+            out['s4_st1'], out['s4_st1_dir'] = supertrend(out, period=s4_params['ST1_PERIOD'], multiplier=s4_params['ST1_MULT'])
+            out['s4_st2'], out['s4_st2_dir'] = supertrend(out, period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
+            out['s4_st3'], out['s4_st3_dir'] = supertrend(out, period=s4_params['ST3_PERIOD'], multiplier=s4_params['ST3_MULT'])
+            # Conditionally calculate the EMA filter only if it's enabled in the config
+            if s4_params.get('EMA_FILTER_ENABLED', False) and s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
+        except Exception:
+            log.exception("SuperTrend (S4) calculation failed")
 
     return out
 
@@ -5272,28 +5353,47 @@ async def run_test_order(strategy_id: int, symbol: str, full_test: bool):
     strategy function with test parameters.
     """
     try:
-        # Fetch fresh data to ensure all calculations are based on the latest market state
-        df = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], 300)
-        df['atr'] = atr(df, CONFIG["ATR_LENGTH"])
-        
+        timeframe = CONFIG["TIMEFRAME"]
+
         # Use a random side for the test signal
         side = random.choice(['BUY', 'SELL'])
         log.info(f"Running test order with random side: {side}")
         test_params = {'test_signal': side, 'full_test': full_test}
 
-        # Dispatch to the correct strategy evaluation function with test parameters
-        if strategy_id == 1:
-            await evaluate_strategy_bb(symbol, df, **test_params)
-        elif strategy_id == 2:
-            await evaluate_strategy_supertrend(symbol, df, **test_params)
-        elif strategy_id == 3:
-            await evaluate_strategy_3(symbol, df, **test_params)
-        elif strategy_id == 4:
-            await evaluate_strategy_4(symbol, df, **test_params)
+        # Strategy-specific data prep
+        if strategy_id == 4:
+            # S4 requires Renko + its own indicators
+            df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, timeframe, 1000)
+            if df_raw is None or df_raw.empty:
+                await asyncio.to_thread(send_telegram, f"❌ Cannot run S4 test. Could not fetch kline data for `{symbol}`.", parse_mode='Markdown')
+                return
+
+            renko_df = await asyncio.to_thread(get_renko_data, df_raw, symbol)
+            if renko_df is None or renko_df.empty:
+                await asyncio.to_thread(send_telegram, f"❌ Cannot run S4 test. Failed to build Renko data for `{symbol}`.", parse_mode='Markdown')
+                return
+
+            df_ind = await asyncio.to_thread(calculate_all_indicators, renko_df)
+            await evaluate_strategy_4(symbol, df_ind, **test_params)
+
         else:
-            # This case should ideally not be hit due to checks in the command handler
-            await asyncio.to_thread(send_telegram, f"Invalid strategy ID {strategy_id} for test order.")
-            return
+            # S1/S2/S3 use time-based OHLCV with their indicators
+            df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, timeframe, 300)
+            if df_raw is None or df_raw.empty:
+                await asyncio.to_thread(send_telegram, f"❌ Cannot run test. Could not fetch kline data for `{symbol}`.", parse_mode='Markdown')
+                return
+
+            df_ind = await asyncio.to_thread(calculate_all_indicators, df_raw)
+
+            if strategy_id == 1:
+                await evaluate_strategy_bb(symbol, df_ind, **test_params)
+            elif strategy_id == 2:
+                await evaluate_strategy_supertrend(symbol, df_ind, **test_params)
+            elif strategy_id == 3:
+                await evaluate_strategy_3(symbol, df_ind, **test_params)
+            else:
+                await asyncio.to_thread(send_telegram, f"Invalid strategy ID {strategy_id} for test order.")
+                return
 
     except Exception as e:
         log.exception(f"Error during run_test_order for S{strategy_id} on {symbol}")
