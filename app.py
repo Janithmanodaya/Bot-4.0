@@ -81,7 +81,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4"),  # 0=all, or comma-separated, e.g., "1,2"
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5"),  # 0=all, or comma-separated, e.g., "1,2"
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -212,6 +212,9 @@ CONFIG = {
     
     # --- CORE ---
     "SYMBOLS": os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(","),
+    # Advanced strategy symbol restriction (applies to S4 and future S5)
+    "ADVANCED_ALLOWED_SYMBOLS": [s.strip().upper() for s in os.getenv("ADVANCED_ALLOWED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()],
+    "ADVANCED_ALLOW_ALL": os.getenv("ADVANCED_ALLOW_ALL", "false").lower() in ("true", "1", "yes"),
     "TIMEFRAME": os.getenv("TIMEFRAME", "15m"),
     "SCAN_INTERVAL": int(os.getenv("SCAN_INTERVAL", "60")),
     "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
@@ -1617,11 +1620,12 @@ async def evaluate_strategy_5(symbol: str):
     try:
         s5 = CONFIG['STRATEGY_5']
 
-        # Restrict to liquid symbols by default
-        allowed_symbols = ["BTCUSDT", "ETHUSDT"]
-        if symbol not in allowed_symbols:
-            _record_rejection(symbol, "S5 Symbol Restricted", {"symbol": symbol})
-            return
+        # Advanced symbol restriction (configurable)
+        if not is_advanced_symbol_allowed(symbol):
+            allowed_list = CONFIG.get("ADVANCED_ALLOWED_SYMBOLS", [])
+            _record_rejection(symbol, "S5 Symbol Restricted", {"allowed": ",".join(allowed_list) if allowed_list else "ALL"})
+            re_codetunewr</n
+n
 
         # Daily trade limiter per symbol
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
