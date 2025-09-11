@@ -370,40 +370,76 @@ next_scan_time: Optional[datetime] = None
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
-def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
+def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:     """    BestB-effort inference using exchange position update time if available,     otherwise falls back to most recent closed candles.   m """   d ts_ms: Optional[int] = None    try:
+        if client is not None:            positions = client.futures_position_information(symbol=symbol)
+            desired_side = 'LONG' if side == 'BUY' else 'SHORT'            pos = next((p for p in positions if p.get('positionSide') == desired_side or p.get('positionSide') == 'BOTH'), None)
+            if pos:                ut = pos.get('updateTime')
+                if ut:                    ts_ms = int(ut)
+    except Exception:        ts_ms = None
+    return infer_strategy_for_open_trade_at_time_sync(symbol, side, ts_code_mnews</)
+
+
+
+
+
+
+None)
+
+def _nearest_closed_index_for_time(df: pd.DataFrame, ts_ms: Optional[int]) -> Optional[int]:
+    if df is None or df.empty:
+        return None
+    if ts_ms is None:
+        return len(df) - 1  # last closed
+    ts = pd.to_datetime(ts_ms, unit='ms', utc=True)
+    # find index of last candle closed at or before ts
+    idx = df.index.get_indexer([ts], method='pad')[0]
+    if idx is None or idx < 2:
+        return None
+    return idx
+
+def infer_strategy_for_open_trade_at_time_sync(symbol: str, side: str, ts_ms: Optional[int]) -> Optional[int]:
     """
-    Best-effort inference of which strategy likely opened the current position.
-    Priority: 5, 6, 7, 4, 3, 2, 1
-    Uses last closed candles and HTF signals to determine a plausible strategy.
+    Infers strategy likely responsible for an open trade, using signals around a given timestamp (ms).
+    Priority: 5, 6, 7, 4, 3, 2, 1.
+    If ts_ms is None, uses last closed candles.
     """
     try:
-        # Fetch M15 (or configured) data
+        # Fetch M15
         df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 300)
         if df is None or len(df) < 80:
             return None
         df_ind = calculate_all_indicators(df.copy())
 
-        # Helper: get last two closed candles
-        sig = df_ind.iloc[-2]; prev = df_ind.iloc[-3]
+        sig_idx = _nearest_closed_index_for_time(df_ind, ts_ms)
+        if sig_idx is None or sig_idx < 3:
+            return None
 
-        # 1) S5 check (H1 trend + M15 execution)
+        sig = df_ind.iloc[sig_idx - 1]
+        prev = df_ind.iloc[sig_idx - 2]
+        ft = df_ind.iloc[sig_idx] if sig_idx < len(df_ind) else df_ind.iloc[-1]
+
+        # 1) S5 check
         try:
             s5 = CONFIG.get('STRATEGY_5', {})
             df_h1 = fetch_klines_sync(symbol, '1h', 300)
             if df_h1 is not None and len(df_h1) >= 80:
+                h1_idx = _nearest_closed_index_for_time(df_h1, ts_ms)
+                if h1_idx is None or h1_idx < 2:
+                    raise RuntimeError("no h1 index")
                 df_h1 = df_h1.copy()
                 df_h1['ema_fast'] = ema(df_h1['close'], s5.get('EMA_FAST', 21))
                 df_h1['ema_slow'] = ema(df_h1['close'], s5.get('EMA_SLOW', 55))
                 df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=s5.get('H1_ST_PERIOD', 10), multiplier=s5.get('H1_ST_MULT', 3.0))
-                h1_last = df_h1.iloc[-2]
+                h1_last = df_h1.iloc[h1_idx - 1]
                 h1_bull = (h1_last['ema_fast'] > h1_last['ema_slow']) and (h1_last['close'] > h1_last['st_h1'])
                 h1_bear = (h1_last['ema_fast'] < h1_last['ema_slow']) and (h1_last['close'] < h1_last['st_h1'])
+
                 df_ind['s5_m15_ema_fast'] = ema(df_ind['close'], s5.get('EMA_FAST', 21))
                 df_ind['s5_m15_ema_slow'] = ema(df_ind['close'], s5.get('EMA_SLOW', 55))
                 df_ind['s5_atr'] = atr(df_ind, s5.get('ATR_PERIOD', 14))
                 df_ind['s5_rsi'] = rsi(df_ind['close'], s5.get('RSI_PERIOD', 14))
                 df_ind['s5_vol_ma10'] = df_ind['volume'].rolling(10).mean()
-                sig = df_ind.iloc[-2]; prev = df_ind.iloc[-3]
+                sig = df_ind.iloc[sig_idx - 1]; prev = df_ind.iloc[sig_idx - 2]
                 m15_bull_pullback = (sig['s5_m15_ema_fast'] >= sig['s5_m15_ema_slow']) and (prev['low'] <= prev['s5_m15_ema_fast']) and (sig['close'] > sig['s5_m15_ema_fast']) and (sig['close'] > sig['open'])
                 m15_bear_pullback = (sig['s5_m15_ema_fast'] <= sig['s5_m15_ema_slow']) and (prev['high'] >= prev['s5_m15_ema_fast']) and (sig['close'] < sig['s5_m15_ema_fast']) and (sig['close'] < sig['open'])
                 vol_spike = (sig['volume'] >= 1.2 * sig['s5_vol_ma10']) if pd.notna(sig['s5_vol_ma10']) else False
@@ -414,38 +450,40 @@ def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
         except Exception:
             pass
 
-        # 2) S6 check (price action rejection + follow-through)
+        # 2) S6 check
         try:
             s6 = CONFIG.get('STRATEGY_6', {})
             df_ind['s6_atr'] = atr(df_ind, s6.get('ATR_PERIOD', 14))
-            sig = df_ind.iloc[-2]; prev = df_ind.iloc[-3]; ft = df_ind.iloc[-1]
-            # Minimal POI proxy: use recent swing highs/lows on H4/Daily for direction
             df_h4 = fetch_klines_sync(symbol, '4h', 200)
             df_d = fetch_klines_sync(symbol, '1d', 200)
             if df_h4 is not None and df_d is not None and len(df_h4) >= 50 and len(df_d) >= 50:
                 bias_d = _s6_trend_from_swings(df_d, swing_lookback=20)
                 direction = 'BUY' if bias_d == 'BULL' else ('SELL' if bias_d == 'BEAR' else None)
+                sig = df_ind.iloc[sig_idx - 1]; prev = df_ind.iloc[sig_idx - 2]; ft = df_ind.iloc[min(sig_idx, len(df_ind)-1)]
                 if direction == side:
                     is_pin = _s6_is_pin_bar(sig, direction)
                     is_engulf = _s6_is_engulfing_reclaim(sig, prev, direction, float(sig['close']))
-                    vol_ma = float(df_ind['volume'].rolling(int(s6.get('VOL_MA_LEN', 10))).mean().iloc[-2])
+                    vol_ma = float(df_ind['volume'].rolling(int(s6.get('VOL_MA_LEN', 10))).mean().iloc[sig_idx - 1])
                     if (is_pin or is_engulf) and _s6_follow_through_ok(sig, ft, direction, vol_ma, float(s6.get('FOLLOW_THROUGH_RATIO', 0.7))):
                         return 6
         except Exception:
             pass
 
-        # 3) S7 check (H1 BOS + M15 POI touch + rejection)
+        # 3) S7 check
         try:
             s7 = CONFIG.get('STRATEGY_7', {})
             df_h1 = fetch_klines_sync(symbol, '1h', 300)
             if df_h1 is not None and len(df_h1) >= 120:
                 lookback = int(s7.get('BOS_LOOKBACK_H1', 72))
-                sig_h1 = df_h1.iloc[-2]
-                prev_window_high = float(df_h1['high'].iloc[-(lookback+2):-2].max())
-                prev_window_low = float(df_h1['low'].iloc[-(lookback+2):-2].min())
+                h1_idx = _nearest_closed_index_for_time(df_h1, ts_ms)
+                if h1_idx is None or h1_idx < lookback + 2:
+                    raise RuntimeError("no h1 idx")
+                sig_h1 = df_h1.iloc[h1_idx - 1]
+                prev_window_high = float(df_h1['high'].iloc[(h1_idx - lookback - 2):(h1_idx - 1)].max())
+                prev_window_low = float(df_h1['low'].iloc[(h1_idx - lookback - 2):(h1_idx - 1)].min())
                 dir_detected = 'BUY' if float(sig_h1['close']) > prev_window_high else ('SELL' if float(sig_h1['close']) < prev_window_low else None)
                 if dir_detected == side:
-                    # simple rejection near POI ~ close price
+                    sig = df_ind.iloc[sig_idx - 1]; prev = df_ind.iloc[sig_idx - 2]
                     is_pin = _s6_is_pin_bar(sig, side)
                     is_engulf = _s6_is_engulfing_reclaim(sig, prev, side, float(sig['close']))
                     if is_pin or is_engulf:
@@ -453,7 +491,7 @@ def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
         except Exception:
             pass
 
-        # 4) Use simulate functions for S4/S3/S2/S1
+        # 4) Fallback sims
         try:
             sim4 = simulate_strategy_4(symbol, df_ind)
             if sim4 and sim4.get('side') == side:
@@ -479,6 +517,8 @@ def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
         except Exception:
             pass
 
+        return None
+    except Exception:
         return None
     except Exception:
         return None
@@ -919,25 +959,26 @@ def get_public_ip() -> str:
     except Exception:
         return "unable-to-fetch-ip"
 
-def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:
-    # Fetch klines, enough for S4 indicators
-    df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 250)
-    if df is None or df.empty:
-        raise RuntimeError("No kline data to calc default SL/TP")
+def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:     """   t Derive a safe default SL for an imported position.   i Primary: use S4 (ST2). If it produces an invalid stop (wrong side of price),     fall back to ATR-based distance to ensure a valid protective stop.     """   t # Fetch klines   T df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 300)   ' if df is None or df.empty:       = raise RuntimeError("No kline data to calc default SL/TP")
+    # Compute Supertrend (S4 ST2) and ATR     s4_params = CONFIG['STRATEGY_4']   r st2, _ = supertrend(df.copy(), period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])    df ['atr'] = atr(df, CONFIG.get("ATR_LENGTH", 14))
+    st2_val = safe_last(st2)   g current_price = safe_last(df['close'])   _ atr_now = max(1e-9, safe_last(df['atr']))  # avoid zero
+    # Start with ST2-based SL   r stop_price = st2_val
+    # Validate side and correct if invalid    if side == 'BUY':
+        if stop_price >= current_price or stop_price <= 0:            stop_price = current_price - 1.5 * atr_now
+    else:  # SELL        if stop_price <= current_price or stop_price <= 0:
+            stop_price = current_price + 1.5 * atr_now
+    # Final safety: ensure non-negative and reasonable distance    # If still invalid (e.g., NaN), use 2% fallback
+    if not np.isfinite(stop_price) or stop_price <= 0:        pct = 0.02
+        stop_price = current_price * (1 - pct) if side == 'BUY' else current_price * (1 + pct)
+    take_price
 
-    # Calculate S4 Supertrend (ST2 - middle one) to determine the SL
-    s4_params = CONFIG['STRATEGY_4']
-    df['s4_st2'], _ = supertrend(df, period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
 
-    # The stop price is the most recent Supertrend value
-    stop_price = safe_last(df['s4_st2'])
-    current_price = safe_last(df['close'])
 
-    # We are no longer placing a TP, but the function signature requires returning two values.
-    # The calling function (_import_rogue_position_async) ignores the second value.
-    take_price = 0.0
 
-    return stop_price, take_price, current_price
+
+
+
+ke_price, current_price
 
 def timeframe_to_timedelta(tf: str) -> Optional[timedelta]:
     """Converts a timeframe string like '1m', '5m', '1h', '1d' to a timedelta object."""
