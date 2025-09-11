@@ -1407,27 +1407,54 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     upper_band = ma + (std_dev * std)
     lower_band = ma - (std_dev * std)
     return upper_band, lower_band
-# --- Additional Indicators / Helpers for S5-S7 and Small-Account mode ---def don chian_channel(high_series: pd.Series, low_series: pd.Series, length: int) -> tuple[pd.Series, pd.Series]:     upper = high_series.rolling(window=length).max()    lowero = low_series.rolling(window=length).min()     return upper, lower
-def bb_bandwidth(series: pd.Series, length: int, std: float) -> pd.Series:   s ma = series.rolling(window=length).mean()   n sd = series.rolling(window=length).std()   ( upper = ma + (sd * std)   t lower = ma - (sd * std)   d width = (upper - lower) / series.replace(0, np.nan)   a return width.fillna(0)
-def is_small_account(balance: Optional[float] = None) -> bool:   b mode = str(CONFIG.get("SMALL_ACCOUNT_MODE", "auto")).lower()   l if mode in ("true", "1", "yes", "on"):       t return True   a if mode in ("false", "0", "no", "off"):       a return False   " if balance is None:       d try:           a balance = get_account_balance_usdt()       0 except Exception:           d balance = 0.0   R return balanc < CONFIG .get("RISK_SMALL_BALANCE_THRESHOLD", 50.0)
-def get_effective_max_concurrent_trades(balance: Optional[float] = None) -> int:   t base_max = int(CONFIG.get("MAX_CONCURRENT_TRADES", 3))   f if is_small_account(balance):       u return min(base_max, int(CONFIG.get("SMALL_MAX_OPEN_TRADES", 1)))    return base_max
+# --- Additional Indicators / Helpers for S5-S7 and Small-Account mode ---
+def donchian_channel(high_series: pd.Series, low_series: pd.Series, length: int) -> tuple[pd.Series, pd.Series]:
+    upper = high_series.rolling(window=length, min_periods=1).max()
+    lower = low_series.rolling(window=length, min_periods=1).min()
+    return upper, lower
+
+def bb_bandwidth(series: pd.Series, length: int, std: float) -> pd.Series:
+    ma = series.rolling(window=length, min_periods=1).mean()
+    sd = series.rolling(window=length, min_periods=1).std()
+    upper = ma + (sd * std)
+    lower = ma - (sd * std)
+    width = (upper - lower) / series.replace(0, np.nan)
+    return width.fillna(0)
+
+def is_small_account(balance: Optional[float] = None) -> bool:
+    mode = str(CONFIG.get("SMALL_ACCOUNT_MODE", "auto")).lower()
+    if mode in ("true", "1", "yes", "on"):
+        return True
+    if mode in ("false", "0", "no", "off"):
+        return False
+    # auto
+    if balance is None:
+        try:
+            balance = get_account_balance_usdt()
+        except Exception:
+            balance = 0.0
+    return balance < CONFIG.get("RISK_SMALL_BALANCE_THRESHOLD", 50.0)
+
+def get_effective_max_concurrent_trades(balance: Optional[float] = None) -> int:
+    base_max = int(CONFIG.get("MAX_CONCURRENT_TRADES", 3))
+    if is_small_account(balance):
+        return min(base_max, int(CONFIG.get("SMALL_MAX_OPEN_TRADES", 1)))
+    return base_max
+
 def safe_latest_atr_from_df(df: Optional[pd.DataFrame]) -> float:
-    """Return the latest ATR value from df or 0.0 if df is None/empty or ATR can't be computed."""    try:
-        if df is None or getattr(df, 'empty', True):            return 0.0
-        atr_series = atr(df, CONFIG.get("ATR_LENGTH", 14))        if atr_series is None or atr_series.empty:
-            return 0.0        return float(atr_series.iloc[-1])
-    except Exception:        log.exception("safe_latest_atr_from_df failed; returning 0.0")
+    """Return the latest ATR value from df or 0.0 if df is None/empty or ATR can't be computed."""
+    try:
+        if df is None or getattr(df, 'empty', True):
+            return 0.0
+        atr_series = atr(df, CONFIG.get("ATR_LENGTH", 14))
+        if atr_series is None or atr_series.empty:
+            return 0.0
+        return float(atr_series.iloc[-1])
+    except Exception:
+        log.exception("safe_latest_atr_from_df failed; returning 0.0")
         return 0.0
-def safe_last(series: pd.Series, default=0.0) -> fl_codeoanewt</:
 
-
-
-
-
-
-
-
- safe_last(series: pd.Series, default=0.0) -> float:
+def safe_last(series: pd.Series, default=0.0) -> float:
     """Safely get the last value of a series, returning a default if it's empty or the value is NaN."""
     if series is None or series.empty:
         return float(default)
@@ -2702,8 +2729,8 @@ cks ---
 
         try:
             modes = CONFIG["STRATEGY_MODE"]
-            run_s4 = 4 in modes or 0 in modes             run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7]) or 0 in m_codeodnewe</s
-es
+            run_s4 = (4 in modes) or (0 in modes)
+            run_others = (0 in modes) or any(m in modes for m in [1, 2, 3, 5, 6, 7])
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
@@ -2733,6 +2760,12 @@ es
                         await evaluate_strategy_supertrend(symbol, df_standard)
                     if 3 in modes or 0 in modes:
                         await evaluate_strategy_3(symbol, df_standard)
+                    if 5 in modes or 0 in modes:
+                        await evaluate_strategy_5(symbol, df_standard)
+                    if 6 in modes or 0 in modes:
+                        await evaluate_strategy_6(symbol, df_standard)
+                    if 7 in modes or 0 in modes:
+                        await evaluate_strategy_7(symbol, df_standard)
                 else:
                     log.warning(f"Skipping S1/S2/S3 evaluation for {symbol} due to empty indicator data.")
 
@@ -3173,6 +3206,384 @@ async def evaluate_strategy_3(symbol: str, df: pd.DataFrame):
         f"**Leverage:** `{leverage}x`"
     )
     await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+
+async def evaluate_strategy_5(symbol: str, df: pd.DataFrame):
+    """
+    Strategy 5: EMA Pullback
+    BUY:
+      - s5_ema_fast > s5_ema_slow
+      - Signal candle body crosses above s5_ema_fast and previous close below it
+      - RSI within [MIN_RSI, MAX_RSI]
+      - ADX >= ADX_MIN
+    SELL is symmetric.
+    """
+    if df is None or df.empty:
+        return
+
+    s5 = CONFIG.get("STRATEGY_5", {})
+    fast_len = s5.get("EMA_FAST", 21)
+    slow_len = s5.get("EMA_SLOW", 50)
+    min_rsi = s5.get("MIN_RSI", 25)
+    max_rsi = s5.get("MAX_RSI", 65)
+    adx_min = s5.get("ADX_MIN", 10)
+    atr_mult = s5.get("ATR_SL_MULT", 1.8)
+    fallback_sl_pct = CONFIG.get("S3_FALLBACK_SL_PCT", 0.015)  # reuse S3 fallback pct
+
+    if len(df) < max(slow_len, 50):
+        _record_rejection(symbol, "S5-Not enough bars", {"len": len(df), "need": max(slow_len, 50)})
+        return
+
+    sig = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    required_cols = ['s5_ema_fast', 's5_ema_slow', 'rsi', 'adx', 'atr', 'open', 'close']
+    if any(col not in df.columns for col in required_cols) or df[required_cols].iloc[-3:].isnull().values.any():
+        _record_rejection(symbol, "S5-Indicators not ready", {}, signal_candle=sig)
+        return
+
+    def body_crosses(candle, level):
+        return min(candle['open'], candle['close']) < level < max(candle['open'], candle['close'])
+
+    side = None
+    trend_up = sig['s5_ema_fast'] > sig['s5_ema_slow']
+    trend_down = sig['s5_ema_fast'] < sig['s5_ema_slow']
+
+    if trend_up and body_crosses(sig, sig['s5_ema_fast']) and prev['close'] < prev['s5_ema_fast']:
+        side = 'BUY'
+    elif trend_down and body_crosses(sig, sig['s5_ema_fast']) and prev['close'] > prev['s5_ema_fast']:
+        side = 'SELL'
+    else:
+        _record_rejection(symbol, "S5-No EMA pullback cross", {"fast": sig['s5_ema_fast'], "slow": sig['s5_ema_slow']}, signal_candle=sig)
+        return
+
+    # Candle direction filter
+    if side == 'BUY' and prev['close'] <= prev['open']:
+        _record_rejection(symbol, "S5-Prev candle not bullish", {"prev_close": prev['close'], "prev_open": prev['open']})
+        return
+    if side == 'SELL' and prev['close'] >= prev['open']:
+        _record_rejection(symbol, "S5-Prev candle not bearish", {"prev_close": prev['close'], "prev_open": prev['open']})
+        return
+
+    rsi_val = float(sig['rsi'])
+    if not (min_rsi <= rsi_val <= max_rsi):
+        _record_rejection(symbol, "S5-RSI out of range", {"rsi": rsi_val, "min": min_rsi, "max": max_rsi}, signal_candle=sig)
+        return
+
+    adx_val = float(sig['adx'])
+    if adx_val < adx_min:
+        _record_rejection(symbol, "S5-ADX too weak", {"adx": adx_val, "min": adx_min}, signal_candle=sig)
+        return
+
+    entry_price = float(sig['close'])
+    atr_val = float(df['atr'].iloc[-2]) if 'atr' in df.columns else 0.0
+    if atr_val and atr_val > 0:
+        sl_price = entry_price - atr_mult * atr_val if side == 'BUY' else entry_price + atr_mult * atr_val
+    else:
+        sl_price = entry_price * (1 - fallback_sl_pct) if side == 'BUY' else entry_price * (1 + fallback_sl_pct)
+
+    distance = abs(entry_price - sl_price)
+    if distance <= 0:
+        _record_rejection(symbol, "S5-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=sig)
+        return
+
+    balance = await asyncio.to_thread(get_account_balance_usdt)
+    risk_usdt = calculate_risk_amount(balance, strategy_id=5)
+    ideal_qty = risk_usdt / distance
+    ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+    qty_min = min_notional / entry_price if entry_price > 0 else 0.0
+    qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+    final_qty = max(ideal_qty, qty_min)
+
+    if final_qty <= 0:
+        _record_rejection(symbol, "S5-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=sig)
+        return
+
+    notional = final_qty * entry_price
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+
+    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+    order_id = str(limit_order_resp.get('orderId'))
+    pending_order_id = f"{symbol}_{order_id}"
+
+    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+    pending_meta = {
+        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+        "side": side, "qty": final_qty, "limit_price": entry_price,
+        "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
+        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "strategy_id": 5,
+        "atr_at_entry": atr_val,
+        "trailing": CONFIG["TRAILING_ENABLED"]
+    }
+
+    async with pending_limit_orders_lock:
+        pending_limit_orders[pending_order_id] = pending_meta
+        await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+    log.info(f"Placed pending limit order (S5-EMA Pullback): {pending_meta}")
+    title = "⏳ *New Pending Order: S5-EMA Pullback*"
+    new_order_msg = (
+        f"{title}\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Side:** `{side}`\n"
+        f"**Price:** `{entry_price:.4f}`\n"
+        f"**Qty:** `{final_qty}`\n"
+        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Leverage:** `{leverage}x`"
+    )
+    await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+
+async def evaluate_strategy_6(symbol: str, df: pd.DataFrame):
+    """
+    Strategy 6: Donchian Breakout
+    BUY on close crossing above upper channel with ADX confirmation.
+    SELL symmetric. SL uses opposite channel ± ATR buffer.
+    """
+    if df is None or df.empty:
+        return
+
+    s6 = CONFIG.get("STRATEGY_6", {})
+    adx_min = s6.get("ADX_MIN", 15)
+    atr_buf = s6.get("ATR_BUFFER_MULT", 0.3)
+
+    if len(df) < 30:
+        _record_rejection(symbol, "S6-Not enough bars", {"len": len(df)})
+        return
+
+    sig = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    required_cols = ['s6_donchian_high', 's6_donchian_low', 'adx', 'atr', 'open', 'close']
+    if any(col not in df.columns for col in required_cols) or df[required_cols].iloc[-3:].isnull().values.any():
+        _record_rejection(symbol, "S6-Indicators not ready", {}, signal_candle=sig)
+        return
+
+    prev_above_high = prev['close'] > prev['s6_donchian_high']
+    prev_below_low = prev['close'] < prev['s6_donchian_low']
+    sig_above_high = sig['close'] > sig['s6_donchian_high']
+    sig_below_low = sig['close'] < sig['s6_donchian_low']
+
+    side = None
+    if not prev_above_high and sig_above_high:
+        side = 'BUY'
+    elif not prev_below_low and sig_below_low:
+        side = 'SELL'
+    else:
+        _record_rejection(symbol, "S6-No Donchian breakout", {"sig_close": sig['close'], "high": sig['s6_donchian_high'], "low": sig['s6_donchian_low']}, signal_candle=sig)
+        return
+
+    # Candle direction filter like others
+    if side == 'BUY' and prev['close'] <= prev['open']:
+        _record_rejection(symbol, "S6-Prev candle not bullish", {"prev_close": prev['close'], "prev_open": prev['open']})
+        return
+    if side == 'SELL' and prev['close'] >= prev['open']:
+        _record_rejection(symbol, "S6-Prev candle not bearish", {"prev_close": prev['close'], "prev_open": prev['open']})
+        return
+
+    adx_val = float(sig['adx'])
+    if adx_val < adx_min:
+        _record_rejection(symbol, "S6-ADX too weak", {"adx": adx_val, "min": adx_min}, signal_candle=sig)
+        return
+
+    entry_price = float(sig['close'])
+    atr_val = float(df['atr'].iloc[-2]) if 'atr' in df.columns else 0.0
+
+    if side == 'BUY':
+        base_sl = float(sig['s6_donchian_low'])
+        sl_price = base_sl - atr_buf * atr_val if atr_val > 0 else base_sl
+    else:
+        base_sl = float(sig['s6_donchian_high'])
+        sl_price = base_sl + atr_buf * atr_val if atr_val > 0 else base_sl
+
+    distance = abs(entry_price - sl_price)
+    if distance <= 0:
+        _record_rejection(symbol, "S6-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=sig)
+        return
+
+    balance = await asyncio.to_thread(get_account_balance_usdt)
+    risk_usdt = calculate_risk_amount(balance, strategy_id=6)
+    ideal_qty = risk_usdt / distance
+    ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+    qty_min = min_notional / entry_price if entry_price > 0 else 0.0
+    qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+    final_qty = max(ideal_qty, qty_min)
+
+    if final_qty <= 0:
+        _record_rejection(symbol, "S6-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=sig)
+        return
+
+    notional = final_qty * entry_price
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+
+    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+    order_id = str(limit_order_resp.get('orderId'))
+    pending_order_id = f"{symbol}_{order_id}"
+
+    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+    pending_meta = {
+        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+        "side": side, "qty": final_qty, "limit_price": entry_price,
+        "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
+        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "strategy_id": 6,
+        "atr_at_entry": atr_val,
+        "trailing": CONFIG["TRAILING_ENABLED"]
+    }
+
+    async with pending_limit_orders_lock:
+        pending_limit_orders[pending_order_id] = pending_meta
+        await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+    log.info(f"Placed pending limit order (S6-Donchian): {pending_meta}")
+    title = "⏳ *New Pending Order: S6-Donchian*"
+    new_order_msg = (
+        f"{title}\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Side:** `{side}`\n"
+        f"**Price:** `{entry_price:.4f}`\n"
+        f"**Qty:** `{final_qty}`\n"
+        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Leverage:** `{leverage}x`"
+    )
+    await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+
+async def evaluate_strategy_7(symbol: str, df: pd.DataFrame):
+    """
+    Strategy 7: Bollinger Squeeze Breakout
+    BUY: previous bbwidth below threshold, signal close breaks above upper band.
+    SELL: previous bbwidth below threshold, signal close breaks below lower band.
+    SL: ATR-based.
+    """
+    if df is None or df.empty:
+        return
+
+    s7 = CONFIG.get("STRATEGY_7", {})
+    width_thresh = s7.get("BB_WIDTH_PCT_THRESH", 0.03)
+    atr_mult = s7.get("ATR_SL_MULT", 1.6)
+
+    if len(df) < 30:
+        _record_rejection(symbol, "S7-Not enough bars", {"len": len(df)})
+        return
+
+    sig = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    required_cols = ['s7_bbu', 's7_bbl', 's7_bbwidth', 'atr', 'open', 'close']
+    if any(col not in df.columns for col in required_cols) or df[required_cols].iloc[-3:].isnull().values.any():
+        _record_rejection(symbol, "S7-Indicators not ready", {}, signal_candle=sig)
+        return
+
+    prev_squeeze = float(prev['s7_bbwidth']) <= width_thresh
+    side = None
+    if prev_squeeze and sig['close'] > sig['s7_bbu']:
+        side = 'BUY'
+    elif prev_squeeze and sig['close'] < sig['s7_bbl']:
+        side = 'SELL'
+    else:
+        _record_rejection(symbol, "S7-No squeeze breakout", {"sig_close": sig['close'], "bbu": sig['s7_bbu'], "bbl": sig['s7_bbl'], "prev_width": float(prev['s7_bbwidth']), "thresh": width_thresh}, signal_candle=sig)
+        return
+
+    # Candle direction filter
+    if side == 'BUY' and prev['close'] <= prev['open']:
+        _record_rejection(symbol, "S7-Prev candle not bullish", {"prev_close": prev['close'], "prev_open": prev['open']})
+        return
+    if side == 'SELL' and prev['close'] >= prev['open']:
+        _record_rejection(symbol, "S7-Prev candle not bearish", {"prev_close": prev['close'], "prev_open": prev['open']})
+        return
+
+    entry_price = float(sig['close'])
+    atr_val = float(df['atr'].iloc[-2]) if 'atr' in df.columns else 0.0
+    if atr_val and atr_val > 0:
+        sl_price = entry_price - atr_mult * atr_val if side == 'BUY' else entry_price + atr_mult * atr_val
+    else:
+        # Fallback 1.5% if ATR missing
+        sl_price = entry_price * (1 - 0.015) if side == 'BUY' else entry_price * (1 + 0.015)
+
+    distance = abs(entry_price - sl_price)
+    if distance <= 0:
+        _record_rejection(symbol, "S7-Zero distance for sizing", {"entry": entry_price, "sl": sl_price}, signal_candle=sig)
+        return
+
+    balance = await asyncio.to_thread(get_account_balance_usdt)
+    risk_usdt = calculate_risk_amount(balance, strategy_id=7)
+    ideal_qty = risk_usdt / distance
+    ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+    qty_min = min_notional / entry_price if entry_price > 0 else 0.0
+    qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+    final_qty = max(ideal_qty, qty_min)
+
+    if final_qty <= 0:
+        _record_rejection(symbol, "S7-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=sig)
+        return
+
+    notional = final_qty * entry_price
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+    leverage = max(1, min(leverage, max_leverage))
+    take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
+
+    limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+    order_id = str(limit_order_resp.get('orderId'))
+    pending_order_id = f"{symbol}_{order_id}"
+
+    candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+    expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+    expiry_time = df.index[-1] + (candle_duration * (expiry_candles - 1))
+
+    pending_meta = {
+        "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+        "side": side, "qty": final_qty, "limit_price": entry_price,
+        "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
+        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "expiry_time": expiry_time.isoformat(),
+        "strategy_id": 7,
+        "atr_at_entry": atr_val,
+        "trailing": CONFIG["TRAILING_ENABLED"]
+    }
+
+    async with pending_limit_orders_lock:
+        pending_limit_orders[pending_order_id] = pending_meta
+        await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+    log.info(f"Placed pending limit order (S7-BB Squeeze): {pending_meta}")
+    title = "⏳ *New Pending Order: S7-BB Squeeze*"
+    new_order_msg = (
+        f"{title}\n\n"
+        f"**Symbol:** `{symbol}`\n"
+        f"**Side:** `{side}`\n"
+        f"**Price:** `{entry_price:.4f}`\n"
+        f"**Qty:** `{final_qty}`\n"
+        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Leverage:** `{leverage}x`"
+    )
+    await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
 
 def simulate_strategy_4(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
