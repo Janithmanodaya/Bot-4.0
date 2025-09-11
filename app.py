@@ -3902,11 +3902,19 @@ def monitor_thread_func():
                                 "atr_at_entry": p_meta.get('atr_at_entry')
                             }
                             # --- S5 initialization of R and TP1 ---
-                            if meta['strategy_id'] == 5:                                 r_dist = abs(actual_entry_price - stop_price)                                 meta['s5_initial_sl'] = stop_price                                 meta['s5_r_per_unit'] = r_dist                                 if r_dist and r_dist > 0:                                     tp1_price = actual_entry_price + r_dist if meta['side'] == 'BUY' else actual_entry_price - r_dist                                     meta['s5_tp1_price'] = tp1_price                                 else:                                     meta['s5_tp1_price'] = None                                 meta['trade_phase'] = 0                                # Activate trailing immediately (generic ATR trail) until custom logic is added
-                                meta['trailing_active'] = True                                meta['be_moved'] = T_coderunewe</
-
-
-ase'] = 0
+                            if meta['strategy_id'] == 5:
+                                r_dist = abs(actual_entry_price - stop_price)
+                                meta['s5_initial_sl'] = stop_price
+                                meta['s5_r_per_unit'] = r_dist
+                                if r_dist and r_dist > 0:
+                                    tp1_price = actual_entry_price + r_dist if meta['side'] == 'BUY' else actual_entry_price - r_dist
+                                    meta['s5_tp1_price'] = tp1_price
+                                else:
+                                    meta['s5_tp1_price'] = None
+                                # Management state
+                                meta['trade_phase'] = 0  # 0: pre-TP1, 1: after TP1 (trailing active)
+                                meta['be_moved'] = False
+                                meta['trailing_active'] = False
 
                             with managed_trades_lock:
                                 managed_trades[trade_id] = meta
@@ -4323,7 +4331,7 @@ ase'] = 0
                             st1 = forming_candle['s4_st1']
                             st2 = forming_candle['s4_st2']
                             st3 = forming_candle['s4_st3']
-
+                            
                             if side == 'BUY' and (current_price < st1 or current_price < st2 or current_price < st3):
                                 price_cross_st = True
                             elif side == 'SELL' and (current_price > st1 or current_price > st2 or current_price > st3):
@@ -4415,6 +4423,116 @@ ase'] = 0
                                 if trade_to_update_in_db:
                                     add_managed_trade_to_db(trade_to_update_in_db)
                                     # send_telegram(f"📈 S4 Trailing SL updated for {tid} ({sym}) to `{new_sl:.4f}`", parse_mode='Markdown')
+                        continue
+
+                    elif strategy_id == '5':
+                        # --- Strategy 5: In-Trade Manager ---
+                        s5 = CONFIG['STRATEGY_5']
+                        entry_price = meta['entry_price']
+                        current_price = float(df_monitor['close'].iloc[-1])
+                        r_dist = float(meta.get('s5_r_per_unit') or abs(entry_price - meta.get('s5_initial_sl', entry_price)))
+                        if r_dist <= 0:
+                            # Cannot manage without valid R
+                            continue
+
+                        # 1) Move SL to BE at +0.5R
+                        if not meta.get('be_moved', False):
+                            half_r_price = entry_price + 0.5 * r_dist if side == 'BUY' else entry_price - 0.5 * r_dist
+                            if (side == 'BUY' and current_price >= half_r_price) or (side == 'SELL' and current_price <= half_r_price):
+                                try:
+                                    cancel_trade_sltp_orders_sync(meta)
+                                    new_sl = entry_price
+                                    new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                                    with managed_trades_lock:
+                                        if tid in managed_trades:
+                                            managed_trades[tid].update({
+                                                'sl': new_sl,
+                                                'sltp_orders': new_orders,
+                                                'be_moved': True
+                                            })
+                                            add_managed_trade_to_db(managed_trades[tid])
+                                    send_telegram(f"📈 S5 BE moved for {sym}. SL set to BE at {new_sl:.4f}.")
+                                except Exception as e:
+                                    log_and_send_error(f"Failed to move S5 SL to BE for {tid}", e)
+                                # fall-through to TP1 logic if price already beyond
+
+                        # 2) Partial 30% at 1R, then activate trailing
+                        trade_phase = int(meta.get('trade_phase', 0))
+                        if trade_phase == 0:
+                            tp1_price = meta.get('s5_tp1_price')
+                            if tp1_price and (
+                                (side == 'BUY' and current_price >= tp1_price) or
+                                (side == 'SELL' and current_price <= tp1_price)
+                            ):
+                                try:
+                                    qty_to_close = round_qty(sym, meta['initial_qty'] * s5.get('TP1_CLOSE_PCT', 0.3))
+                                    if qty_to_close > 0:
+                                        close_partial_market_position_sync(sym, side, qty_to_close)
+                                        # reduce qty and move SL to BE if not already
+                                        remaining_qty = max(0.0, meta['qty'] - qty_to_close)
+                                        cancel_trade_sltp_orders_sync(meta)
+                                        new_sl = entry_price  # BE after TP1
+                                        new_orders = {}
+                                        if remaining_qty > 0:
+                                            new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=remaining_qty)
+                                        with managed_trades_lock:
+                                            if tid in managed_trades:
+                                                managed_trades[tid].update({
+                                                    'qty': remaining_qty,
+                                                    'sl': new_sl,
+                                                    'sltp_orders': new_orders,
+                                                    'trade_phase': 1,
+                                                    'be_moved': True,
+                                                    'trailing_active': True  # Activate trailing after TP1
+                                                })
+                                                add_managed_trade_to_db(managed_trades[tid])
+                                        send_telegram(f"✅ S5 TP1 hit for {sym}. Closed {s5.get('TP1_CLOSE_PCT',0.3)*100:.0f}%, SL to BE, trailing activated.")
+                                        continue
+                                except Exception as e:
+                                    log_and_send_error(f"Failed S5 TP1 management for {tid}", e)
+
+                        # 3) Hybrid ATR/pivot trailing with buffer when trailing_active
+                        if meta.get('trailing_active', False) and meta.get('trailing', True) and meta.get('qty', 0) > 0:
+                            try:
+                                # Compute ATR on monitor data
+                                atr_series = atr(df_monitor, s5.get('ATR_PERIOD', 14))
+                                atr_now = safe_last(atr_series, default=0.0)
+                                if atr_now <= 0:
+                                    continue
+                                buffer = s5.get('TRAIL_BUFFER_MULT', 0.25) * atr_now
+                                atr_trail_component = s5.get('TRAIL_ATR_MULT', 1.0) * atr_now
+
+                                # Pivot: recent swing low/high
+                                pivot_lookback = 5
+                                pivot_low = swing_low(df_monitor['low'], lookback=pivot_lookback)
+                                pivot_high = swing_high(df_monitor['high'], lookback=pivot_lookback)
+
+                                current_sl = float(meta.get('sl', entry_price))
+
+                                new_sl = None
+                                if side == 'BUY':
+                                    candidate = max(pivot_low, current_price - atr_trail_component) - buffer
+                                    # ensure SL stays below price and only ratchets up
+                                    if candidate > current_sl and candidate < current_price:
+                                        new_sl = candidate
+                                else:  # SELL
+                                    candidate = min(pivot_high, current_price + atr_trail_component) + buffer
+                                    if candidate < current_sl and candidate > current_price:
+                                        new_sl = candidate
+
+                                if new_sl:
+                                    log.info(f"S5 Trailing SL update for {tid}. Old: {current_sl:.4f}, New: {new_sl:.4f}")
+                                    cancel_trade_sltp_orders_sync(meta)
+                                    new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
+                                    with managed_trades_lock:
+                                        if tid in managed_trades:
+                                            managed_trades[tid].update({
+                                                'sl': new_sl,
+                                                'sltp_orders': new_orders
+                                            })
+                                            add_managed_trade_to_db(managed_trades[tid])
+                            except Exception as e:
+                                log_and_send_error(f"Failed S5 trailing management for {tid}", e)
                         continue
 
                     # --- Generic BE & Trailing Logic ---
