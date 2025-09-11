@@ -146,6 +146,17 @@ CONFIG = {
         "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
         "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
     },
+    "STRATEGY_6": { # Price-Action only (single high-probability trade per day)
+        "ATR_PERIOD": int(os.getenv("S6_ATR_PERIOD", "14")),
+        "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER", "0.25")),
+        "FOLLOW_THROUGH_RANGE_RATIO": float(os.getenv("S6_FOLLOW_THROUGH_RATIO", "0.7")),
+        "VOL_MA_LEN": int(os.getenv("S6_VOL_MA_LEN", "10")),
+        "LIMIT_EXPIRY_CANDLES": int(os.getenv("S6_LIMIT_EXPIRY_CANDLES", "3")),
+        "SESSION_START_UTC_HOUR": int(os.getenv("S6_SESSION_START_HOUR", "7")),
+        "SESSION_END_UTC_HOUR": int(os.getenv("S6_SESSION_END_HOUR", "15")),
+        "RISK_USD": float(os.getenv("S6_RISK_USD", "0.50")),
+        "ENFORCE_ONE_TRADE_PER_DAY": os.getenv("S6_ENFORCE_ONE_PER_DAY", "true").lower() in ("true", "1", "yes"),
+    },
     "STRATEGY_7": { # SMC (Smart Money Concepts) execution - price-action only
         "ATR_PERIOD": int(os.getenv("S7_ATR_PERIOD", "14")),
         "ATR_BUFFER": float(os.getenv("S7_ATR_BUFFER", "0.25")),
@@ -154,6 +165,8 @@ CONFIG = {
         "REJECTION_WICK_RATIO": float(os.getenv("S7_REJECTION_WICK_RATIO", "0.6")),
         "LIMIT_EXPIRY_CANDLES": int(os.getenv("S7_LIMIT_EXPIRY_CANDLES", "4")),
         "USE_MIN_NOTIONAL": os.getenv("S7_USE_MIN_NOTIONAL", "true").lower() in ("true", "1", "yes"),
+        "ALLOW_M5_MICRO_CONFIRM": os.getenv("S7_ALLOW_M5_MICRO_CONFIRM", "false").lower() in ("true", "1", "yes"),
+        "SYMBOLS": os.getenv("S7_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
         "RISK_USD": float(os.getenv("S7_RISK_USD", "0.0")),  # kept optional; default 0 uses min notional
     },
     "STRATEGY_EXIT_PARAMS": {
@@ -184,27 +197,6 @@ CONFIG = {
         },
         "7": {  # SMC trailing is structural; keep generic minimal trailing disabled by default
             "ATR_MULTIPLIER": float(os.getenv("S7_TRAIL_ATR_MULT", "0.0")),
-            "BE_TRIGGER": 0.0,
-            "BE_SL_OFFSET": 0.0
-        }
-    },
-        "2": {  # SuperTrend strategy
-            "ATR_MULTIPLIER": float(os.getenv("S2_ATR_MULTIPLIER", "2.0")),
-            "BE_TRIGGER": float(os.getenv("S2_BE_TRIGGER", "0.006")),
-            "BE_SL_OFFSET": float(os.getenv("S2_BE_SL_OFFSET", "0.001"))
-        },
-        "3": {  # Advanced SuperTrend strategy (custom trailing logic)
-            "ATR_MULTIPLIER": float(os.getenv("S3_TRAIL_ATR_MULT", "3.0")), # Value from S3 config
-            "BE_TRIGGER": 0.0, # Not used in S3
-            "BE_SL_OFFSET": 0.0 # Not used in S3
-        },
-        "4": {  # Advanced SuperTrend v2 strategy (custom trailing logic)
-            "ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")), # Value from S4 config
-            "BE_TRIGGER": 0.0, # Not used in S4
-            "BE_SL_OFFSET": 0.0 # Not used in S4
-        },
-        "5": {  # Advanced H1/M15 strategy (custom trailing logic)
-            "ATR_MULTIPLIER": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
             "BE_TRIGGER": 0.0,
             "BE_SL_OFFSET": 0.0
         }
@@ -722,29 +714,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-# ------------- Debug Endpoints -------------@app.get("/debug/scan_once")
-async def debug_scan_once(symbols: Optional[str] = None):    """
-    Runs a one-time evaluation-and-enter pass for the provided symbols in DRY_RUN mode    so no real orders are placed. Returns a simple JSON summary.
-    Usage: GET /debug/scan_once?symbols=BTCUSDT,ETHUSDT    """
-    # Parse symbol list or default to configured symbols    if symbols:
-        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]    else:
+
+# ------------- Debug Endpoints -------------
+@app.get("/debug/scan_once")
+async def debug_scan_once(symbols: Optional[str] = None):
+    """
+    Runs a one-time evaluation-and-enter pass for the provided symbols in DRY_RUN mode
+    so no real orders are placed. Returns a simple JSON summary.
+    Usage: GET /debug/scan_once?symbols=BTCUSDT,ETHUSDT
+    """
+    # Parse symbol list or default to configured symbols
+    if symbols:
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
         sym_list = [s.strip().upper() for s in CONFIG.get("SYMBOLS", []) if s.strip()]
-    # Force DRY_RUN for safety during debug scan    original_dry = CONFIG.get("DRY_RUN", False)
+
+    # Force DRY_RUN for safety during debug scan
+    original_dry = CONFIG.get("DRY_RUN", False)
     CONFIG["DRY_RUN"] = True
-    results = {}    try:
-        for s in sym
 
+    results = {}
+    try:
+        for s in sym_list:
+            try:
+                await evaluate_and_enter(s)
+                results[s] = "ok"
+            except Exception as e:
+                results[s] = f"error: {type(e).__name__}: {e}"
+        return {"status": "ok", "dry_run": True, "symbols": sym_list, "results": results}
+    finally:
+        # Restore original DRY_RUN configuration
+        CONFIG["DRY_RUN"] = original_dry
 
-
-
-
-
-
-
-
-
-)
-
+# -------------------------
+# Utilities
 # -------------------------
 # Utilities
 # -------------------------
@@ -2671,8 +2674,8 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
-    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG['STRATEGY_5']         out['s5_m15_ema_fast']st'] = ema(out['close'], s5['EMA_FAST'])
-        out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLOW'])
+    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG['STRATEGY_5']         out['s5_m15_ema_fast'] = ema(out['close'], s5['EMA_FAST'])         out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLO_code
+W'])
 
     return out
 
@@ -2768,11 +2771,12 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_3(symbol, df_standard)
                     if run_s5:
                         await evaluate_strategy_5(symbol, df_standard)
-                    if run_s6:                         await evaluate_strategy_6(symbol, df_standard)                    if
-)
+                    if run_s6:
+                        await evaluate_strategy_6(symbol, df_standard)
+                    if 7 in modes or 0 in modes:
+                        await evaluate_strategy_7(symbol, df_standard)
                 else:
                     log.warning(f"Skipping S1/S2/S3/S5/S6 evaluation for {symbol} due to empty indicator data.")
-
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
@@ -4089,6 +4093,178 @@ async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
         await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"S6 evaluation error for {symbol}", e)
+        return
+
+async def evaluate_strategy_7(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 7: SMC execution (price-action only, min-notional sizing)
+    - Allowed only on selected symbols (default: BTCUSDT, ETHUSDT)
+    - HTF BOS on H1
+    - POI as an H1 Order Block (preferred) or simple recent level
+    - M15 entry only (default), rejection or engulfing reclaim at POI
+    - SL: beyond OB extreme +/- ATR buffer (0.25*ATR by default)
+    - Qty: minimum notional only (no fixed risk by default)
+    """
+    try:
+        s7 = CONFIG['STRATEGY_7']
+        allowed = [s.strip().upper() for s in s7.get('SYMBOLS', []) if s.strip()]
+        if allowed and symbol not in allowed:
+            _record_rejection(symbol, "S7-Restricted symbol", {"allowed": ",".join(allowed)})
+            return
+
+        if df_m15 is None or len(df_m15) < 80:
+            _record_rejection(symbol, "S7-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
+            return
+
+        # Clone and compute local ATR/vol
+        df_m15 = df_m15.copy()
+        atr_period = int(s7.get('ATR_PERIOD', 14))
+        df_m15['s7_atr'] = atr(df_m15, atr_period)
+        s7_atr = float(df_m15['s7_atr'].iloc[-2]) if 's7_atr' in df_m15.columns else 0.0
+        if s7_atr <= 0:
+            _record_rejection(symbol, "S7-ATR not ready", {})
+            return
+
+        # HTF: H1 BOS detection
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < 120:
+            _record_rejection(symbol, "S7-Not enough H1 data", {"len": len(df_h1) if df_h1 is not None else 0})
+            return
+        df_h1 = df_h1.copy()
+        lookback = int(s7.get('BOS_LOOKBACK_H1', 72))
+        sig_h1 = df_h1.iloc[-2]  # last closed H1
+        prev_window_high = float(df_h1['high'].iloc[-(lookback+2):-2].max())
+        prev_window_low = float(df_h1['low'].iloc[-(lookback+2):-2].min())
+
+        direction = None
+        if float(sig_h1['close']) > prev_window_high:
+            direction = 'BUY'
+        elif float(sig_h1['close']) < prev_window_low:
+            direction = 'SELL'
+        else:
+            _record_rejection(symbol, "S7-No BOS on H1", {"close": float(sig_h1['close']), "HH": prev_window_high, "LL": prev_window_low})
+            return
+
+        # POI: simple H1 OB zone near BOS
+        # Find last opposite color candle(s) before the BOS candle
+        bos_idx = df_h1.index.get_loc(sig_h1.name)
+        start_scan = max(0, bos_idx - 10)
+        segment = df_h1.iloc[start_scan:bos_idx]
+        ob_lows = []
+        ob_highs = []
+        for i in range(len(segment)-1, -1, -1):
+            c = segment.iloc[i]
+            is_opp = (direction == 'BUY' and c['close'] < c['open']) or (direction == 'SELL' and c['close'] > c['open'])
+            if is_opp:
+                ob_lows.append(float(c['low']))
+                ob_highs.append(float(c['high']))
+                if len(ob_lows) >= 3:  # use up to 3-bar cluster
+                    break
+        if ob_lows and ob_highs:
+            ob_low = min(ob_lows)
+            ob_high = max(ob_highs)
+            poi_level = (ob_low + ob_high) / 2.0
+            ob_range = ob_high - ob_low
+        else:
+            # Fallback: use previous swing level
+            poi_level = prev_window_high if direction == 'BUY' else prev_window_low
+            ob_low = ob_high = poi_level
+            ob_range = 0.0
+
+        # M15 entry only
+        sig = df_m15.iloc[-2]
+        prev = df_m15.iloc[-3]
+        ft = df_m15.iloc[-1]
+
+        # Check touch of POI on signal candle
+        def _within_poi(cndl: pd.Series, lvl: float, atr_val: float) -> bool:
+            h = float(cndl['high']); l = float(cndl['low'])
+            tol = 0.25 * float(atr_val)
+            return (l <= lvl <= h) or abs(h - lvl) <= tol or abs(l - lvl) <= tol
+
+        if not _within_poi(sig, poi_level, s7_atr):
+            _record_rejection(symbol, "S7-No POI touch on M15", {"poi": poi_level})
+            return
+
+        # Rejection: pin bar or engulfing reclaim of POI
+        ob_min_body_ratio = float(s7.get('OB_MIN_BODY_RATIO', 0.5))
+        # Use existing S6 helpers
+        is_pin = _s6_is_pin_bar(sig, direction)
+        is_engulf = _s6_is_engulfing_reclaim(sig, prev, direction, poi_level)
+        if not (is_pin or is_engulf):
+            _record_rejection(symbol, "S7-No valid rejection", {"pin": is_pin, "engulf": is_engulf})
+            return
+
+        # Follow-through on next candle using S6 helper
+        vol_ma10 = float(df_m15['volume'].rolling(10).mean().iloc[-2])
+        if not _s6_follow_through_ok(sig, ft, direction, vol_ma10, 0.7):
+            _record_rejection(symbol, "S7-No follow-through", {"vol_ma10": vol_ma10})
+            return
+
+        # Entry and SL
+        entry_price = float(sig['close'])
+        if direction == 'BUY':
+            zone_extreme = ob_low if ob_range > 0 else float(sig['low'])
+            stop_price = zone_extreme - float(s7.get('ATR_BUFFER', 0.25)) * s7_atr
+            side = 'BUY'
+        else:
+            zone_extreme = ob_high if ob_range > 0 else float(sig['high'])
+            stop_price = zone_extreme + float(s7.get('ATR_BUFFER', 0.25)) * s7_atr
+            side = 'SELL'
+
+        # Sizing: min-notional only by default
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+        if qty_min <= 0:
+            _record_rejection(symbol, "S7-Qty min invalid", {"min_notional": min_notional})
+            return
+
+        final_qty = qty_min
+        notional = final_qty * entry_price
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        # With min-notional, use notional as margin basis -> leverage=1 unless capped by config
+        uncapped_leverage = 1
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place limit order with SL only
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = int(s7.get("LIMIT_EXPIRY_CANDLES", 4))
+        expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": None, "leverage": leverage,
+            "risk_usdt": 0.0, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 7,
+            "atr_at_entry": s7_atr,
+            "trailing": False,
+            "s7_poi_level": poi_level,
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S7-SMC"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S7 evaluation error for {symbol}", e)
         return
 
 async def force_trade_entry(strategy_id: int, symbol: str, side: str):
