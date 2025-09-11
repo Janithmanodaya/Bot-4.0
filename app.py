@@ -697,6 +697,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+# ------------- Debug Endpoints -------------@app.get("/debug/scan_once")
+async def debug_scan_once(symbols: Optional[str] = None):    """
+    Runs a one-time evaluation-and-enter pass for the provided symbols in DRY_RUN mode    so no real orders are placed. Returns a simple JSON summary.
+    Usage: GET /debug/scan_once?symbols=BTCUSDT,ETHUSDT    """
+    # Parse symbol list or default to configured symbols    if symbols:
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]    else:
+        sym_list = [s.strip().upper() for s in CONFIG.get("SYMBOLS", []) if s.strip()]
+    # Force DRY_RUN for safety during debug scan    original_dry = CONFIG.get("DRY_RUN", False)
+    CONFIG["DRY_RUN"] = True
+    results = {}    try:
+        for s in sym
+
+
+
+
+
+
+
+
+
+
+)
 
 # -------------------------
 # Utilities
