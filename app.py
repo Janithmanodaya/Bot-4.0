@@ -146,6 +146,17 @@ CONFIG = {
         "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
         "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
     },
+    "STRATEGY_6": { # Price-Action Only (Single-High-Probability Trade per Day)
+        "ATR_PERIOD": int(os.getenv("S6_ATR_PERIOD", "14")),             # M15 ATR for buffer and trail
+        "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER_MULT", "0.25")), # Buffer = 0.25 * ATR
+        "FOLLOW_THROUGH_RANGE_RATIO": float(os.getenv("S6_FT_RANGE_RATIO", "0.7")),  # 70%
+        "VOL_MA_LEN": int(os.getenv("S6_VOL_MA_LEN", "10")),            # M15 volume MA
+        "LIMIT_EXPIRY_CANDLES": int(os.getenv("S6_LIMIT_EXPIRY_CANDLES", "3")),  # Limit must fill within 3 candles
+        "SESSION_START_UTC_HOUR": int(os.getenv("S6_SESSION_START_UTC_HOUR", "7")), # e.g., 07:00 UTC
+        "SESSION_END_UTC_HOUR": int(os.getenv("S6_SESSION_END_UTC_HOUR", "15")),   # e.g., 15:00 UTC
+        "RISK_USD": float(os.getenv("S6_RISK_USD", "0.50")),             # Same fixed USD risk model as S4
+        "ENFORCE_ONE_TRADE_PER_DAY": os.getenv("S6_ONE_TRADE_PER_DAY", "true").lower() in ("true","1","yes"),
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -2613,10 +2624,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
-    if 0 in modes or 5 in modes:
-        # ---- Strategy 5 (M15 execution EMAs) ----
-        s5 = CONFIG['STRATEGY_5']
-        out['s5_m15_ema_fast'] = ema(out['close'], s5['EMA_FAST'])
+    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG['STRATEGY_5']         out['s5_m15_ema_fast']st'] = ema(out['close'], s5['EMA_FAST'])
         out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLOW'])
 
     return out
@@ -2679,8 +2687,9 @@ async def evaluate_and_enter(symbol: str):
         try:
             modes = CONFIG["STRATEGY_MODE"]
             run_s4 = 4 in modes or 0 in modes
-            run_others = any(m in modes for m in [1, 2, 3, 5]) or 0 in modes
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6]) or 0 in modes
             run_s5 = 5 in modes or 0 in modes
+            run_s6 = 6 in modes or 0 in modes
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
@@ -2712,8 +2721,10 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_3(symbol, df_standard)
                     if run_s5:
                         await evaluate_strategy_5(symbol, df_standard)
+                    if run_s6:
+                        await evaluate_strategy_6(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3/S5 evaluation for {symbol} due to empty indicator data.")
+                    log.warning(f"Skipping S1/S2/S3/S5/S6 evaluation for {symbol} due to empty indicator data.")
 
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
@@ -3777,6 +3788,261 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
 
 
+
+# ------------- Strategy 6 (Price-Action Only) helpers -------------
+def _s6_in_session_window(ts: pd.Timestamp) -> bool:
+    try:
+        s6 = CONFIG['STRATEGY_6']
+        start_h = int(s6.get('SESSION_START_UTC_HOUR', 7))
+        end_h = int(s6.get('SESSION_END_UTC_HOUR', 15))
+        hour = ts.tz_convert('UTC').hour if ts.tzinfo is not None else ts.hour
+        if start_h <= end_h:
+            return start_h <= hour < end_h
+        # overnight window
+        return hour >= start_h or hour < end_h
+    except Exception:
+        return True
+
+def _s6_prev_daily_levels(df_d: pd.DataFrame) -> tuple[float, float]:
+    if df_d is None or len(df_d) < 2:
+        return float('nan'), float('nan')
+    prev = df_d.iloc[-2]
+    return float(prev['high']), float(prev['low'])
+
+def _s6_recent_swings(df: pd.DataFrame, lookback: int = 10) -> tuple[float, float]:
+    if df is None or len(df) < max(lookback, 3):
+        return float('nan'), float('nan')
+    sw_high = float(df['high'].iloc[-lookback:].max())
+    sw_low = float(df['low'].iloc[-lookback:].min())
+    return sw_high, sw_low
+
+def _s6_trend_from_swings(df_htf: pd.DataFrame, swing_lookback: int = 10) -> Optional[str]:
+    # Determine simple structure: compare last two swing highs/lows
+    if df_htf is None or len(df_htf) < swing_lookback + 5:
+        return None
+    highs = df_htf['high'].iloc[-(swing_lookback+5):]
+    lows = df_htf['low'].iloc[-(swing_lookback+5):]
+    last_high = float(highs.iloc[-1]); prev_high = float(highs.iloc[-3])
+    last_low = float(lows.iloc[-1]); prev_low = float(lows.iloc[-3])
+    is_bull = last_high >= prev_high and last_low >= prev_low
+    is_bear = last_high <= prev_high and last_low <= prev_low
+    if is_bull and not is_bear:
+        return 'BULL'
+    if is_bear and not is_bull:
+        return 'BEAR'
+    return None
+
+def _s6_is_pin_bar(candle: pd.Series, direction: str) -> bool:
+    o = float(candle['open']); h = float(candle['high']); l = float(candle['low']); c = float(candle['close'])
+    rng = max(1e-9, h - l)
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    wick_ratio = (lower_wick if direction == 'BUY' else upper_wick) / rng
+    # wick >= 60% of range and close inside prior range handled elsewhere
+    return wick_ratio >= 0.60 and body / rng <= 0.40
+
+def _s6_is_engulfing_reclaim(curr: pd.Series, prev: pd.Series, direction: str, poi_price: float) -> bool:
+    # Engulfing body and reclaim the POI
+    co, cc = float(curr['open']), float(curr['close'])
+    po, pc = float(prev['open']), float(prev['close'])
+    if direction == 'BUY':
+        engulf = cc > co and cc >= max(po, pc) and co <= min(po, pc)
+        reclaim = cc > poi_price
+        return engulf and reclaim
+    else:
+        engulf = cc < co and cc <= min(po, pc) and co >= max(po, pc)
+        reclaim = cc < poi_price
+        return engulf and reclaim
+
+def _s6_follow_through_ok(rej: pd.Series, ft: pd.Series, direction: str, vol_ma: float, ratio: float) -> bool:
+    rej_range = float(rej['high'] - rej['low'])
+    ft_range = float(ft['high'] - ft['low'])
+    in_dir = (direction == 'BUY' and ft['close'] > ft['open']) or (direction == 'SELL' and ft['close'] < ft['open'])
+    vol_ok = float(ft['volume']) >= float(vol_ma) if np.isfinite(vol_ma) and vol_ma > 0 else False
+    range_ok = ft_range >= ratio * rej_range if np.isfinite(rej_range) else False
+    return in_dir and (range_ok or vol_ok)
+
+def _s6_within_poi(candle: pd.Series, poi_level: float, atr_val: float) -> bool:
+    # consider touch if wick crosses within 0.25*ATR of the POI level
+    h = float(candle['high']); l = float(candle['low'])
+    tol = 0.25 * float(atr_val)
+    return (l <= poi_level <= h) or (abs(h - poi_level) <= tol) or (abs(l - poi_level) <= tol)
+
+async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 6: Price-Action Only — Single High-Probability Trade per Day
+    - HTF bias from Daily first, H4 must not contradict
+    - POI retest (Daily/H4 swing or previous Daily High/Low)
+    - M15 rejection candle (pin bar or engulfing reclaim) at POI
+    - Follow-through confirmation by next candle
+    - Entry: limit at rejection close; SL beyond wick +/- 0.25*ATR(14)
+    - Risk: same fixed USD model as S4
+    - One setup per symbol per day
+    """
+    try:
+        s6 = CONFIG['STRATEGY_6']
+        if df_m15 is None or len(df_m15) < 80:
+            _record_rejection(symbol, "S6-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
+            return
+
+        # Session window check on last closed candle time
+        signal_ts = df_m15.index[-2]
+        if not _s6_in_session_window(signal_ts):
+            _record_rejection(symbol, "S6-Outside session window", {"ts": str(signal_ts)})
+            return
+
+        # Prepare M15 indicators
+        df_m15 = df_m15.copy()
+        atr_period = s6.get('ATR_PERIOD', 14)
+        df_m15['s6_atr'] = df_m15.get('s6_atr_m15', atr(df_m15, atr_period))
+        df_m15['s6_vol_ma'] = df_m15.get('s6_vol_ma', df_m15['volume'].rolling(int(s6.get('VOL_MA_LEN',10))).mean())
+
+        sig = df_m15.iloc[-2]; prev = df_m15.iloc[-3]
+
+        # Fetch HTF data
+        df_h4 = await asyncio.to_thread(fetch_klines_sync, symbol, '4h', 400)
+        df_d = await asyncio.to_thread(fetch_klines_sync, symbol, '1d', 400)
+        if df_h4 is None or df_d is None or len(df_h4) < 50 or len(df_d) < 50:
+            _record_rejection(symbol, "S6-Not enough HTF data", {"h4": len(df_h4) if df_h4 is not None else 0, "d": len(df_d) if df_d is not None else 0})
+            return
+
+        # HTF bias
+        bias_d = _s6_trend_from_swings(df_d, swing_lookback=20)
+        bias_h4 = _s6_trend_from_swings(df_h4, swing_lookback=20)
+        if bias_d is None:
+            _record_rejection(symbol, "S6-Daily bias unclear", {})
+            return
+        if bias_h4 is not None and bias_h4 != bias_d:
+            _record_rejection(symbol, "S6-H4 contradicts Daily", {"daily": bias_d, "h4": bias_h4})
+            return
+
+        direction = 'BUY' if bias_d == 'BULL' else 'SELL'
+
+        # Determine POIs: prior Daily H/L and recent Daily/H4 swing H/L
+        y_high, y_low = _s6_prev_daily_levels(df_d)
+        h4_sw_high, h4_sw_low = _s6_recent_swings(df_h4, lookback=30)
+        d_sw_high, d_sw_low = _s6_recent_swings(df_d, lookback=30)
+
+        candidate_levels = []
+        if np.isfinite(y_high): candidate_levels.append(y_high)
+        if np.isfinite(y_low): candidate_levels.append(y_low)
+        for lvl in (h4_sw_high, h4_sw_low, d_sw_high, d_sw_low):
+            if np.isfinite(lvl): candidate_levels.append(lvl)
+
+        # Find a POI that was touched by the signal candle
+        atr_sig = float(sig['s6_atr'])
+        touched_pois = [lvl for lvl in candidate_levels if _s6_within_poi(sig, lvl, atr_sig)]
+        if not touched_pois:
+            _record_rejection(symbol, "S6-No POI touch on signal candle", {})
+            return
+        # Pick the closest POI to close
+        poi_level = min(touched_pois, key=lambda lvl: abs(float(sig['close']) - lvl))
+
+        # Rejection candle definition
+        # 1) Pin bar with wick >=60% and close inside prior 3-bar range
+        prior3_high = float(df_m15['high'].iloc[-5:-2].max())
+        prior3_low = float(df_m15['low'].iloc[-5:-2].min())
+        close_inside_prior3 = prior3_low <= float(sig['close']) <= prior3_high
+        is_pin = _s6_is_pin_bar(sig, direction) and close_inside_prior3
+
+        # 2) Full engulfing reclaim of POI
+        is_engulf = _s6_is_engulfing_reclaim(sig, prev, direction, poi_level)
+
+        if not (is_pin or is_engulf):
+            _record_rejection(symbol, "S6-No valid rejection candle", {"pin": is_pin, "engulf": is_engulf})
+            return
+
+        # Follow-through confirmation by next candle (or same if strong)
+        ft = df_m15.iloc[-1]
+        vol_ma = float(df_m15['s6_vol_ma'].iloc[-2]) if pd.notna(df_m15['s6_vol_ma'].iloc[-2]) else float('nan')
+        ratio = float(s6.get('FOLLOW_THROUGH_RANGE_RATIO', 0.7))
+        if not _s6_follow_through_ok(sig, ft, direction, vol_ma, ratio):
+            _record_rejection(symbol, "S6-No follow-through", {"vol_ma": vol_ma, "ratio": ratio})
+            return
+
+        # Entry and SL
+        entry_price = float(sig['close'])  # limit at rejection close
+        if direction == 'BUY':
+            wick_low = float(sig['low'])
+            stop_price = wick_low - s6.get('ATR_BUFFER_MULT', 0.25) * atr_sig
+            side = 'BUY'
+        else:
+            wick_high = float(sig['high'])
+            stop_price = wick_high + s6.get('ATR_BUFFER_MULT', 0.25) * atr_sig
+            side = 'SELL'
+
+        # Distance and sizing (S4 risk model)
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S6-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        risk_usd = float(s6.get('RISK_USD', CONFIG['STRATEGY_4']['RISK_USD']))
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+        if ideal_qty < qty_min or ideal_qty <= 0:
+            _record_rejection(symbol, "S6-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        final_qty = ideal_qty
+        notional = final_qty * entry_price
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        actual_risk_usdt = final_qty * distance
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place limit order
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = int(s6.get("LIMIT_EXPIRY_CANDLES", 3))
+        expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": None, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 6,
+            "atr_at_entry": float(sig['s6_atr']),
+            "trailing": True,
+            "s6_poi_level": poi_level,
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        # Enforce one trade per day if configured: cooldown until UTC end of day
+        if s6.get('ENFORCE_ONE_TRADE_PER_DAY', True):
+            now = datetime.now(timezone.utc)
+            eod = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=timezone.utc)
+            symbol_trade_cooldown[symbol] = eod
+            log.info(f"S6: Set end-of-day cooldown for {symbol} to enforce one setup per day.")
+
+        title = "⏳ New Pending Order: S6-PA"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S6 evaluation error for {symbol}", e)
+        return
 
 async def force_trade_entry(strategy_id: int, symbol: str, side: str):
     """
