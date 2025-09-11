@@ -370,20 +370,24 @@ next_scan_time: Optional[datetime] = None
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
-def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:     """    BestB-effort inference using exchange position update time if available,     otherwise falls back to most recent closed candles.   m """   d ts_ms: Optional[int] = None    try:
-        if client is not None:            positions = client.futures_position_information(symbol=symbol)
-            desired_side = 'LONG' if side == 'BUY' else 'SHORT'            pos = next((p for p in positions if p.get('positionSide') == desired_side or p.get('positionSide') == 'BOTH'), None)
-            if pos:                ut = pos.get('updateTime')
-                if ut:                    ts_ms = int(ut)
-    except Exception:        ts_ms = None
-    return infer_strategy_for_open_trade_at_time_sync(symbol, side, ts_code_mnews</)
-
-
-
-
-
-
-None)
+def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
+    """
+    Best-effort inference using exchange position update time if available,
+    otherwise falls back to most recent closed candles.
+    """
+    ts_ms: Optional[int] = None
+    try:
+        if client is not None:
+            positions = client.futures_position_information(symbol=symbol)
+            desired_side = 'LONG' if side == 'BUY' else 'SHORT'
+            pos = next((p for p in positions if p.get('positionSide') in (desired_side, 'BOTH')), None)
+            if pos:
+                ut = pos.get('updateTime') or pos.get('updateTimeMs') or pos.get('time')
+                if ut:
+                    ts_ms = int(float(ut))
+    except Exception:
+        ts_ms = None
+    return infer_strategy_for_open_trade_at_time_sync(symbol, side, ts_ms)
 
 def _nearest_closed_index_for_time(df: pd.DataFrame, ts_ms: Optional[int]) -> Optional[int]:
     if df is None or df.empty:
@@ -959,26 +963,40 @@ def get_public_ip() -> str:
     except Exception:
         return "unable-to-fetch-ip"
 
-def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:     """   t Derive a safe default SL for an imported position.   i Primary: use S4 (ST2). If it produces an invalid stop (wrong side of price),     fall back to ATR-based distance to ensure a valid protective stop.     """   t # Fetch klines   T df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 300)   ' if df is None or df.empty:       = raise RuntimeError("No kline data to calc default SL/TP")
-    # Compute Supertrend (S4 ST2) and ATR     s4_params = CONFIG['STRATEGY_4']   r st2, _ = supertrend(df.copy(), period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])    df ['atr'] = atr(df, CONFIG.get("ATR_LENGTH", 14))
-    st2_val = safe_last(st2)   g current_price = safe_last(df['close'])   _ atr_now = max(1e-9, safe_last(df['atr']))  # avoid zero
-    # Start with ST2-based SL   r stop_price = st2_val
-    # Validate side and correct if invalid    if side == 'BUY':
-        if stop_price >= current_price or stop_price <= 0:            stop_price = current_price - 1.5 * atr_now
-    else:  # SELL        if stop_price <= current_price or stop_price <= 0:
+def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:
+    """
+    Derive a safe default SL for an imported position.
+    Primary: use S4 ST2 supertrend as stop. If invalid (wrong side of price), fall back to ATR-based distance.
+    Returns: (stop_price, take_price, current_price). take_price is 0.0 for imports (no TP by default).
+    """
+    df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 300)
+    if df is None or df.empty:
+        raise RuntimeError("No kline data to calc default SL/TP")
+
+    # Compute Supertrend (S4 ST2) and ATR
+    s4_params = CONFIG['STRATEGY_4']
+    st2, _ = supertrend(df.copy(), period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
+    df['atr'] = atr(df, CONFIG.get("ATR_LENGTH", 14))
+
+    current_price = safe_last(df['close'])
+    atr_now = max(1e-9, safe_last(df['atr']))  # avoid zero
+    stop_price = safe_last(st2)
+
+    # Validate side and correct if invalid
+    if side == 'BUY':
+        if stop_price >= current_price or stop_price <= 0:
+            stop_price = current_price - 1.5 * atr_now
+    else:  # SELL
+        if stop_price <= current_price or stop_price <= 0:
             stop_price = current_price + 1.5 * atr_now
-    # Final safety: ensure non-negative and reasonable distance    # If still invalid (e.g., NaN), use 2% fallback
-    if not np.isfinite(stop_price) or stop_price <= 0:        pct = 0.02
+
+    # Final safety: ensure non-negative and reasonable distance
+    if not np.isfinite(stop_price) or stop_price <= 0:
+        pct = 0.02
         stop_price = current_price * (1 - pct) if side == 'BUY' else current_price * (1 + pct)
-    take_price
 
-
-
-
-
-
-
-ke_price, current_price
+    take_price = 0.0
+    return stop_price, take_price, current_price
 
 def timeframe_to_timedelta(tf: str) -> Optional[timedelta]:
     """Converts a timeframe string like '1m', '5m', '1h', '1d' to a timedelta object."""
