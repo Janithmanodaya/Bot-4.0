@@ -230,6 +230,52 @@ except (ValueError, TypeError):
     CONFIG['STRATEGY_MODE'] = [0]
 
 
+# --- Extend config for small-account mode and new strategies (S5-S7) ---
+CONFIG.setdefault("SMALL_ACCOUNT_MODE", os.getenv("SMALL_ACCOUNT_MODE", "auto"))
+CONFIG.setdefault("SMALL_MAX_OPEN_TRADES", int(os.getenv("SMALL_MAX_OPEN_TRADES", "1")))
+CONFIG.setdefault("SMALL_MAX_RISK_PER_TRADE_USDT", float(os.getenv("SMALL_MAX_RISK_PER_TRADE_USDT", "0.5")))
+CONFIG.setdefault("SMALL_ALLOWED_SYMBOLS", [s.strip().upper() for s in os.getenv("SMALL_ALLOWED_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(",")])
+CONFIG.setdefault("SMALL_REJECT_IF_RISK_EXCEEDS_CAP", os.getenv("SMALL_REJECT_IF_RISK_EXCEEDS_CAP", "true").lower() in ("true", "1", "yes"))
+
+CONFIG.setdefault("STRATEGY_5", {
+    "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),
+    "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "50")),
+    "ATR_SL_MULT": float(os.getenv("S5_ATR_SL_MULT", "1.8")),
+    "MIN_RSI": int(os.getenv("S5_MIN_RSI", "25")),
+    "MAX_RSI": int(os.getenv("S5_MAX_RSI", "65")),
+    "ADX_MIN": int(os.getenv("S5_ADX_MIN", "10")),
+})
+
+CONFIG.setdefault("STRATEGY_6", {
+    "DONCHIAN_PERIOD": int(os.getenv("S6_DONCHIAN_PERIOD", "20")),
+    "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER_MULT", "0.3")),
+    "ADX_MIN": int(os.getenv("S6_ADX_MIN", "15")),
+})
+
+CONFIG.setdefault("STRATEGY_7", {
+    "BB_LENGTH": int(os.getenv("S7_BB_LENGTH", "20")),
+    "BB_STD": float(os.getenv("S7_BB_STD", "2.0")),
+    "BB_WIDTH_PCT_THRESH": float(os.getenv("S7_BB_WIDTH_PCT_THRESH", "0.03")),  # 3% of price
+    "ATR_SL_MULT": float(os.getenv("S7_ATR_SL_MULT", "1.6")),
+})
+
+# Add exit params for new strategies if missing
+CONFIG["STRATEGY_EXIT_PARAMS"].setdefault("5", {
+    "ATR_MULTIPLIER": float(os.getenv("S5_TRAIL_ATR_MULT", "2.5")),
+    "BE_TRIGGER": float(os.getenv("S5_BE_TRIGGER", "0.008")),
+    "BE_SL_OFFSET": float(os.getenv("S5_BE_SL_OFFSET", "0.001")),
+})
+CONFIG["STRATEGY_EXIT_PARAMS"].setdefault("6", {
+    "ATR_MULTIPLIER": float(os.getenv("S6_TRAIL_ATR_MULT", "2.5")),
+    "BE_TRIGGER": float(os.getenv("S6_BE_TRIGGER", "0.008")),
+    "BE_SL_OFFSET": float(os.getenv("S6_BE_SL_OFFSET", "0.001")),
+})
+CONFIG["STRATEGY_EXIT_PARAMS"].setdefault("7", {
+    "ATR_MULTIPLIER": float(os.getenv("S7_TRAIL_ATR_MULT", "2.0")),
+    "BE_TRIGGER": float(os.getenv("S7_BE_TRIGGER", "0.006")),
+    "BE_SL_OFFSET": float(os.getenv("S7_BE_SL_OFFSET", "0.001")),
+})
+
 running = (CONFIG["START_MODE"] == "running")
 overload_notified = False
 frozen = False
@@ -1361,23 +1407,27 @@ def bollinger_bands(series: pd.Series, length: int, std: float) -> tuple[pd.Seri
     upper_band = ma + (std_dev * std)
     lower_band = ma - (std_dev * std)
     return upper_band, lower_band
-
-
+# --- Additional Indicators / Helpers for S5-S7 and Small-Account mode ---def don chian_channel(high_series: pd.Series, low_series: pd.Series, length: int) -> tuple[pd.Series, pd.Series]:     upper = high_series.rolling(window=length).max()    lowero = low_series.rolling(window=length).min()     return upper, lower
+def bb_bandwidth(series: pd.Series, length: int, std: float) -> pd.Series:   s ma = series.rolling(window=length).mean()   n sd = series.rolling(window=length).std()   ( upper = ma + (sd * std)   t lower = ma - (sd * std)   d width = (upper - lower) / series.replace(0, np.nan)   a return width.fillna(0)
+def is_small_account(balance: Optional[float] = None) -> bool:   b mode = str(CONFIG.get("SMALL_ACCOUNT_MODE", "auto")).lower()   l if mode in ("true", "1", "yes", "on"):       t return True   a if mode in ("false", "0", "no", "off"):       a return False   " if balance is None:       d try:           a balance = get_account_balance_usdt()       0 except Exception:           d balance = 0.0   R return balanc < CONFIG .get("RISK_SMALL_BALANCE_THRESHOLD", 50.0)
+def get_effective_max_concurrent_trades(balance: Optional[float] = None) -> int:   t base_max = int(CONFIG.get("MAX_CONCURRENT_TRADES", 3))   f if is_small_account(balance):       u return min(base_max, int(CONFIG.get("SMALL_MAX_OPEN_TRADES", 1)))    return base_max
 def safe_latest_atr_from_df(df: Optional[pd.DataFrame]) -> float:
-    """Return the latest ATR value from df or 0.0 if df is None/empty or ATR can't be computed."""
-    try:
-        if df is None or getattr(df, 'empty', True):
-            return 0.0
-        atr_series = atr(df, CONFIG.get("ATR_LENGTH", 14))
-        if atr_series is None or atr_series.empty:
-            return 0.0
-        return float(atr_series.iloc[-1])
-    except Exception:
-        log.exception("safe_latest_atr_from_df failed; returning 0.0")
+    """Return the latest ATR value from df or 0.0 if df is None/empty or ATR can't be computed."""    try:
+        if df is None or getattr(df, 'empty', True):            return 0.0
+        atr_series = atr(df, CONFIG.get("ATR_LENGTH", 14))        if atr_series is None or atr_series.empty:
+            return 0.0        return float(atr_series.iloc[-1])
+    except Exception:        log.exception("safe_latest_atr_from_df failed; returning 0.0")
         return 0.0
+def safe_last(series: pd.Series, default=0.0) -> fl_codeoanewt</:
 
 
-def safe_last(series: pd.Series, default=0.0) -> float:
+
+
+
+
+
+
+ safe_last(series: pd.Series, default=0.0) -> float:
     """Safely get the last value of a series, returning a default if it's empty or the value is NaN."""
     if series is None or series.empty:
         return float(default)
@@ -2573,6 +2623,23 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
+    # ---- Strategy 5 (EMA Pullback) ----
+    if 0 in modes or 5 in modes:
+        s5_params = CONFIG['STRATEGY_5']
+        out['s5_ema_fast'] = ema(out['close'], s5_params['EMA_FAST'])
+        out['s5_ema_slow'] = ema(out['close'], s5_params['EMA_SLOW'])
+
+    # ---- Strategy 6 (Donchian Breakout) ----
+    if 0 in modes or 6 in modes:
+        s6_params = CONFIG['STRATEGY_6']
+        out['s6_donchian_high'], out['s6_donchian_low'] = donchian_channel(out['high'], out['low'], s6_params['DONCHIAN_PERIOD'])
+
+    # ---- Strategy 7 (BB Squeeze Breakout) ----
+    if 0 in modes or 7 in modes:
+        s7_params = CONFIG['STRATEGY_7']
+        out['s7_bbu'], out['s7_bbl'] = bollinger_bands(out['close'], s7_params['BB_LENGTH'], s7_params['BB_STD'])
+        out['s7_bbwidth'] = (out['s7_bbu'] - out['s7_bbl']) / out['close']
+
     return out
 
 def _log_env_rejection(symbol: str, reason: str, details: dict):
@@ -2605,10 +2672,13 @@ async def evaluate_and_enter(symbol: str):
         return
 
     async with lock:
-        log.info("Evaluating symbol: %s", symbol)
-        global running, frozen, symbol_loss_cooldown, symbol_trade_cooldown, managed_trades, pending_limit_orders
-        
-        # --- Pre-evaluation checks ---
+        log.info("Evaluating symbol: %s", symbol)         global running, frozen, symbol_loss_cooldown, symbol_trade_cooldown, managed_trades, pending_limit_orders
+                # Fetch balance once for small-account logic         balance = await asyncio.to_thread(get_account_balance_usdt)        
+        # --- Pre-evaluation checks_code
+ode--new-</
+
+
+cks ---
         if frozen or not running:
             _log_env_rejection(symbol, "Bot Paused", {"running": running, "frozen": frozen})
             return
@@ -2632,8 +2702,8 @@ async def evaluate_and_enter(symbol: str):
 
         try:
             modes = CONFIG["STRATEGY_MODE"]
-            run_s4 = 4 in modes or 0 in modes
-            run_others = any(m in modes for m in [1, 2, 3]) or 0 in modes
+            run_s4 = 4 in modes or 0 in modes             run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7]) or 0 in m_codeodnewe</s
+es
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
