@@ -584,10 +584,11 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
             log.warning(f"Rogue import for {symbol} calculated an invalid SL ({stop_price}) which is <= current price ({current_price}). Skipping SL placement.")
             stop_price = None # Do not place an SL
 
-        # Infer strategy for better in-trade management
-        inferred_strategy = await asyncio.to_thread(infer_strategy_for_open_trade_sync, symbol, side)
+        # Infer strategy for better in-trade management and capture time-source used
+        inferred_strategy, infer_src = await asyncio.to_thread(infer_strategy_for_open_trade_sync, symbol, side)
         if inferred_strategy is None:
             inferred_strategy = 4  # fallback
+        infer_src = infer_src or "last_closed"
 
         trade_id = f"{symbol}_imported_{int(time.time())}"
         meta = {
@@ -598,6 +599,7 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
             "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
             "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0,
             "strategy_id": inferred_strategy,
+            "inference_time_source": infer_src,
         }
 
         # Initialize S5-specific management state if inferred as S5
