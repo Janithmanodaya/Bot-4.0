@@ -250,6 +250,8 @@ CONFIG = {
     "RISK_PCT_STRATEGY_2": float(os.getenv("RISK_PCT_S2", "0.025")),
     "MAX_RISK_USDT": float(os.getenv("MAX_RISK_USDT", "0.0")),  # 0 disables cap
     "MAX_BOT_LEVERAGE": int(os.getenv("MAX_BOT_LEVERAGE", "30")),
+    "SMALL_RISK_TOLERANCE_MULT": float(os.getenv("SMALL_RISK_TOLERANCE_MULT", "1.25")),
+    "SMALL_ACCT_MIN_NOTIONAL_FALLBACK": os.getenv("SMALL_ACCT_MIN_NOTIONAL_FALLBACK", "true").lower() in ("true","1","yes"),
 
 
     "TRAILING_ENABLED": os.getenv("TRAILING_ENABLED", "true").lower() in ("true", "1", "yes"),
@@ -267,6 +269,15 @@ CONFIG = {
     "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "25")),
     "AUTO_RESTART_ON_IP_ERROR": os.getenv("AUTO_RESTART_ON_IP_ERROR", "true").lower() in ("true", "1", "yes"),
     "TELEGRAM_NOTIFY_REJECTIONS": os.getenv("TELEGRAM_NOTIFY_REJECTIONS", "false").lower() in ("true", "1", "yes"),
+    "SMALL_ACCOUNT_MODE": {
+        "ENABLED": os.getenv("SMALL_ACCOUNT_ENABLED", "true").lower() in ("true", "1", "yes"),
+        "BALANCE_THRESHOLD": float(os.getenv("SMALL_ACCOUNT_BALANCE_THRESHOLD", "50.0")),
+        "MIN_NOTIONAL_OVERRIDE": os.getenv("SMALL_ACCOUNT_MIN_NOTIONAL_OVERRIDE", "true").lower() in ("true", "1", "yes"),
+        "MAX_RISK_PCT_BALANCE": float(os.getenv("SMALL_ACCOUNT_MAX_RISK_PCT_BALANCE", "0.25")),
+        "MAX_RISK_USDT": float(os.getenv("SMALL_ACCOUNT_MAX_RISK_USDT", "0.0")),  # 0 disables cap
+        "RISK_FLOOR_USDT": float(os.getenv("SMALL_ACCOUNT_RISK_FLOOR_USDT", "0.3")),
+        "MARGIN_USDT": float(os.getenv("SMALL_ACCOUNT_MARGIN_USDT", "1.0"))
+    },
 }
 
 # --- Parse STRATEGY_MODE into a list of ints ---
@@ -1783,6 +1794,106 @@ def round_price(symbol: str, price: float) -> str:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
 
+def compute_small_account_position(symbol: str, entry_price: float, stop_price: float, desired_risk_usd: float, balance: float, strategy_id: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Unified sizing helper with small-account support.
+
+    Behavior:
+    - Computes ideal quantity from desired_risk_usd and stop distance.
+    - Enforces min-notional quantity.
+    - For small accounts (balance < threshold), allows a fallback to min-notional sizing
+      if and only if the risk at min-notional is within a tolerance multiple of desired risk.
+    - Computes leverage based on notional and margin_to_use (risk for normal, fixed margin for small).
+
+    Returns:
+      {
+        "rejected": False,
+        "qty": float,
+        "leverage": int,
+        "risk_usdt": float,
+        "notional": float,
+        "qty_min": float,
+        "ideal_qty": float,
+        "sizing_mode": "ideal" | "min_notional"
+      }
+    or, on rejection:
+      {
+        "rejected": True,
+        "reason": "...",
+        ...
+      }
+    """
+    try:
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            return {"rejected": True, "reason": "invalid_distance", "entry": float(entry_price), "sl": float(stop_price)}
+
+        # Compute ideal and minimum quantities
+        min_notional = get_min_notional_sync(symbol)
+        qty_min_raw = (min_notional / entry_price) if entry_price > 0 else 0.0
+        qty_min = round_qty(symbol, qty_min_raw, rounding=ROUND_CEILING)
+
+        ideal_qty_raw = desired_risk_usd / distance
+        ideal_qty = round_qty(symbol, ideal_qty_raw, rounding=ROUND_DOWN)
+
+        small_balance_threshold = CONFIG.get("RISK_SMALL_BALANCE_THRESHOLD", 50.0)
+        small_tolerance = CONFIG.get("SMALL_RISK_TOLERANCE_MULT", 1.25)
+        allow_min_fallback = CONFIG.get("SMALL_ACCT_MIN_NOTIONAL_FALLBACK", True)
+
+        qty = ideal_qty
+        risk_usdt = ideal_qty * distance
+        sizing_mode = "ideal"
+
+        # If ideal is below exchange min quantity, consider small account fallback
+        if ideal_qty < qty_min:
+            if balance < small_balance_threshold and allow_min_fallback:
+                risk_at_min = qty_min * distance
+                risk_cap = desired_risk_usd * small_tolerance
+                if risk_at_min <= risk_cap:
+                    qty = qty_min
+                    risk_usdt = risk_at_min
+                    sizing_mode = "min_notional"
+                else:
+                    return {
+                        "rejected": True,
+                        "reason": "min_notional_risk_exceeds_cap",
+                        "risk_at_min": float(risk_at_min),
+                        "risk_cap": float(risk_cap),
+                        "qty_min": float(qty_min),
+                        "ideal_qty": float(ideal_qty),
+                        "distance": float(distance),
+                    }
+            else:
+                # Not a small account, but still must meet exchange min-notional
+                qty = qty_min
+                risk_usdt = qty_min * distance
+                sizing_mode = "min_notional"
+
+        if qty <= 0 or not np.isfinite(qty):
+            return {"rejected": True, "reason": "qty_zero", "ideal_qty": float(ideal_qty), "qty_min": float(qty_min)}
+
+        notional = qty * entry_price
+
+        # Leverage: for small accounts use fixed small margin, else use actual risk_usdt
+        margin_to_use = CONFIG.get("MARGIN_USDT_SMALL_BALANCE", 1.0) if balance < small_balance_threshold else max(risk_usdt, 1e-9)
+        uncapped_leverage = int(math.ceil(notional / margin_to_use))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        return {
+            "rejected": False,
+            "qty": float(qty),
+            "leverage": int(leverage),
+            "risk_usdt": float(risk_usdt),
+            "notional": float(notional),
+            "qty_min": float(qty_min),
+            "ideal_qty": float(ideal_qty),
+            "sizing_mode": sizing_mode
+        }
+    except Exception as e:
+        # Defensive: never throw inside sizing computation
+        return {"rejected": True, "reason": f"exception: {e}"}
+
 def place_limit_order_sync(symbol: str, side: str, qty: float, price: float):
     """
     Places a single limit order. This is a blocking call.
@@ -2300,6 +2411,91 @@ def calculate_risk_amount(account_balance: float, strategy_id: Optional[int] = N
     if max_cap and max_cap > 0:
         risk = min(risk, max_cap)
     return float(risk)
+
+def size_position_small_account_aware(symbol: str,
+                                      entry_price: float,
+                                      stop_price: float,
+                                      base_risk_usdt: float,
+                                      balance: float,
+                                      strategy_id: Optional[int] = None) -> tuple[float, int, float, Optional[str]]:
+    """
+    Unified sizing helper with small-account handling.
+    - Honors exchange min notional
+    - Allows (optional) min-notional override for small accounts with risk cap
+    - Returns: (qty, leverage, actual_risk_usdt, reject_reason)
+    """
+    try:
+        distance = abs(entry_price - stop_price)
+        if not np.isfinite(distance) or distance <= 0 or entry_price <= 0:
+            return 0.0, 0, 0.0, "Invalid SL distance for sizing"
+
+        small_cfg = CONFIG.get("SMALL_ACCOUNT_MODE", {})
+        small_enabled = bool(small_cfg.get("ENABLED", True)) and (balance <= float(small_cfg.get("BALANCE_THRESHOLD", 50.0)))
+        min_notional_override = bool(small_cfg.get("MIN_NOTIONAL_OVERRIDE", True))
+
+        # Determine target risk
+        if base_risk_usdt and base_risk_usdt > 0:
+            target_risk = float(base_risk_usdt)
+        else:
+            target_risk = float(calculate_risk_amount(balance, strategy_id=strategy_id))
+
+        # Optional risk floor for small accounts
+        if small_enabled:
+            risk_floor = float(small_cfg.get("RISK_FLOOR_USDT", 0.0))
+            if risk_floor > 0:
+                target_risk = max(target_risk, risk_floor)
+
+        # Ideal quantity by risk
+        ideal_qty = target_risk / distance
+        ideal_qty = round_qty(symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        # Min notional quantity
+        min_notional = get_min_notional_sync(symbol)
+        qty_min = (min_notional / entry_price) if entry_price > 0 else 0.0
+        qty_min = round_qty(symbol, qty_min, rounding=ROUND_CEILING)
+
+        qty = ideal_qty
+        used_risk = max(0.0, qty * distance)
+
+        if qty <= 0 or qty < qty_min:
+            # Need to lift to min-notional
+            if not (small_enabled and min_notional_override):
+                return 0.0, 0, 0.0, "Min-notional unmet and override disabled"
+            risk_if_min = qty_min * distance
+
+            # Compute risk cap
+            caps = []
+            max_risk_usdt_cap = float(small_cfg.get("MAX_RISK_USDT", 0.0))
+            if max_risk_usdt_cap > 0:
+                caps.append(max_risk_usdt_cap)
+            max_risk_pct_cap = float(small_cfg.get("MAX_RISK_PCT_BALANCE", 0.0)) * float(balance)
+            if max_risk_pct_cap > 0:
+                caps.append(max_risk_pct_cap)
+            risk_cap = min(caps) if caps else float("inf")
+
+            if risk_if_min > risk_cap:
+                return 0.0, 0, 0.0, f"Min-notional risk {risk_if_min:.4f} exceeds cap {risk_cap:.4f}"
+
+            qty = qty_min
+            used_risk = risk_if_min
+
+        # Compute leverage
+        notional = qty * entry_price
+        if small_enabled:
+            margin_usdt = float(small_cfg.get("MARGIN_USDT", CONFIG.get("MARGIN_USDT_SMALL_BALANCE", 1.0)))
+        else:
+            # For normal accounts, use actual risk for leverage except very small balances
+            margin_usdt = CONFIG.get("MARGIN_USDT_SMALL_BALANCE", 1.0) if balance < CONFIG.get("RISK_SMALL_BALANCE_THRESHOLD", 50.0) else used_risk
+        margin_usdt = max(1e-9, float(margin_usdt))
+
+        uncapped_leverage = int(math.ceil(notional / margin_usdt))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        return float(qty), int(leverage), float(used_risk), None
+    except Exception as e:
+        log.exception(f"size_position_small_account_aware failed for {symbol}")
+        return 0.0, 0, 0.0, f"Sizing error: {e}"
 
 def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
     results = {"ok": True, "checks": []}
@@ -2899,24 +3095,20 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
         return
 
     balance = await asyncio.to_thread(get_account_balance_usdt)
-    risk_usdt = calculate_risk_amount(balance, strategy_id=1)
-    ideal_qty = risk_usdt / distance
-    ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
-
-    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-    qty_min = min_notional / entry_price if entry_price > 0 else 0.0
-    qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
-    final_qty = max(ideal_qty, qty_min)
-
-    if final_qty <= 0:
-        _record_rejection(symbol, "S1-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min}, signal_candle=signal_candle)
+    qty, leverage, risk_usdt_used, reject_reason = await asyncio.to_thread(
+        size_position_small_account_aware,
+        symbol,
+        entry_price,
+        sl_price,
+        0.0,  # use calculate_risk_amount for S1
+        balance,
+        1
+    )
+    if reject_reason or qty <= 0:
+        _record_rejection(symbol, reject_reason or "S1-Sizing failed", {"entry": entry_price, "sl": sl_price}, signal_candle=signal_candle)
         return
 
-    notional = final_qty * entry_price
-    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
-    leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
-    max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
-    leverage = max(1, min(leverage, max_leverage))
+    final_qty = qty
     take_price = entry_price + (2 * distance) if side == 'BUY' else entry_price - (2 * distance)
 
     limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
@@ -2931,7 +3123,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
         "id": pending_order_id, "order_id": order_id, "symbol": symbol,
         "side": side, "qty": final_qty, "limit_price": entry_price,
         "stop_price": sl_price, "take_price": take_price, "leverage": leverage,
-        "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+        "risk_usdt": risk_usdt_used, "place_time": datetime.utcnow().isoformat(),
         "expiry_time": expiry_time.isoformat(),
         "strategy_id": 1,
         "atr_at_entry": atr_val,
@@ -2950,7 +3142,7 @@ async def evaluate_strategy_bb(symbol: str, df: pd.DataFrame):
         f"**Side:** `{side}`\n"
         f"**Price:** `{entry_price:.4f}`\n"
         f"**Qty:** `{final_qty}`\n"
-        f"**Risk:** `{risk_usdt:.2f} USDT`\n"
+        f"**Risk:** `{risk_usdt_used:.2f} USDT`\n"
         f"**Leverage:** `{leverage}x`"
     )
     await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
@@ -3583,29 +3775,15 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S5-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
             return
 
-        # Risk model: same as S4 (fixed USDT risk)
-        risk_usd = float(s5['RISK_USD'])
-        ideal_qty = risk_usd / distance
-        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
-
-        # Enforce min notional
-        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-        qty_min = min_notional / entry_price if entry_price > 0 else 0.0
-        qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
-
-        if ideal_qty < qty_min or ideal_qty <= 0:
-            _record_rejection(symbol, "S5-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
-            return
-
-        final_qty = ideal_qty
-        notional = final_qty * entry_price
-
         balance = await asyncio.to_thread(get_account_balance_usdt)
-        actual_risk_usdt = final_qty * distance
-        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
-        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
-        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
-        leverage = max(1, min(uncapped_leverage, max_leverage))
+        sizing = await asyncio.to_thread(compute_small_account_position, symbol, entry_price, stop_price, float(s5['RISK_USD']), balance, 5)
+        if sizing.get("rejected"):
+            _record_rejection(symbol, "S5-Sizing reject", sizing)
+            return
+        final_qty = sizing["qty"]
+        notional = sizing["notional"]
+        leverage = sizing["leverage"]
+        actual_risk_usdt = sizing["risk_usdt"]
 
         # Place LIMIT order with SL only (TP handled by monitor logic)
         limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
@@ -4042,24 +4220,24 @@ async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S6-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
             return
 
-        risk_usd = float(s6.get('RISK_USD', CONFIG['STRATEGY_4']['RISK_USD']))
-        ideal_qty = risk_usd / distance
-        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
-
-        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
-        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
-        if ideal_qty < qty_min or ideal_qty <= 0:
-            _record_rejection(symbol, "S6-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        sizing = await asyncio.to_thread(
+            compute_small_account_position,
+            symbol,
+            entry_price,
+            stop_price,
+            float(s6.get('RISK_USD', CONFIG['STRATEGY_4']['RISK_USD'])),
+            balance,
+            6
+        )
+        if sizing.get("rejected"):
+            _record_rejection(symbol, "S6-Sizing reject", sizing)
             return
 
-        final_qty = ideal_qty
-        notional = final_qty * entry_price
-        balance = await asyncio.to_thread(get_account_balance_usdt)
-        actual_risk_usdt = final_qty * distance
-        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
-        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
-        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
-        leverage = max(1, min(uncapped_leverage, max_leverage))
+        final_qty = sizing["qty"]
+        notional = sizing["notional"]
+        leverage = sizing["leverage"]
+        actual_risk_usdt = sizing["risk_usdt"]
 
         # Place limit order
         limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
