@@ -146,16 +146,15 @@ CONFIG = {
         "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
         "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
     },
-    "STRATEGY_6": { # Price-Action Only (Single-High-Probability Trade per Day)
-        "ATR_PERIOD": int(os.getenv("S6_ATR_PERIOD", "14")),             # M15 ATR for buffer and trail
-        "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER_MULT", "0.25")), # Buffer = 0.25 * ATR
-        "FOLLOW_THROUGH_RANGE_RATIO": float(os.getenv("S6_FT_RANGE_RATIO", "0.7")),  # 70%
-        "VOL_MA_LEN": int(os.getenv("S6_VOL_MA_LEN", "10")),            # M15 volume MA
-        "LIMIT_EXPIRY_CANDLES": int(os.getenv("S6_LIMIT_EXPIRY_CANDLES", "3")),  # Limit must fill within 3 candles
-        "SESSION_START_UTC_HOUR": int(os.getenv("S6_SESSION_START_UTC_HOUR", "7")), # e.g., 07:00 UTC
-        "SESSION_END_UTC_HOUR": int(os.getenv("S6_SESSION_END_UTC_HOUR", "15")),   # e.g., 15:00 UTC
-        "RISK_USD": float(os.getenv("S6_RISK_USD", "0.50")),             # Same fixed USD risk model as S4
-        "ENFORCE_ONE_TRADE_PER_DAY": os.getenv("S6_ONE_TRADE_PER_DAY", "true").lower() in ("true","1","yes"),
+    "STRATEGY_7": { # SMC (Smart Money Concepts) execution - price-action only
+        "ATR_PERIOD": int(os.getenv("S7_ATR_PERIOD", "14")),
+        "ATR_BUFFER": float(os.getenv("S7_ATR_BUFFER", "0.25")),
+        "BOS_LOOKBACK_H1": int(os.getenv("S7_BOS_LOOKBACK_H1", "72")),
+        "OB_MIN_BODY_RATIO": float(os.getenv("S7_OB_MIN_BODY_RATIO", "0.5")),
+        "REJECTION_WICK_RATIO": float(os.getenv("S7_REJECTION_WICK_RATIO", "0.6")),
+        "LIMIT_EXPIRY_CANDLES": int(os.getenv("S7_LIMIT_EXPIRY_CANDLES", "4")),
+        "USE_MIN_NOTIONAL": os.getenv("S7_USE_MIN_NOTIONAL", "true").lower() in ("true", "1", "yes"),
+        "RISK_USD": float(os.getenv("S7_RISK_USD", "0.0")),  # kept optional; default 0 uses min notional
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
@@ -163,6 +162,32 @@ CONFIG = {
             "BE_TRIGGER": float(os.getenv("S1_BE_TRIGGER", "0.008")),
             "BE_SL_OFFSET": float(os.getenv("S1_BE_SL_OFFSET", "0.002"))
         },
+        "2": {  # SuperTrend strategy
+            "ATR_MULTIPLIER": float(os.getenv("S2_ATR_MULTIPLIER", "2.0")),
+            "BE_TRIGGER": float(os.getenv("S2_BE_TRIGGER", "0.006")),
+            "BE_SL_OFFSET": float(os.getenv("S2_BE_SL_OFFSET", "0.001"))
+        },
+        "3": {  # Advanced SuperTrend strategy (custom trailing logic)
+            "ATR_MULTIPLIER": float(os.getenv("S3_TRAIL_ATR_MULT", "3.0")), # Value from S3 config
+            "BE_TRIGGER": 0.0, # Not used in S3
+            "BE_SL_OFFSET": 0.0 # Not used in S3
+        },
+        "4": {  # Advanced SuperTrend v2 strategy (custom trailing logic)
+            "ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")), # Value from S4 config
+            "BE_TRIGGER": 0.0, # Not used in S4
+            "BE_SL_OFFSET": 0.0 # Not used in S4
+        },
+        "5": {  # Advanced H1/M15 strategy (custom trailing logic)
+            "ATR_MULTIPLIER": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
+            "BE_TRIGGER": 0.0,
+            "BE_SL_OFFSET": 0.0
+        },
+        "7": {  # SMC trailing is structural; keep generic minimal trailing disabled by default
+            "ATR_MULTIPLIER": float(os.getenv("S7_TRAIL_ATR_MULT", "0.0")),
+            "BE_TRIGGER": 0.0,
+            "BE_SL_OFFSET": 0.0
+        }
+    },
         "2": {  # SuperTrend strategy
             "ATR_MULTIPLIER": float(os.getenv("S2_ATR_MULTIPLIER", "2.0")),
             "BE_TRIGGER": float(os.getenv("S2_BE_TRIGGER", "0.006")),
@@ -2709,7 +2734,7 @@ async def evaluate_and_enter(symbol: str):
         try:
             modes = CONFIG["STRATEGY_MODE"]
             run_s4 = 4 in modes or 0 in modes
-            run_others = any(m in modes for m in [1, 2, 3, 5, 6]) or 0 in modes
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7]) or 0 in modes
             run_s5 = 5 in modes or 0 in modes
             run_s6 = 6 in modes or 0 in modes
 
@@ -2743,8 +2768,8 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_3(symbol, df_standard)
                     if run_s5:
                         await evaluate_strategy_5(symbol, df_standard)
-                    if run_s6:
-                        await evaluate_strategy_6(symbol, df_standard)
+                    if run_s6:                         await evaluate_strategy_6(symbol, df_standard)                    if
+)
                 else:
                     log.warning(f"Skipping S1/S2/S3/S5/S6 evaluation for {symbol} due to empty indicator data.")
 
