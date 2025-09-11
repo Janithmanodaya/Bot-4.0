@@ -389,13 +389,6 @@ def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
         ts_ms = None
     return infer_strategy_for_open_trade_at_time_sync(symbol, side, ts_ms)
 
-
-
-
-
-
-None)
-
 def _nearest_closed_index_for_time(df: pd.DataFrame, ts_ms: Optional[int]) -> Optional[int]:
     if df is None or df.empty:
         return None
@@ -973,11 +966,9 @@ def get_public_ip() -> str:
 def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:
     """
     Derive a safe default SL for an imported position.
-    Primary: use S4 (ST2). If it produces an invalid stop (wrong side of price),
-    fall back to ATR-based distance to ensure a valid protective stop.
-    Returns (stop_price, take_price, current_price). take_price is currently unused.
+    Primary: use S4 ST2 supertrend as stop. If invalid (wrong side of price), fall back to ATR-based distance.
+    Returns: (stop_price, take_price, current_price). take_price is 0.0 for imports (no TP by default).
     """
-    # Fetch klines
     df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 300)
     if df is None or df.empty:
         raise RuntimeError("No kline data to calc default SL/TP")
@@ -987,12 +978,9 @@ def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tupl
     st2, _ = supertrend(df.copy(), period=s4_params['ST2_PERIOD'], multiplier=s4_params['ST2_MULT'])
     df['atr'] = atr(df, CONFIG.get("ATR_LENGTH", 14))
 
-    st2_val = safe_last(st2, default=0.0)
-    current_price = safe_last(df['close'], default=entry_price)
-    atr_now = max(1e-9, safe_last(df['atr'], default=0.0))  # avoid zero
-
-    # Start with ST2-based SL
-    stop_price = st2_val
+    current_price = safe_last(df['close'])
+    atr_now = max(1e-9, safe_last(df['atr']))  # avoid zero
+    stop_price = safe_last(st2)
 
     # Validate side and correct if invalid
     if side == 'BUY':
