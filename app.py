@@ -3225,6 +3225,207 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     if df is None or df.empty:
         return
 
+    # --- Pre-Trade Checks ---
+    s4_params = CONFIG['STRATEGY_4']
+    async with managed_trades_lock, pending_limit_orders_lock:
+        if not CONFIG["HEDGING_ENABLED"] and any(t['symbol'] == symbol for t in managed_trades.values()):
+            return
+        if any(p['symbol'] == symbol for p in pending_limit_orders.values()):
+            return
+    
+    required_cols = ['s4_st1_dir', 's4_st2_dir', 's4_st3_dir', 's4_st2', 'open', 'close']
+    if len(df) < 4 or any(col not in df.columns for col in required_cols) or df[required_cols].iloc[-4:].isnull().values.any():
+        log.warning(f"S4: DataFrame for {symbol} is missing required columns or data for evaluation. Kline len: {len(df)}")
+        return
+
+    side = None
+    signal_candle = df.iloc[-2]
+    prev_candle = df.iloc[-3]
+
+    # --- Primary EMA Trend Filter ---
+    allowed_side = 'BOTH' # Default to allowing both sides
+    if s4_params.get('EMA_FILTER_ENABLED', False):
+        ema_period = s4_params.get('EMA_FILTER_PERIOD', 0)
+        if ema_period > 0 and 's4_ema_filter' in df.columns:
+            # This is intentional: we check the CURRENT open price against the EMA
+            # of the CLOSED signal candle to ensure the trend is still valid for entry.
+            entry_price_check = df.iloc[-1]['open']
+            ema_value = signal_candle['s4_ema_filter']
+            
+            candle_open = signal_candle['open']
+            candle_close = signal_candle['close']
+
+            if pd.isna(ema_value) or pd.isna(entry_price_check) or pd.isna(candle_open) or pd.isna(candle_close):
+                _record_rejection(symbol, "S4 EMA Filter Not Ready", {"ema_period": ema_period, "ema_val": ema_value}, signal_candle=signal_candle)
+                return
+            
+            is_cross = min(candle_open, candle_close) < ema_value < max(candle_open, candle_close)
+
+            if is_cross:
+                _record_rejection(symbol, "S4 Price crossing EMA", {"open": candle_open, "close": candle_close, "ema": ema_value}, signal_candle=signal_candle)
+                return
+            elif entry_price_check > ema_value:
+                allowed_side = 'BUY'
+            elif entry_price_check < ema_value:
+                allowed_side = 'SELL'
+        # If filter is enabled but period is 0 or indicator is missing, we don't restrict the side.
+
+    side = None
+    # --- Test Order Logic ---
+    if test_signal:
+        side = test_signal
+        log.info(f"S4 TEST ORDER: Bypassing signal logic for side: {side}")
+    else:
+        # --- Stateful Confluence Logic ---
+        state = s4_confirmation_state[symbol]
+        
+        # Determine the current trend from the slow SuperTrend on the signal candle
+        slow_st_is_buy = signal_candle['s4_st1_dir'] == 1
+        slow_st_is_sell = signal_candle['s4_st1_dir'] == -1
+
+        # Check if the trend has changed since the previous candle
+        st1_flipped_buy = prev_candle['s4_st1_dir'] == -1 and slow_st_is_buy
+        st1_flipped_sell = prev_candle['s4_st1_dir'] == 1 and slow_st_is_sell
+        
+        # If the trend flips, we reset the `trade_taken` flag for the new trend direction,
+        # allowing one trade to be taken in this new trend cycle.
+        if st1_flipped_buy:
+            log.info(f"S4: Slow ST flipped to BUY for {symbol}. Resetting trade-taken flag.")
+            state['buy_trade_taken'] = False
+        elif st1_flipped_sell:
+            log.info(f"S4: Slow ST flipped to SELL for {symbol}. Resetting trade-taken flag.")
+            state['sell_trade_taken'] = False
+
+        # --- Trade Trigger Logic ---
+        # A trade can be taken if the trend is established and a trade for this trend hasn't been taken yet.
+        
+        # Check for BUY signal
+        if allowed_side in ['BUY', 'BOTH'] and slow_st_is_buy and not state.get('buy_trade_taken', False):
+            all_buy_now = (signal_candle['s4_st1_dir'] == 1 and signal_candle['s4_st2_dir'] == 1 and signal_candle['s4_st3_dir'] == 1)
+            if all_buy_now:
+                side = 'BUY'
+                state['buy_trade_taken'] = True # Mark that we've taken a trade for this buy trend
+                log.info(f"S4 Signal: BUY confluence detected for {symbol}.")
+            else:
+                _record_rejection(symbol, "S4 Awaiting Buy Confluence", {"st1": signal_candle['s4_st1_dir'], "st2": signal_candle['s4_st2_dir'], "st3": signal_candle['s4_st3_dir']}, signal_candle=signal_candle)
+        
+        # Check for SELL signal
+        elif allowed_side in ['SELL', 'BOTH'] and slow_st_is_sell and not state.get('sell_trade_taken', False):
+            all_sell_now = (signal_candle['s4_st1_dir'] == -1 and signal_candle['s4_st2_dir'] == -1 and signal_candle['s4_st3_dir'] == -1)
+            if all_sell_now:
+                side = 'SELL'
+                state['sell_trade_taken'] = True # Mark that we've taken a trade for this sell trend
+                log.info(f"S4 Signal: SELL confluence detected for {symbol}.")
+            else:
+                _record_rejection(symbol, "S4 Awaiting Sell Confluence", {"st1": signal_candle['s4_st1_dir'], "st2": signal_candle['s4_st2_dir'], "st3": signal_candle['s4_st3_dir']}, signal_candle=signal_candle)
+
+    # --- Trade Execution ---
+    if not side:
+        return # No trade signal on this candle, exit.
+        
+    log.info(f"S4 Stateful Signal PASSED for {symbol}, side: {side}")
+    
+    current_candle = df.iloc[-1] 
+    entry_price = current_candle['open']
+    stop_loss_price = signal_candle['s4_st2']
+    risk_usd = s4_params['RISK_USD']
+    
+    price_distance = abs(entry_price - stop_loss_price)
+    if price_distance <= 0:
+        _record_rejection(symbol, "S4 Invalid SL Distance", {"entry": entry_price, "sl": stop_loss_price}, signal_candle=signal_candle)
+        return
+
+    ideal_qty = risk_usd / price_distance
+    ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+    min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+    qty_min = min_notional / entry_price if entry_price > 0 else 0.0
+    qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+
+    if ideal_qty < qty_min:
+        _record_rejection(
+            symbol, "S4 Risk Too Low", 
+            {"risk_usd": risk_usd, "ideal_qty": ideal_qty, "min_qty": qty_min, "entry": entry_price, "sl": stop_loss_price},
+            signal_candle=signal_candle
+        )
+        return
+
+    final_qty = ideal_qty
+    if final_qty <= 0:
+        _record_rejection(symbol, "S4 Qty Zero", {"ideal_qty": ideal_qty, "min_qty": qty_min}, signal_candle=signal_candle)
+        return
+
+    notional = final_qty * entry_price
+    balance = await asyncio.to_thread(get_account_balance_usdt)
+    actual_risk_usdt = final_qty * price_distance
+    margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+    
+    uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+    max_leverage_exchange = get_max_leverage(symbol)
+    max_leverage_config = CONFIG.get("MAX_BOT_LEVERAGE", 30)
+    max_leverage = min(max_leverage_config, max_leverage_exchange)
+    leverage = max(1, min(uncapped_leverage, max_leverage))
+
+    log.info(
+        f"Leverage Calculation for {symbol} | Side: {side}\n"
+        f"  - Notional Value: {notional:.4f} | Margin to Use (Risk): {margin_to_use:.4f}\n"
+        f"  - Uncapped Leverage: {uncapped_leverage}x | Final Capped Leverage: {leverage}x"
+    )
+
+    try:
+        log.info(f"S4: Placing MARKET {side} order for {final_qty} {symbol} at ~{entry_price}")
+
+        # --- Set post-trade cooldown immediately to prevent duplicates ---
+        symbol_trade_cooldown[symbol] = datetime.now(timezone.utc) + timedelta(minutes=16)
+        log.info(f"S4: Set 16-minute post-trade cooldown for {symbol} to prevent duplicates before placing order.")
+
+        await asyncio.to_thread(open_market_position_sync, symbol, side, final_qty, leverage)
+
+        pos = None
+        for i in range(10):
+            await asyncio.sleep(0.5)
+            positions = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            pos = next((p for p in positions if p.get('positionSide') == position_side and float(p.get('positionAmt', 0)) != 0), None)
+            if pos:
+                log.info(f"Position for {symbol} found after {i+1} attempts.")
+                break
+        
+        if not pos:
+            raise RuntimeError(f"Position for {symbol} not found after S4 market order (waited 5s).")
+        
+        actual_entry_price = float(pos['entryPrice'])
+        actual_qty = abs(float(pos['positionAmt']))
+        
+        sltp_orders = await asyncio.to_thread(place_batch_sl_tp_sync, symbol, side, sl_price=stop_loss_price, qty=actual_qty)
+
+        trade_id = f"{symbol}_S4_{int(time.time())}"
+        meta = {
+            "id": trade_id, "symbol": symbol, "side": side, "entry_price": actual_entry_price,
+            "initial_qty": actual_qty, "qty": actual_qty, "notional": actual_qty * actual_entry_price,
+            "leverage": leverage, "sl": stop_loss_price, "tp": 0,
+            "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
+            "risk_usdt": actual_risk_usdt, "strategy_id": 4,
+        }
+
+        async with managed_trades_lock:
+            managed_trades[trade_id] = meta
+        await asyncio.to_thread(add_managed_trade_to_db, meta)
+
+        new_trade_msg = (
+            f"✅ *New Trade Opened: S4 (Sequential)*\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Entry:** `{actual_entry_price:.4f}`\n"
+            f"**Initial SL (ST2):** `{stop_loss_price:.4f}`\n"
+            f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_trade_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"Failed to execute S4 trade for {symbol}", e)
+
 async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
     """
     Strategy 5: Advanced crypto-futures strategy
@@ -3371,6 +3572,7 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
 
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"S5 evaluation error for {symbol}", e)
+        return
 
     # --- Pre-Trade Checks ---
     s4_params = CONFIG['STRATEGY_4']
