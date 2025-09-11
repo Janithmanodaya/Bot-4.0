@@ -372,21 +372,51 @@ EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
 def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
     """
-    Best-effort inference using exchange position update time if available,
-    otherwise falls back to most recent closed candles.
+    Try to infer the entry timestamp from the actual fill time of the position,
+    using account trades first (most accurate), then fall back to the position's
+    updateTime, then finally to the most recent closed candle.
+
+    This improves strategy inference accuracy (e.g. distinguishing S6 from S4)
+    because using updateTime can reflect later updates (like SL/TP changes)
+    rather than the original entry fill time.
     """
     ts_ms: Optional[int] = None
     try:
         if client is not None:
-            positions = client.futures_position_information(symbol=symbol)
-            desired_side = 'LONG' if side == 'BUY' else 'SHORT'
-            pos = next((p for p in positions if p.get('positionSide') in (desired_side, 'BOTH')), None)
-            if pos:
-                ut = pos.get('updateTime') or pos.get('updateTimeMs') or pos.get('time')
-                if ut:
-                    ts_ms = int(float(ut))
+            desired_pos_side = 'LONG' if side == 'BUY' else 'SHORT'
+
+            # 1) Prefer the latest trade fill that contributed to the current position side
+            #    This is the most accurate signal time for the entry.
+            try:
+                trades = client.futures_account_trades(symbol=symbol, limit=50)
+                # Find last trade that increased the position on this side
+                # For LONG: side == 'BUY' and positionSide == 'LONG'
+                # For SHORT: side == 'SELL' and positionSide == 'SHORT'
+                contributing = [
+                    t for t in trades
+                    if str(t.get('positionSide', '')).upper() == desired_pos_side
+                    and str(t.get('side', '')).upper() == side
+                ]
+                if contributing:
+                    # Pick the most recent by time
+                    last_trade = max(contributing, key=lambda x: int(x.get('time', 0)))
+                    if last_trade.get('time'):
+                        ts_ms = int(last_trade['time'])
+            except Exception:
+                # Ignore and fall back to position info
+                pass
+
+            # 2) Fallback: use the position's update time (can be later than entry)
+            if ts_ms is None:
+                positions = client.futures_position_information(symbol=symbol)
+                pos = next((p for p in positions if p.get('positionSide') in (desired_pos_side, 'BOTH')), None)
+                if pos:
+                    ut = pos.get('updateTime') or pos.get('updateTimeMs') or pos.get('time')
+                    if ut:
+                        ts_ms = int(float(ut))
     except Exception:
         ts_ms = None
+
     return infer_strategy_for_open_trade_at_time_sync(symbol, side, ts_ms)
 
 def _nearest_closed_index_for_time(df: pd.DataFrame, ts_ms: Optional[int]) -> Optional[int]:
