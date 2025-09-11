@@ -131,6 +131,21 @@ CONFIG = {
         "EMA_FILTER_PERIOD": int(os.getenv("S4_EMA_FILTER_PERIOD", "200")),
         "EMA_FILTER_ENABLED": os.getenv("S4_EMA_FILTER_ENABLED", "false").lower() in ("true", "1", "yes"),
     },
+    "STRATEGY_5": { # Advanced crypto-futures strategy (H1 trend + M15 execution)
+        "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),
+        "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),
+        "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),
+        "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),
+        "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),
+        "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),
+        "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%
+        "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),  # 3.5%
+        "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),         # Same risk model as S4 (fixed risk)
+        "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")),# 30% at 1R
+        "TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
+        "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
+        "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -151,6 +166,11 @@ CONFIG = {
             "ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")), # Value from S4 config
             "BE_TRIGGER": 0.0, # Not used in S4
             "BE_SL_OFFSET": 0.0 # Not used in S4
+        },
+        "5": {  # Advanced H1/M15 strategy (custom trailing logic)
+            "ATR_MULTIPLIER": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
+            "BE_TRIGGER": 0.0,
+            "BE_SL_OFFSET": 0.0
         }
     },
 
@@ -1342,6 +1362,18 @@ def ema(series: pd.Series, length: int) -> pd.Series:
     """Calculates the Exponential Moving Average (EMA)."""
     return series.ewm(span=length, adjust=False).mean()
 
+def swing_low(series_low: pd.Series, lookback: int = 5) -> float:
+    """Returns the most recent swing low over a lookback window."""
+    if series_low is None or len(series_low) < lookback:
+        return float('nan')
+    return float(series_low.iloc[-lookback:].min())
+
+def swing_high(series_high: pd.Series, lookback: int = 5) -> float:
+    """Returns the most recent swing high over a lookback window."""
+    if series_high is None or len(series_high) < lookback:
+        return float('nan')
+    return float(series_high.iloc[-lookback:].max())
+
 def rsi(series: pd.Series, length: int) -> pd.Series:
     """Calculates the Relative Strength Index (RSI)."""
     delta = series.diff()
@@ -2379,7 +2411,7 @@ def calculate_signal_confidence(signal_candle, side: str) -> tuple[float, dict]:
 def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     """
     Determines which strategy to use for a symbol based on market conditions and configuration.
-    Returns the strategy ID (1, 2, 3, 4) or None if no strategy is suitable.
+    Returns the strategy ID (1, 2, 3, 4, 5) or None if no strategy is suitable.
     """
     if df is None or df.empty:
         log.warning(f"Cannot select strategy for {symbol}, dataframe is empty.")
@@ -2396,6 +2428,7 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     s1_params = CONFIG['STRATEGY_1']
     s2_params = CONFIG['STRATEGY_2']
     s3_params = CONFIG['STRATEGY_3']
+    s5_params = CONFIG.get('STRATEGY_5', {})
     
     volatility_ratio_s1 = last['atr'] / last['close'] if last['close'] > 0 else 0
     s1_allowed = volatility_ratio_s1 <= s1_params.get('MAX_VOLATILITY_FOR_ENTRY', 0.03)
@@ -2409,7 +2442,11 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
     # S4 is an evolution of S3, assume it runs under similar volatility conditions.
     s4_allowed = s3_allowed
 
-    log.info(f"Strategy selection checks for {symbol}: S1_allowed={s1_allowed}, S2_allowed={s2_allowed}, S3_allowed={s3_allowed}, S4_allowed={s4_allowed}")
+    # S5 volatility band filter on M15
+    atr_pct = (last['atr'] / last['close']) if last['close'] > 0 else 0
+    s5_allowed = (s5_params and (s5_params.get('VOL_MIN_PCT', 0.003) <= atr_pct <= s5_params.get('VOL_MAX_PCT', 0.035)))
+
+    log.info(f"Strategy selection checks for {symbol}: S1_allowed={s1_allowed}, S2_allowed={s2_allowed}, S3_allowed={s3_allowed}, S4_allowed={s4_allowed}, S5_allowed={s5_allowed}")
 
     # --- Strategy Selection ---
     mode = CONFIG["STRATEGY_MODE"]
@@ -2423,9 +2460,12 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
         if s3_allowed: strategy_id = 3
     elif mode == 4:
         if s4_allowed: strategy_id = 4
+    elif mode == 5:
+        if s5_allowed: strategy_id = 5
     elif mode == 0:  # Auto-select
         # Create a list of potential strategies to try in order of priority
         potential_strategies = []
+        if s5_allowed: potential_strategies.append(5)
         if s4_allowed: potential_strategies.append(4)
         if s3_allowed: potential_strategies.append(3)
         
@@ -2444,7 +2484,7 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
         
         # Iterate through potential strategies and find the first one that is not restricted
         for strat in potential_strategies:
-            if strat in [3, 4]:
+            if strat in [3, 4, 5]:
                 allowed_symbols = ["BTCUSDT", "ETHUSDT"]
                 if symbol not in allowed_symbols:
                     log.info(f"Auto-select: Strategy {strat} is restricted for {symbol}. Trying next.")
@@ -2460,7 +2500,7 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
         return None
 
     # --- Symbol Restriction Check (for non-auto modes) ---
-    if mode in [3, 4] and strategy_id in [3, 4]:
+    if mode in [3, 4, 5] and strategy_id in [3, 4, 5]:
         allowed_symbols = ["BTCUSDT", "ETHUSDT"]
         if symbol not in allowed_symbols:
             log.info(f"Strategy {strategy_id} is restricted and not allowed for {symbol}. Skipping.")
@@ -2573,6 +2613,12 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
+    if 0 in modes or 5 in modes:
+        # ---- Strategy 5 (M15 execution EMAs) ----
+        s5 = CONFIG['STRATEGY_5']
+        out['s5_m15_ema_fast'] = ema(out['close'], s5['EMA_FAST'])
+        out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLOW'])
+
     return out
 
 def _log_env_rejection(symbol: str, reason: str, details: dict):
@@ -2633,7 +2679,8 @@ async def evaluate_and_enter(symbol: str):
         try:
             modes = CONFIG["STRATEGY_MODE"]
             run_s4 = 4 in modes or 0 in modes
-            run_others = any(m in modes for m in [1, 2, 3]) or 0 in modes
+            run_others = any(m in modes for m in [1, 2, 3, 5]) or 0 in modes
+            run_s5 = 5 in modes or 0 in modes
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
@@ -2663,8 +2710,10 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_supertrend(symbol, df_standard)
                     if 3 in modes or 0 in modes:
                         await evaluate_strategy_3(symbol, df_standard)
+                    if run_s5:
+                        await evaluate_strategy_5(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3 evaluation for {symbol} due to empty indicator data.")
+                    log.warning(f"Skipping S1/S2/S3/S5 evaluation for {symbol} due to empty indicator data.")
 
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
@@ -3175,6 +3224,153 @@ async def evaluate_strategy_4(symbol: str, df: pd.DataFrame, test_signal: Option
     global s4_confirmation_state, managed_trades, symbol_trade_cooldown
     if df is None or df.empty:
         return
+
+async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 5: Advanced crypto-futures strategy
+    - H1 trend via EMA(21/55) and SuperTrend(10,3) filter
+    - M15 execution with EMA pullback + momentum/volume filter
+    - Initial stop: structure/ATR hybrid
+    - Risk: fixed USDT like S4 (CONFIG['STRATEGY_5']['RISK_USD'])
+    - Management: handled in monitor thread (BE at +0.5R, 30% at 1R, ATR/swing trailing)
+    """
+    try:
+        s5 = CONFIG['STRATEGY_5']
+
+        # Basic data checks
+        if df_m15 is None or len(df_m15) < 80:
+            _record_rejection(symbol, "S5-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
+            return
+
+        # Compute additional M15 indicators
+        df_m15 = df_m15.copy()
+        df_m15['s5_atr'] = atr(df_m15, s5['ATR_PERIOD'])
+        df_m15['s5_rsi'] = rsi(df_m15['close'], s5['RSI_PERIOD'])
+        df_m15['s5_vol_ma10'] = df_m15['volume'].rolling(10).mean()
+
+        sig = df_m15.iloc[-2]
+        prev = df_m15.iloc[-3]
+
+        # Volatility band filter (M15 ATR%)
+        atr_pct = (sig['s5_atr'] / sig['close']) if sig['close'] > 0 else 0
+        if not (s5['VOL_MIN_PCT'] <= atr_pct <= s5['VOL_MAX_PCT']):
+            _record_rejection(symbol, "S5-ATR pct out of band", {"atr_pct": atr_pct})
+            return
+
+        # Fetch H1 data for trend filter
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < 80:
+            _record_rejection(symbol, "S5-Not enough H1 data", {"len": len(df_h1) if df_h1 is not None else 0})
+            return
+
+        df_h1 = df_h1.copy()
+        df_h1['ema_fast'] = ema(df_h1['close'], s5['EMA_FAST'])
+        df_h1['ema_slow'] = ema(df_h1['close'], s5['EMA_SLOW'])
+        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=s5['H1_ST_PERIOD'], multiplier=s5['H1_ST_MULT'])
+        h1_last = df_h1.iloc[-2]  # last closed H1
+
+        # H1 trend direction
+        h1_bull = (h1_last['ema_fast'] > h1_last['ema_slow']) and (h1_last['close'] > h1_last['st_h1'])
+        h1_bear = (h1_last['ema_fast'] < h1_last['ema_slow']) and (h1_last['close'] < h1_last['st_h1'])
+
+        # M15 execution filters
+        m15_bull_pullback = (sig['s5_m15_ema_fast'] >= sig['s5_m15_ema_slow']) and (prev['low'] <= prev['s5_m15_ema_fast']) and (sig['close'] > sig['s5_m15_ema_fast']) and (sig['close'] > sig['open'])
+        m15_bear_pullback = (sig['s5_m15_ema_fast'] <= sig['s5_m15_ema_slow']) and (prev['high'] >= prev['s5_m15_ema_fast']) and (sig['close'] < sig['s5_m15_ema_fast']) and (sig['close'] < sig['open'])
+
+        vol_spike = (sig['volume'] >= 1.2 * sig['s5_vol_ma10']) if pd.notna(sig['s5_vol_ma10']) else False
+        rsi_ok_long = 35 <= sig['s5_rsi'] <= 65
+        rsi_ok_short = 35 <= sig['s5_rsi'] <= 65
+
+        side = None
+        if h1_bull and m15_bull_pullback and vol_spike and rsi_ok_long:
+            side = 'BUY'
+        elif h1_bear and m15_bear_pullback and vol_spike and rsi_ok_short:
+            side = 'SELL'
+        else:
+            _record_rejection(symbol, "S5-No confluence", {"h1_bull": h1_bull, "h1_bear": h1_bear, "vol_spike": bool(vol_spike), "rsi": float(sig['s5_rsi'])})
+            return
+
+        # Entry at signal close (limit)
+        entry_price = float(sig['close'])
+
+        # Initial stop: structure + ATR hybrid
+        swing_lookback = 5
+        if side == 'BUY':
+            tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())
+            atr_stop = entry_price - 1.5 * float(sig['s5_atr'])
+            stop_price = min(atr_stop, tech_inval)  # ensure stop at/below swing low
+        else:  # SELL
+            tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())
+            atr_stop = entry_price + 1.5 * float(sig['s5_atr'])
+            stop_price = max(atr_stop, tech_inval)  # ensure stop at/above swing high
+
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S5-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        # Risk model: same as S4 (fixed USDT risk)
+        risk_usd = float(s5['RISK_USD'])
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        # Enforce min notional
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = min_notional / entry_price if entry_price > 0 else 0.0
+        qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+
+        if ideal_qty < qty_min or ideal_qty <= 0:
+            _record_rejection(symbol, "S5-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        final_qty = ideal_qty
+        notional = final_qty * entry_price
+
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        actual_risk_usdt = final_qty * distance
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place LIMIT order with SL only (TP handled by monitor logic)
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+        expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": None, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 5,
+            "atr_at_entry": float(sig['s5_atr']),
+            "trailing": True
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ *New Pending Order: S5-Adv*"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Price:** `{entry_price:.4f}`\n"
+            f"**Qty:** `{final_qty}`\n"
+            f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S5 evaluation error for {symbol}", e)
 
     # --- Pre-Trade Checks ---
     s4_params = CONFIG['STRATEGY_4']
@@ -3690,7 +3886,7 @@ def monitor_thread_func():
                                 "initial_qty": p_meta['qty'], "qty": p_meta['qty'], "notional": p_meta['qty'] * actual_entry_price,
                                 "leverage": p_meta['leverage'],
                                 "sl": stop_price,
-                                "tp": take_price, # The internally monitored TP level
+                                "tp": take_price, # The internally monitored TP level (may be None)
                                 "open_time": datetime.utcnow().isoformat(), "sltp_orders": sltp_orders,
                                 "be_moved": False,
                                 "trailing_active": False,
@@ -3705,6 +3901,12 @@ def monitor_thread_func():
                                 "macd_confirmation": p_meta.get('macd_confirmation'),
                                 "atr_at_entry": p_meta.get('atr_at_entry')
                             }
+                            # --- S5 initialization of R and TP1 ---
+                            if meta['strategy_id'] == 5:                                 r_dist = abs(actual_entry_price - stop_price)                                 meta['s5_initial_sl'] = stop_price                                 meta['s5_r_per_unit'] = r_dist                                 if r_dist and r_dist > 0:                                     tp1_price = actual_entry_price + r_dist if meta['side'] == 'BUY' else actual_entry_price - r_dist                                     meta['s5_tp1_price'] = tp1_price                                 else:                                     meta['s5_tp1_price'] = None                                 meta['trade_phase'] = 0                                # Activate trailing immediately (generic ATR trail) until custom logic is added
+                                meta['trailing_active'] = True                                meta['be_moved'] = T_coderunewe</
+
+
+ase'] = 0
 
                             with managed_trades_lock:
                                 managed_trades[trade_id] = meta
