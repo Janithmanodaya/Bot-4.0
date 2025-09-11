@@ -81,7 +81,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "4"),  # 0=all, or comma-separated, e.g., "1,2"
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7"),  # 0=all, or comma-separated, e.g., "1,2"
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -2639,7 +2639,10 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
 
     out = df.copy()
-    modes = CONFIG["STRATEGY_MODE"] # This is now a list
+    # Restrict to strategies 5, 6, 7 only per plan
+    modes = [m for m in CONFIG["STRATEGY_MODE"] if m in (5, 6, 7)]
+    if not modes:
+        modes = [5, 6, 7]
 
     # ---- Common Indicators (calculated for most strategies) ----
     out['atr'] = atr(out, CONFIG["ATR_LENGTH"])
@@ -2674,8 +2677,11 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
-    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG['STRATEGY_5']         out['s5_m15_ema_fast'] = ema(out['close'], s5['EMA_FAST'])         out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLO_code
-W'])
+    if 0 in modes or 5 in modes:
+        # ---- Strategy 5 (M15 execution EMAs) ----
+        s5 = CONFIG['STRATEGY_5']
+        out['s5_m15_ema_fast'] = ema(out['close'], s5['EMA_FAST'])
+        out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLOW'])
 
     return out
 
@@ -3500,6 +3506,11 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
     try:
         s5 = CONFIG['STRATEGY_5']
 
+        # Restrict to BTC/ETH only as per plan
+        if symbol not in ("BTCUSDT", "ETHUSDT"):
+            _record_rejection(symbol, "S5-Restricted symbol", {"allowed": "BTCUSDT,ETHUSDT"})
+            return
+
         # Basic data checks
         if df_m15 is None or len(df_m15) < 80:
             _record_rejection(symbol, "S5-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
@@ -3635,6 +3646,8 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"S5 evaluation error for {symbol}", e)
         return
+
+    return
 
     # --- Pre-Trade Checks ---
     s4_params = CONFIG['STRATEGY_4']
