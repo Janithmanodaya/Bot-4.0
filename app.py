@@ -370,6 +370,119 @@ next_scan_time: Optional[datetime] = None
 # Exchange info cache
 EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None, "ttl": 300}  # ttl seconds
 
+def infer_strategy_for_open_trade_sync(symbol: str, side: str) -> Optional[int]:
+    """
+    Best-effort inference of which strategy likely opened the current position.
+    Priority: 5, 6, 7, 4, 3, 2, 1
+    Uses last closed candles and HTF signals to determine a plausible strategy.
+    """
+    try:
+        # Fetch M15 (or configured) data
+        df = fetch_klines_sync(symbol, CONFIG["TIMEFRAME"], 300)
+        if df is None or len(df) < 80:
+            return None
+        df_ind = calculate_all_indicators(df.copy())
+
+        # Helper: get last two closed candles
+        sig = df_ind.iloc[-2]; prev = df_ind.iloc[-3]
+
+        # 1) S5 check (H1 trend + M15 execution)
+        try:
+            s5 = CONFIG.get('STRATEGY_5', {})
+            df_h1 = fetch_klines_sync(symbol, '1h', 300)
+            if df_h1 is not None and len(df_h1) >= 80:
+                df_h1 = df_h1.copy()
+                df_h1['ema_fast'] = ema(df_h1['close'], s5.get('EMA_FAST', 21))
+                df_h1['ema_slow'] = ema(df_h1['close'], s5.get('EMA_SLOW', 55))
+                df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=s5.get('H1_ST_PERIOD', 10), multiplier=s5.get('H1_ST_MULT', 3.0))
+                h1_last = df_h1.iloc[-2]
+                h1_bull = (h1_last['ema_fast'] > h1_last['ema_slow']) and (h1_last['close'] > h1_last['st_h1'])
+                h1_bear = (h1_last['ema_fast'] < h1_last['ema_slow']) and (h1_last['close'] < h1_last['st_h1'])
+                df_ind['s5_m15_ema_fast'] = ema(df_ind['close'], s5.get('EMA_FAST', 21))
+                df_ind['s5_m15_ema_slow'] = ema(df_ind['close'], s5.get('EMA_SLOW', 55))
+                df_ind['s5_atr'] = atr(df_ind, s5.get('ATR_PERIOD', 14))
+                df_ind['s5_rsi'] = rsi(df_ind['close'], s5.get('RSI_PERIOD', 14))
+                df_ind['s5_vol_ma10'] = df_ind['volume'].rolling(10).mean()
+                sig = df_ind.iloc[-2]; prev = df_ind.iloc[-3]
+                m15_bull_pullback = (sig['s5_m15_ema_fast'] >= sig['s5_m15_ema_slow']) and (prev['low'] <= prev['s5_m15_ema_fast']) and (sig['close'] > sig['s5_m15_ema_fast']) and (sig['close'] > sig['open'])
+                m15_bear_pullback = (sig['s5_m15_ema_fast'] <= sig['s5_m15_ema_slow']) and (prev['high'] >= prev['s5_m15_ema_fast']) and (sig['close'] < sig['s5_m15_ema_fast']) and (sig['close'] < sig['open'])
+                vol_spike = (sig['volume'] >= 1.2 * sig['s5_vol_ma10']) if pd.notna(sig['s5_vol_ma10']) else False
+                rsi_ok = 35 <= sig['s5_rsi'] <= 65
+                if (side == 'BUY' and h1_bull and m15_bull_pullback and vol_spike and rsi_ok) or \
+                   (side == 'SELL' and h1_bear and m15_bear_pullback and vol_spike and rsi_ok):
+                    return 5
+        except Exception:
+            pass
+
+        # 2) S6 check (price action rejection + follow-through)
+        try:
+            s6 = CONFIG.get('STRATEGY_6', {})
+            df_ind['s6_atr'] = atr(df_ind, s6.get('ATR_PERIOD', 14))
+            sig = df_ind.iloc[-2]; prev = df_ind.iloc[-3]; ft = df_ind.iloc[-1]
+            # Minimal POI proxy: use recent swing highs/lows on H4/Daily for direction
+            df_h4 = fetch_klines_sync(symbol, '4h', 200)
+            df_d = fetch_klines_sync(symbol, '1d', 200)
+            if df_h4 is not None and df_d is not None and len(df_h4) >= 50 and len(df_d) >= 50:
+                bias_d = _s6_trend_from_swings(df_d, swing_lookback=20)
+                direction = 'BUY' if bias_d == 'BULL' else ('SELL' if bias_d == 'BEAR' else None)
+                if direction == side:
+                    is_pin = _s6_is_pin_bar(sig, direction)
+                    is_engulf = _s6_is_engulfing_reclaim(sig, prev, direction, float(sig['close']))
+                    vol_ma = float(df_ind['volume'].rolling(int(s6.get('VOL_MA_LEN', 10))).mean().iloc[-2])
+                    if (is_pin or is_engulf) and _s6_follow_through_ok(sig, ft, direction, vol_ma, float(s6.get('FOLLOW_THROUGH_RATIO', 0.7))):
+                        return 6
+        except Exception:
+            pass
+
+        # 3) S7 check (H1 BOS + M15 POI touch + rejection)
+        try:
+            s7 = CONFIG.get('STRATEGY_7', {})
+            df_h1 = fetch_klines_sync(symbol, '1h', 300)
+            if df_h1 is not None and len(df_h1) >= 120:
+                lookback = int(s7.get('BOS_LOOKBACK_H1', 72))
+                sig_h1 = df_h1.iloc[-2]
+                prev_window_high = float(df_h1['high'].iloc[-(lookback+2):-2].max())
+                prev_window_low = float(df_h1['low'].iloc[-(lookback+2):-2].min())
+                dir_detected = 'BUY' if float(sig_h1['close']) > prev_window_high else ('SELL' if float(sig_h1['close']) < prev_window_low else None)
+                if dir_detected == side:
+                    # simple rejection near POI ~ close price
+                    is_pin = _s6_is_pin_bar(sig, side)
+                    is_engulf = _s6_is_engulfing_reclaim(sig, prev, side, float(sig['close']))
+                    if is_pin or is_engulf:
+                        return 7
+        except Exception:
+            pass
+
+        # 4) Use simulate functions for S4/S3/S2/S1
+        try:
+            sim4 = simulate_strategy_4(symbol, df_ind)
+            if sim4 and sim4.get('side') == side:
+                return 4
+        except Exception:
+            pass
+        try:
+            sim3 = simulate_strategy_3(symbol, df_ind)
+            if sim3 and sim3.get('side') == side:
+                return 3
+        except Exception:
+            pass
+        try:
+            sim2 = simulate_strategy_supertrend(symbol, df_ind)
+            if sim2 and sim2.get('side') == side:
+                return 2
+        except Exception:
+            pass
+        try:
+            sim1 = simulate_strategy_bb(symbol, df_ind)
+            if sim1 and sim1.get('side') == side:
+                return 1
+        except Exception:
+            pass
+
+        return None
+    except Exception:
+        return None
+
 async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) -> Optional[tuple[str, Dict[str, Any]]]:
     """
     Imports a single rogue position, places a default SL order, and returns the trade metadata.
@@ -397,16 +510,31 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
             log.warning(f"Rogue import for {symbol} calculated an invalid SL ({stop_price}) which is <= current price ({current_price}). Skipping SL placement.")
             stop_price = None # Do not place an SL
 
+        # Infer strategy for better in-trade management
+        inferred_strategy = await asyncio.to_thread(infer_strategy_for_open_trade_sync, symbol, side)
+        if inferred_strategy is None:
+            inferred_strategy = 4  # fallback
+
         trade_id = f"{symbol}_imported_{int(time.time())}"
         meta = {
             "id": trade_id, "symbol": symbol, "side": side, "entry_price": entry_price,
             "initial_qty": qty, "qty": qty, "notional": notional, "leverage": leverage,
-            "sl": stop_price if stop_price is not None else 0, "tp": 0, "open_time": datetime.utcnow().isoformat(),
+            "sl": stop_price if stop_price is not None else 0.0, "tp": 0.0, "open_time": datetime.utcnow().isoformat(),
             "sltp_orders": {}, "trailing": CONFIG["TRAILING_ENABLED"],
             "dyn_sltp": False, "tp1": None, "tp2": None, "tp3": None,
             "trade_phase": 0, "be_moved": False, "risk_usdt": 0.0,
-            "strategy_id": 4,
+            "strategy_id": inferred_strategy,
         }
+
+        # Initialize S5-specific management state if inferred as S5
+        if inferred_strategy == 5 and stop_price is not None and stop_price > 0:
+            r_dist = abs(entry_price - stop_price)
+            meta['s5_initial_sl'] = stop_price
+            meta['s5_r_per_unit'] = r_dist
+            meta['s5_tp1_price'] = (entry_price + r_dist) if side == 'BUY' else (entry_price - r_dist)
+            meta['trade_phase'] = 0
+            meta['be_moved'] = False
+            meta['trailing_active'] = False
 
         await asyncio.to_thread(add_managed_trade_to_db, meta)
 
@@ -422,6 +550,7 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
                    f"**Side:** {side}\n"
                    f"**Entry Price:** {entry_price}\n"
                    f"**Quantity:** {qty}\n\n"
+                   f"**Inferred Strategy:** S{inferred_strategy}\n"
                    f"A default SL has been calculated and placed:\n"
                    f"**SL:** `{round_price(symbol, stop_price)}`\n\n"
                    f"The bot will now manage this trade.")
@@ -430,6 +559,7 @@ async def _import_rogue_position_async(symbol: str, position: Dict[str, Any]) ->
             log.warning(f"No valid SL placed for imported trade {symbol}. Please manage manually.")
             msg = (f"ℹ️ **Position Imported (No SL)**\n\n"
                    f"Found and imported a position for **{symbol}** but could not place a valid SL.\n\n"
+                   f"**Inferred Strategy:** S{inferred_strategy}\n"
                    f"**Please manage this trade manually.**")
             await asyncio.to_thread(send_telegram, msg)
 
@@ -1287,9 +1417,14 @@ def record_trade(rec: Dict[str, Any]):
 def add_managed_trade_to_db(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cur = conn.cursor()
+
+    # Coalesce required NOT NULL fields to safe defaults
+    sl_val = rec.get('sl', 0.0) if rec.get('sl', None) is not None else 0.0
+    tp_val = rec.get('tp', 0.0) if rec.get('tp', None) is not None else 0.0
+
     values = (
         rec['id'], rec['symbol'], rec['side'], rec['entry_price'], rec['initial_qty'],
-        rec['qty'], rec['notional'], rec['leverage'], rec['sl'], rec['tp'],
+        rec['qty'], rec['notional'], rec['leverage'], sl_val, tp_val,
         rec['open_time'], json.dumps(rec.get('sltp_orders')),
         int(rec.get('trailing', False)), int(rec.get('dyn_sltp', False)),
         rec.get('tp1'), rec.get('tp2'), rec.get('tp3'),
