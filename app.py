@@ -1445,9 +1445,18 @@ def init_db():
 def add_pending_order_to_db(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
     cur = conn.cursor()
+
+    # Coalesce NOT NULL columns to safe defaults
+    stop_val = rec.get('stop_price', 0.0)
+    if stop_val is None:
+        stop_val = 0.0
+    take_val = rec.get('take_price', 0.0)
+    if take_val is None:
+        take_val = 0.0
+
     values = (
         rec.get('id'), rec.get('order_id'), rec.get('symbol'), rec.get('side'),
-        rec.get('qty'), rec.get('limit_price'), rec.get('stop_price'), rec.get('take_price'),
+        rec.get('qty'), rec.get('limit_price'), stop_val, take_val,
         rec.get('leverage'), rec.get('risk_usdt'), rec.get('place_time'), rec.get('expiry_time'),
         rec.get('strategy_id'), rec.get('atr_at_entry'), int(rec.get('trailing', False))
     )
