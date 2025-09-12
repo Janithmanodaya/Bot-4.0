@@ -3953,9 +3953,7 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             return
 
         # Risk model: same as S4 (fixed USDT risk)
-        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0._code
-
-
+        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5)))
 
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
@@ -5535,7 +5533,8 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             # ATR/Supertrend based SLs don't change with entry price
             pass 
         elif strategy_id == 3:
-            sl_mult_s3 = CONFIG.get('STRATEGY_3', {}).get('INITIAL_STOP_PCT', CONFIG.get('STRATEGY_3', {}).get('FALLBACK_SL_PCT', 0.015))slC_price = actual_entry_price * (1 - sl_mult_s3) if side == 'BUY' else actual_entry_price * (1 + sl_mult_code_snew3</)
+            sl_mult_s3 = CONFIG.get('STRATEGY_3', {}).get('INITIAL_STOP_PCT', CONFIG.get('STRATEGY_3', {}).get('FALLBACK_SL_PCT', 0.015))slC_price = actual_entry_price * (1 - sl_mult_s3) if side == 'BUY' else actual_entry_price * (1 + sl_mult_code
+_snew3</)
 '])
         elif strategy_id == 4:
             sl_price = actual_entry_price * (1 - CONFIG['STRATEGY_4']['INITIAL_STOP_PCT']) if side == 'BUY' else actual_entry_price * (1 + CONFIG['STRATEGY_4']['INITIAL_STOP_PCT'])
