@@ -131,8 +131,22 @@ CONFIG = {
         "EMA_FILTER_PERIOD": int(os.getenv("S4_EMA_FILTER_PERIOD", "200")),
         "EMA_FILTER_ENABLED": os.getenv("S4_EMA_FILTER_ENABLED", "false").lower() in ("true", "1", "yes"),
     },
-    "STRATEGY_5": { # Advanced crypto-futures strategy (H1 trend + M15 execution)         "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),         "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),         "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),         "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),         "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),         "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),         "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%         "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),  # 3.5%         "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),         # Same risk model as S4 (fixed risk)         "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")),# 30% at 1R        " TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),        " TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),        " MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),        " SYMBOLS": os.getenv("S5_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),  _code  new}</,
-},
+    "STRATEGY_5": { # Advanced crypto-futures strategy (H1 trend + M15 execution)
+        "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),
+        "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),
+        "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),
+        "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),
+        "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),
+        "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),
+        "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%
+        "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),  # 3.5%
+        "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),         # Same risk model as S4 (fixed risk)
+        "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")),# 30% at 1R
+        "TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
+        "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
+        "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
+        "SYMBOLS": os.getenv("S5_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),
+    },
     "STRATEGY_6": { # Price-Action only (single high-probability trade per day)
         "ATR_PERIOD": int(os.getenv("S6_ATR_PERIOD", "14")),
         "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER", "0.25")),
@@ -2995,18 +3009,25 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
-    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG.get('STRATEGY_5', {})       u ema_fast = int(s5.get('EMA_FAST', 21))         ema_slow = int(s5.get('EMA_SLOW', 55))       ) out['s5_m15_ema_fast'] = ema(out['close'], ema_fast)        out['s5_m15_ema_slow'] = ema(out['close'], ema_sl_codeownew)</
+    if 0 in modes or 5 in modes:
+        # ---- Strategy 5 (M15 execution EMAs) ----
+        s5_params = CONFIG.get('STRATEGY_5', {})
+        ef = int(s5_params.get('EMA_FAST', 21))
+        es = int(s5_params.get('EMA_SLOW', 55))
+        out['s5_m15_ema_fast'] = ema(out['close'], ef)
+        out['s5_m15_ema_slow'] = ema(out['close'], es)
 
-fast'] = ema(out['close'], ema_fast_len)        out['s5_m15_ema_slow'] = ema(out['close'], ema_slow_l_codeennew)</
+    # Defensive: ensure S5 M15 EMAs exist if S5 active
+    try:
+        if 0 in modes or 5 in modes:
+            if 's5_m15_ema_fast' not in out.columns:
+                out['s5_m15_ema_fast'] = ema(out['close'], int(CONFIG.get('STRATEGY_5', {}).get('EMA_FAST', 21)))
+            if 's5_m15_ema_slow' not in out.columns:
+                out['s5_m15_ema_slow'] = ema(out['close'], int(CONFIG.get('STRATEGY_5', {}).get('EMA_SLOW', 55)))
+    except Exception:
+        pass
 
-SLOW'])
-
-    # Ensure S5 M15 EMAs exist even if earlier block failed or was skipped    try:
-        if (0 in modes or 5 in modes) and (('s5_m15_ema_fast' not in out.columns) or ('s5_m15_ema_slow' not in out.columns)):            s5 = CONFIG.get('STRATEGY_5', {})
-            ef = int(s5.get('EMA_FAST', 21))            es = int(s5.get('EMA_SLOW', 55))
-            out['s5_m15_ema_fast'] = ema(out['close'], ef)            out['s5_m15_ema_slow'] = ema(out['close'], es)
-    except Exception:        # Defensive: never let indicator calc crash the pipeline
-        pass    return _codeounewt</
+    return out
 
 
 
@@ -3932,7 +3953,9 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             return
 
         # Risk model: same as S4 (fixed USDT risk)
-        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5_code0)new)</)
+        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0._code
+
+
 
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
@@ -4405,7 +4428,7 @@ async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S6-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
             return
 
-        risk_usd = float(s6.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5_code0)new)</)
+        risk_usd = float(s6.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5)))
 
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
