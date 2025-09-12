@@ -2112,13 +2112,16 @@ def round_price(symbol: str, price: float) -> str:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
 
-def place_limit_order_sync(symbol: str, side: str, qty: float, price: float):
+def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, leverage: Optional[int] = None):
     """
-    Places a single limit order. This is a blocking call.
+    Places a single limit order with safety features:
+    - Optionally ensure leverage is set before placing the order (if provided).
+    - Optional pre-check for available margin and scale down qty if needed.
+    - Retry once on Binance -2019 (Margin is insufficient) by halving qty.
     """
     global client, IS_HEDGE_MODE
     if CONFIG["DRY_RUN"]:
-        log.info(f"[DRY RUN] Would place LIMIT {side} order for {qty} {symbol} at {price}.")
+        log.info(f"[DRY RUN] Would place LIMIT {side} order for {qty} {symbol} at {price} (lev={leverage}).")
         dry_run_id = int(time.time())
         return {
             "orderId": f"dryrun_limit_{dry_run_id}", "symbol": symbol, "status": "NEW",
@@ -2131,6 +2134,60 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float):
 
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
 
+    # 1) Try to set requested leverage first (if provided), else set to a safe default (MAX_BOT_LEVERAGE capped by exchange)
+    try:
+        max_lev_allowed = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        if leverage is None:
+            lev_to_set = int(max(1, max_lev_allowed))
+        else:
+            lev_to_set = int(max(1, min(int(leverage), max_lev_allowed)))
+            if lev_to_set != leverage:
+                log.info(f"Adjusted requested leverage for {symbol} from {leverage}x to {lev_to_set}x based on caps.")
+        client.futures_change_leverage(symbol=symbol, leverage=lev_to_set)
+        log.info(f"Leverage set to {lev_to_set}x for {symbol} before LIMIT order.")
+    except Exception as e:
+        log.warning(f"Failed to change leverage for {symbol} to {leverage if leverage is not None else 'default'}x (non-fatal): {e}")
+
+    # 2) Optional pre-check: estimate initial margin and compare against available balance
+    try:
+        notional = float(qty) * float(price)
+        lev_for_check = max(1, int(leverage)) if leverage else 1
+        est_initial_margin = notional / lev_for_check if notional > 0 else 0.0
+
+        # Fetch available balance (USDT) from futures account
+        avail_usdt = 0.0
+        try:
+            balances = client.futures_account_balance()
+            usdt_row = next((b for b in balances if str(b.get('asset')) == 'USDT'), None)
+            if usdt_row:
+                # availableBalance is the recommended field
+                avail_usdt = float(usdt_row.get('availableBalance') or usdt_row.get('balance') or 0.0)
+        except Exception:
+            # Fall back to existing helper if available in codebase
+            try:
+                avail_usdt = float(get_account_balance_usdt())
+            except Exception:
+                avail_usdt = 0.0
+
+        if est_initial_margin > 0 and avail_usdt > 0 and est_initial_margin > avail_usdt:
+            # Scale down qty to fit available margin with a small buffer
+            scale = (avail_usdt * 0.98) / est_initial_margin
+            new_qty = round_qty(symbol, max(0.0, qty * scale), rounding=ROUND_DOWN)
+            # Enforce min notional if possible
+            min_notional = get_min_notional_sync(symbol)
+            qty_min = round_qty(symbol, (min_notional / price) if price > 0 else 0.0, rounding=ROUND_CEILING)
+            if new_qty < qty_min:
+                log.info(f"Pre-check: insufficient margin for {symbol}. Needed ~{est_initial_margin:.4f} USDT, "
+                         f"available {avail_usdt:.4f}. Scaled qty {new_qty} below min {qty_min}; "
+                         f"rejecting order.")
+                raise RuntimeError("Pre-check insufficient margin: qty below minimum after scaling.")
+            if new_qty < qty:
+                log.info(f"Pre-check: scaling down qty for {symbol} from {qty} to {new_qty} to fit available margin "
+                         f"(est_margin={est_initial_margin:.4f}, avail={avail_usdt:.4f}, lev={lev_for_check}).")
+                qty = new_qty
+    except Exception as e:
+        log.warning(f"Pre-check for margin failed for {symbol}: {e}. Proceeding without pre-scale.")
+
     params = {
         'symbol': symbol,
         'side': side,
@@ -2139,17 +2196,38 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float):
         'price': round_price(symbol, price),
         'timeInForce': 'GTC'  # Good-Til-Cancelled
     }
-
     if IS_HEDGE_MODE:
         params['positionSide'] = position_side
 
+    # 3) Place order with one retry on -2019 by halving qty
+    def _try_place(p):
+        log.info(f"Attempting to place limit order with params: {p}")
+        resp = client.futures_create_order(**p)
+        log.info(f"Limit order placement successful for {symbol}. Response: {resp}")
+        return resp
+
     try:
-        # Enhanced logging for debugging price formatting issues
-        log.info(f"Attempting to place limit order with params: {params}")
-        order_response = client.futures_create_order(**params)
-        log.info(f"Limit order placement successful for {symbol}. Response: {order_response}")
-        return order_response
+        return _try_place(params)
     except BinanceAPIException as e:
+        if e.code == -2019:
+            # Retry once with half qty
+            try:
+                original_qty = float(params['quantity'])
+                retry_qty = round_qty(symbol, max(0.0, original_qty / 2.0), rounding=ROUND_DOWN)
+                min_notional = get_min_notional_sync(symbol)
+                qty_min = round_qty(symbol, (min_notional / price) if price > 0 else 0.0, rounding=ROUND_CEILING)
+                if retry_qty <= 0 or retry_qty < qty_min:
+                    log.error(f"Retry on -2019 aborted for {symbol}: halved qty {retry_qty} below min {qty_min}. "
+                              f"Rejecting order.")
+                    raise
+                retry_params = dict(params)
+                retry_params['quantity'] = str(retry_qty)
+                log.warning(f"Binance -2019 (insufficient margin) for {symbol}. Retrying once with qty {retry_qty} "
+                            f"(was {original_qty}).")
+                return _try_place(retry_params)
+            except Exception as retry_e:
+                log.exception(f"Retry after -2019 failed for {symbol}: {retry_e}")
+                raise
         log.exception("BinanceAPIException placing limit order: %s", e)
         raise
     except Exception as e:
