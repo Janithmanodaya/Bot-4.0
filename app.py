@@ -3854,17 +3854,27 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S5-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
             return
 
-        # Compute additional M15 indicators
+        # Compute additional M15 indicators (use local series values to avoid row KeyErrors)
         df_m15 = df_m15.copy()
-        df_m15['s5_atr'] = atr(df_m15, s5['ATR_PERIOD'])
-        df_m15['s5_rsi'] = rsi(df_m15['close'], s5['RSI_PERIOD'])
-        df_m15['s5_vol_ma10'] = df_m15['volume'].rolling(10).mean()
+        s5_atr_series = atr(df_m15, s5['ATR_PERIOD'])
+        s5_rsi_series = rsi(df_m15['close'], s5['RSI_PERIOD'])
+        s5_vol_ma10_series = df_m15['volume'].rolling(10).mean()
+
+        # Keep columns for any downstream consumers, but read via series for safety
+        df_m15['s5_atr'] = s5_atr_series
+        df_m15['s5_rsi'] = s5_rsi_series
+        df_m15['s5_vol_ma10'] = s5_vol_ma10_series
 
         sig = df_m15.iloc[-2]
         prev = df_m15.iloc[-3]
 
+        # Pre-extract robust values from series
+        s5_atr_val = float(s5_atr_series.iloc[-2]) if len(s5_atr_series) >= 2 and pd.notna(s5_atr_series.iloc[-2]) else float('nan')
+        s5_rsi_val = float(s5_rsi_series.iloc[-2]) if len(s5_rsi_series) >= 2 and pd.notna(s5_rsi_series.iloc[-2]) else float('nan')
+        s5_vol_ma10_val = float(s5_vol_ma10_series.iloc[-2]) if len(s5_vol_ma10_series) >= 2 and pd.notna(s5_vol_ma10_series.iloc[-2]) else float('nan')
+
         # Volatility band filter (M15 ATR%)
-        atr_pct = (sig['s5_atr'] / sig['close']) if sig['close'] > 0 else 0
+        atr_pct = (s5_atr_val / float(sig['close'])) if float(sig['close']) > 0 and np.isfinite(s5_atr_val) else 0.0
         if not (s5['VOL_MIN_PCT'] <= atr_pct <= s5['VOL_MAX_PCT']):
             _record_rejection(symbol, "S5-ATR pct out of band", {"atr_pct": atr_pct})
             return
@@ -3889,9 +3899,9 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         m15_bull_pullback = (sig['s5_m15_ema_fast'] >= sig['s5_m15_ema_slow']) and (prev['low'] <= prev['s5_m15_ema_fast']) and (sig['close'] > sig['s5_m15_ema_fast']) and (sig['close'] > sig['open'])
         m15_bear_pullback = (sig['s5_m15_ema_fast'] <= sig['s5_m15_ema_slow']) and (prev['high'] >= prev['s5_m15_ema_fast']) and (sig['close'] < sig['s5_m15_ema_fast']) and (sig['close'] < sig['open'])
 
-        vol_spike = (sig['volume'] >= 1.2 * sig['s5_vol_ma10']) if pd.notna(sig['s5_vol_ma10']) else False
-        rsi_ok_long = 35 <= sig['s5_rsi'] <= 65
-        rsi_ok_short = 35 <= sig['s5_rsi'] <= 65
+        vol_spike = (float(sig['volume']) >= 1.2 * s5_vol_ma10_val) if np.isfinite(s5_vol_ma10_val) else False
+        rsi_ok_long = 35 <= s5_rsi_val <= 65 if np.isfinite(s5_rsi_val) else False
+        rsi_ok_short = 35 <= s5_rsi_val <= 65 if np.isfinite(s5_rsi_val) else False
 
         side = None
         if h1_bull and m15_bull_pullback and vol_spike and rsi_ok_long:
@@ -3899,7 +3909,7 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         elif h1_bear and m15_bear_pullback and vol_spike and rsi_ok_short:
             side = 'SELL'
         else:
-            _record_rejection(symbol, "S5-No confluence", {"h1_bull": h1_bull, "h1_bear": h1_bear, "vol_spike": bool(vol_spike), "rsi": float(sig['s5_rsi'])})
+            _record_rejection(symbol, "S5-No confluence", {"h1_bull": h1_bull, "h1_bear": h1_bear, "vol_spike": bool(vol_spike), "rsi": s5_rsi_val})
             return
 
         # Entry at signal close (limit)
@@ -3909,11 +3919,11 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         swing_lookback = 5
         if side == 'BUY':
             tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())
-            atr_stop = entry_price - 1.5 * float(sig['s5_atr'])
+            atr_stop = entry_price - 1.5 * s5_atr_val
             stop_price = min(atr_stop, tech_inval)  # ensure stop at/below swing low
         else:  # SELL
             tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())
-            atr_stop = entry_price + 1.5 * float(sig['s5_atr'])
+            atr_stop = entry_price + 1.5 * s5_atr_val
             stop_price = max(atr_stop, tech_inval)  # ensure stop at/above swing high
 
         distance = abs(entry_price - stop_price)
@@ -3961,7 +3971,7 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
             "expiry_time": expiry_time.isoformat(),
             "strategy_id": 5,
-            "atr_at_entry": float(sig['s5_atr']),
+            "atr_at_entry": s5_atr_val,
             "trailing": True
         }
 
