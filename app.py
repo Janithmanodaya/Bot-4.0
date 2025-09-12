@@ -2995,7 +2995,9 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
-    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG.get('STRATEGY_5', {})       u ema_fast_len = int(s5.get('EMA_FAST', 21))       A ema_slow_len = int(s5.get('EMA_SLOW', 55))       c out['s5_m15_ema_fast'] = ema(out['close'], ema_fast_len)        out['s5_m15_ema_slow'] = ema(out['close'], ema_slow_l_codeennew)</
+    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG.get('STRATEGY_5', {})       u ema_fast = int(s5.get('EMA_FAST', 21))         ema_slow = int(s5.get('EMA_SLOW', 55))       ) out['s5_m15_ema_fast'] = ema(out['close'], ema_fast)        out['s5_m15_ema_slow'] = ema(out['close'], ema_sl_codeownew)</
+
+fast'] = ema(out['close'], ema_fast_len)        out['s5_m15_ema_slow'] = ema(out['close'], ema_slow_l_codeennew)</
 
 SLOW'])
 
@@ -3868,8 +3870,10 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         prev = df_m15.iloc[-3]
 
         # Volatility band filter (M15 ATR%)
+        min_pct = float(s5.get('VOL_MIN_PCT', 0.003))
+        max_pct = float(s5.get('VOL_MAX_PCT', 0.035))
         atr_pct = (sig['s5_atr'] / sig['close']) if sig['close'] > 0 else 0
-        if not (s5['VOL_MIN_PCT'] <= atr_pct <= s5['VOL_MAX_PCT']):
+        if not (min_pct <= atr_pct <= max_pct):
             _record_rejection(symbol, "S5-ATR pct out of band", {"atr_pct": atr_pct})
             return
 
@@ -3880,10 +3884,9 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             return
 
         df_h1 = df_h1.copy()
-        df_h1['ema_fast'] = ema(df_h1['close'], s5['EMA_FAST'])
-        df_h1['ema_slow'] = ema(df_h1['close'], s5['EMA_SLOW'])
-        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=int(s5.get('H1_ST_PERIOD', 10)), multiplier=float(s5.get('H1_ST_MULT', 3._code0)new)</)
-
+        df_h1['ema_fast'] = ema(df_h1['close'], int(s5.get('EMA_FAST', 21)))
+        df_h1['ema_slow'] = ema(df_h1['close'], int(s5.get('EMA_SLOW', 55)))
+        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=int(s5.get('H1_ST_PERIOD', 10)), multiplier=float(s5.get('H1_ST_MULT', 3.0)))
         h1_last = df_h1.iloc[-2]  # last closed H1
 
         # H1 trend direction
@@ -3929,7 +3932,8 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             return
 
         # Risk model: same as S4 (fixed USDT risk)
-        risk_usd = float(s5['RISK_USD'])
+        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5_code0)new)</)
+
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
@@ -4401,7 +4405,8 @@ async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S6-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
             return
 
-        risk_usd = float(s6.get('RISK_USD', CONFIG['STRATEGY_4']['RISK_USD']))
+        risk_usd = float(s6.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5_code0)new)</)
+
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
 
@@ -5507,7 +5512,8 @@ async def force_trade_entry(strategy_id: int, symbol: str, side: str):
             # ATR/Supertrend based SLs don't change with entry price
             pass 
         elif strategy_id == 3:
-            sl_price = actual_entry_price * (1 - CONFIG['STRATEGY_3']['INITIAL_STOP_PCT']) if side == 'BUY' else actual_entry_price * (1 + CONFIG['STRATEGY_3']['INITIAL_STOP_PCT'])
+            sl_mult_s3 = CONFIG.get('STRATEGY_3', {}).get('INITIAL_STOP_PCT', CONFIG.get('STRATEGY_3', {}).get('FALLBACK_SL_PCT', 0.015))slC_price = actual_entry_price * (1 - sl_mult_s3) if side == 'BUY' else actual_entry_price * (1 + sl_mult_code_snew3</)
+'])
         elif strategy_id == 4:
             sl_price = actual_entry_price * (1 - CONFIG['STRATEGY_4']['INITIAL_STOP_PCT']) if side == 'BUY' else actual_entry_price * (1 + CONFIG['STRATEGY_4']['INITIAL_STOP_PCT'])
 
