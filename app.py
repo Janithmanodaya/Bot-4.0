@@ -2134,7 +2134,7 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, lev
 
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
 
-    # 1) Try to set requested leverage first (if provided), else set to a safe default (MAX_BOT_LEVERAGE capped by exchange)
+    # 1) Try to set requested leverage first (if provided), else set to a safe default
     try:
         max_lev_allowed = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
         if leverage is None:
@@ -2147,6 +2147,9 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, lev
         log.info(f"Leverage set to {lev_to_set}x for {symbol} before LIMIT order.")
     except Exception as e:
         log.warning(f"Failed to change leverage for {symbol} to {leverage if leverage is not None else 'default'}x (non-fatal): {e}")
+
+    # Ensure qty respects step size precision
+    qty = round_qty(symbol, float(qty), rounding=ROUND_DOWN)
 
     # 2) Optional pre-check: estimate initial margin and compare against available balance
     try:
@@ -2229,6 +2232,9 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, lev
                 log.exception(f"Retry after -2019 failed for {symbol}: {retry_e}")
                 raise
         log.exception("BinanceAPIException placing limit order: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception placing limit order: %s", e)
         raise
     except Exception as e:
         log.exception("Exception placing limit order: %s", e)
