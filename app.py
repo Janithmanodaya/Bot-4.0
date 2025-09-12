@@ -4670,20 +4670,9 @@ def _s8_volume_confirm(breakout: pd.Series, retest: pd.Series, vol_ma: float) ->
     except Exception:
         return False
 
-async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
-    """
-    Strategy 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG
-    - HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)
-    - Require recent H1 BOS and a POI (Order Block or strict body-gap FVG)
-    - Pattern: generic range/flag breakout with retest rejection OR micro pin + confirm
-    - Entry: limit at retest (or confirm) candle close; cancel if not filled in 3 candles
-    - Stop: beyond OB extreme or pattern extreme ± 0.25*ATR(14)
-    - Sizing: reuse central risk model (small account friendly)
-    """
-    try:
-        s8 = CONFIG['STRATEGY_8']
-        allowed = [s.strip().upper() for s in s8.get('SYMBOLS', []) if s.strip()]
-        if allowed and symbol not in allowed:
+async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):     """    Strategyt 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG    -  HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)    -  Require recent H1 BOS and a POI (Order Block or strict body-gap FVG)    -  Pattern: generic range/flag breakout with retest rejection OR micro pin + confirm    -  Entry: limit at retest (or confirm) candle close; cancel if not filled in 3 candles    -  Stop: beyond OB extreme or pattern extreme ± 0.25*ATR(14)    -  Sizing: reuse central risk model (small account friendly)    """
+    try:         s8 = CONFIG['STRATEGY_8']        #  Removed symbol restriction: S8 is now allowed on any symbol provided to the bot.
+        if df_m15 is None or len(df_m15 <o 120
             _record_rejection(symbol, "S8-Restricted symbol", {"allowed": ",".join(allowed)})
             return
 
