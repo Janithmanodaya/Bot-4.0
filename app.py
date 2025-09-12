@@ -3840,13 +3840,18 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
     try:
         s5 = CONFIG['STRATEGY_5']
 
-        # Restrict to selected majors only (expanded list)
-        allowed_s5 = (
-            "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
-            "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
-        )
-        if symbol not in allowed_s5:
-            _record_rejection(symbol, "S5-Restricted symbol", {"allowed": ",".join(allowed_s5)})
+        # Restrict to selected majors only (configurable)
+        s5_allowed = s5.get("SYMBOLS")
+        if isinstance(s5_allowed, str):
+            s5_allowed = [x.strip().upper() for x in s5_allowed.split(",") if x.strip()]
+        if not s5_allowed or not isinstance(s5_allowed, (list, tuple)):
+            # Default to a safe expanded majors list if not provided
+            s5_allowed = [
+                "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
+                "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
+            ]
+        if symbol not in s5_allowed:
+            _record_rejection(symbol, "S5-Restricted symbol", {"allowed": ",".join(s5_allowed)})
             return
 
         # Basic data checks
