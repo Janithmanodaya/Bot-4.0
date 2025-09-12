@@ -5101,15 +5101,13 @@ async def evaluate_strategy_9(symbol: str, df_m15: pd.DataFrame):
             "strategy_id": 9,
             "atr_at_entry": atr_m5,
             "trailing": False,
-            "s9_ob_low": ob_low,
-            "s9_ob_high": ob_high
         }
 
         async with pending_limit_orders_lock:
             pending_limit_orders[pending_order_id] = pending_meta
             await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
-        title = "⏳ New Pending Order: S9-SMC-Scalp"
+        title = "⏳ New Pending Order: S9-SMC Scalping"
         new_order_msg = (
             f"{title}\n\n"
             f"Symbol: `{symbol}`\n"
@@ -5117,8 +5115,7 @@ async def evaluate_strategy_9(symbol: str, df_m15: pd.DataFrame):
             f"Price: `{entry_price:.4f}`\n"
             f"Qty: `{final_qty}`\n"
             f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
-            f"Leverage: `{leverage}x`\n"
-            f"TP (0.5R): `{take_price:.4f}`"
+            f"Leverage: `{leverage}x`"
         )
         await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
