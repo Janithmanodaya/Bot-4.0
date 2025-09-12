@@ -3854,7 +3854,11 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S5-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
             return
 
-        # Compute additional M15 indicators         df_m15 = df_m15.copy()         # Use Wilder ATR for stop sizing consistency        df _m15['s5_atr']5_rsi'] = rsi(df_m15['close'], s5['RSI_PERIOD'])
+        # Compute additional M15 indicators
+        df_m15 = df_m15.copy()
+        # Use Wilder ATR for stop sizing consistency
+        df_m15['s5_atr'] = atr_wilder(df_m15, int(s5.get('ATR_PERIOD', 14)))
+        df_m15['s5_rsi'] = rsi(df_m15['close'], int(s5.get('RSI_PERIOD', 14)))
         df_m15['s5_vol_ma10'] = df_m15['volume'].rolling(10).mean()
 
         sig = df_m15.iloc[-2]
