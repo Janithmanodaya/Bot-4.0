@@ -262,7 +262,15 @@ CONFIG = {
     "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
-    "SESSION_FREEZE_ENABLED": os.getenv("SESSION_FREEZE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "SESSION_FREEZE_ENABLED": os.getenv("SESSION_FREEZE_ENABLED", "true").lower() in ("true", "1", "yes"),    # --- ACCOUNT MODE ---
+    # Local preference for hedging (dualSidePosition). The live exchange mode takes precedence at runtime.    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
+    # --- MONITORING / PERFORMANCE ---
+    # Warn if a single monitor loop exceeds this duration (in seconds)    "MONITOR_LOOP_THRESHOLD_SEC": float(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "5"_code))new,</
+
+
+
+
+
 
     # --- INDICATOR SETTINGS ---
     # "BB_LENGTH_CUSTOM" and "BB_STD_CUSTOM" are now in STRATEGY_1
