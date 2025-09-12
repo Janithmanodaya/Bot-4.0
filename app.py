@@ -131,21 +131,8 @@ CONFIG = {
         "EMA_FILTER_PERIOD": int(os.getenv("S4_EMA_FILTER_PERIOD", "200")),
         "EMA_FILTER_ENABLED": os.getenv("S4_EMA_FILTER_ENABLED", "false").lower() in ("true", "1", "yes"),
     },
-    "STRATEGY_5": { # Advanced crypto-futures strategy (H1 trend + M15 execution)
-        "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),
-        "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),
-        "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),
-        "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),
-        "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),
-        "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),
-        "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%
-        "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),  # 3.5%
-        "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),         # Same risk model as S4 (fixed risk)
-        "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")),# 30% at 1R
-        "TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
-        "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
-        "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
-    },
+    "STRATEGY_5": { # Advanced crypto-futures strategy (H1 trend + M15 execution)         "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),         "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),         "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),         "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),         "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),         "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),         "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%         "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),  # 3.5%         "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),         # Same risk model as S4 (fixed risk)         "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")),# 30% at 1R        " TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),        " TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),        " MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),        " SYMBOLS": os.getenv("S5_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),  _code  new}</,
+},
     "STRATEGY_6": { # Price-Action only (single high-probability trade per day)
         "ATR_PERIOD": int(os.getenv("S6_ATR_PERIOD", "14")),
         "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER", "0.25")),
@@ -156,6 +143,7 @@ CONFIG = {
         "SESSION_END_UTC_HOUR": int(os.getenv("S6_SESSION_END_HOUR", "15")),
         "RISK_USD": float(os.getenv("S6_RISK_USD", "0.50")),
         "ENFORCE_ONE_TRADE_PER_DAY": os.getenv("S6_ENFORCE_ONE_PER_DAY", "true").lower() in ("true", "1", "yes"),
+        "SYMBOLS": os.getenv("S6_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),
     },
     "STRATEGY_7": { # SMC (Smart Money Concepts) execution - price-action only
         "ATR_PERIOD": int(os.getenv("S7_ATR_PERIOD", "14")),
@@ -181,7 +169,7 @@ CONFIG = {
         "RETEST_EXPIRY_CANDLES": int(os.getenv("S8_RETEST_EXPIRY_CANDLES", "3")),
         "USE_OB": os.getenv("S8_USE_OB", "true").lower() in ("true", "1", "yes"),
         "USE_FVG": os.getenv("S8_USE_FVG", "true").lower() in ("true", "1", "yes"),
-        "SYMBOLS": os.getenv("S8_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+        "SYMBOLS": os.getenv("S8_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),
     },
     "STRATEGY_9": {  # SMC Scalping — high-win probability (M1/M5 execution, H1 BOS, H4/D bias)
         "REJECTION_WICK_RATIO": float(os.getenv("S9_REJECTION_WICK_RATIO", "0.7")),
@@ -195,7 +183,7 @@ CONFIG = {
         "SESSION_START_UTC_HOUR": int(os.getenv("S9_SESSION_START_HOUR", "7")),
         "SESSION_END_UTC_HOUR": int(os.getenv("S9_SESSION_END_HOUR", "15")),
         "RISK_USD": float(os.getenv("S9_RISK_USD", "0.50")),  # Use S6 fixed-risk sizing model
-        "SYMBOLS": os.getenv("S9_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+        "SYMBOLS": os.getenv("S9_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),
         "HIGH_WIN_TP_R_MULT": float(os.getenv("S9_HIGH_WIN_TP_R_MULT", "0.5")),  # Conservative target 0.5R
         "MICRO_SWEEP_LOOKBACK_M1": int(os.getenv("S9_MICRO_SWEEP_LOOKBACK_M1", "20")),
         "SWEEP_RECLAIM_MAX_BARS": int(os.getenv("S9_SWEEP_RECLAIM_MAX_BARS", "5"))
@@ -4292,6 +4280,20 @@ async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
     """
     try:
         s6 = CONFIG['STRATEGY_6']
+
+        # Restrict S6 to the majors set unless overridden via env
+        allowed_s6 = s6.get("SYMBOLS", [])
+        if isinstance(allowed_s6, str):
+            allowed_s6 = [x.strip().upper() for x in allowed_s6.split(",") if x.strip()]
+        if not allowed_s6 or not isinstance(allowed_s6, (list, tuple)):
+            allowed_s6 = [
+                "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
+                "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
+            ]
+        if symbol not in allowed_s6:
+            _record_rejection(symbol, "S6-Restricted symbol", {"allowed": ",".join(allowed_s6)})
+            return
+
         if df_m15 is None or len(df_m15) < 80:
             _record_rejection(symbol, "S6-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
             return
@@ -4718,7 +4720,20 @@ async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
     - Sizing: reuse central risk model (small account friendly)
     """
     try:
-        s8 = CONFIG['STRATEGY_8']  # S8 allowed on any symbol provided to the bot.
+        s8 = CONFIG['STRATEGY_8']
+
+        # Restrict S8 to the majors set unless overridden via env
+        allowed_s8 = s8.get("SYMBOLS")
+        if isinstance(allowed_s8, str):
+            allowed_s8 = [x.strip().upper() for x in allowed_s8.split(",") if x.strip()]
+        if not allowed_s8 or not isinstance(allowed_s8, (list, tuple)):
+            allowed_s8 = [
+                "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
+                "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
+            ]
+        if symbol not in allowed_s8:
+            _record_rejection(symbol, "S8-Restricted symbol", {"allowed": ",".join(allowed_s8)})
+            return
 
         if df_m15 is None or len(df_m15) < 120:
             _record_rejection(symbol, "S8-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
