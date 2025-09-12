@@ -166,7 +166,8 @@ CONFIG = {
         "LIMIT_EXPIRY_CANDLES": int(os.getenv("S7_LIMIT_EXPIRY_CANDLES", "4")),
         "USE_MIN_NOTIONAL": os.getenv("S7_USE_MIN_NOTIONAL", "true").lower() in ("true", "1", "yes"),
         "ALLOW_M5_MICRO_CONFIRM": os.getenv("S7_ALLOW_M5_MICRO_CONFIRM", "false").lower() in ("true", "1", "yes"),
-        "SYMBOLS": os.getenv("S7_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+        "SYMBOLS": os.getenv(           " "S7_SYMBOLS",           t "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT"        ).
+
         "RISK_USD": float(os.getenv("S7_RISK_USD", "0.0")),  # kept optional; default 0 uses min notional
     },
     "STRATEGY_8": {  # SMC + Chart-Pattern Sniper Entry — break+retest inside OB/FVG
@@ -2861,7 +2862,10 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
         # Iterate through potential strategies and find the first one that is not restricted
         for strat in potential_strategies:
             if strat in [3, 4, 5]:
-                allowed_symbols = ["BTCUSDT", "ETHUSDT"]
+                allowed_symbols = [
+                    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
+                    "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
+                ]
                 if symbol not in allowed_symbols:
                     log.info(f"Auto-select: Strategy {strat} is restricted for {symbol}. Trying next.")
                     continue # Try the next strategy in the priority list
@@ -2877,7 +2881,10 @@ def select_strategy(df: pd.DataFrame, symbol: str) -> Optional[int]:
 
     # --- Symbol Restriction Check (for non-auto modes) ---
     if mode in [3, 4, 5] and strategy_id in [3, 4, 5]:
-        allowed_symbols = ["BTCUSDT", "ETHUSDT"]
+        allowed_symbols = [
+            "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
+            "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
+        ]
         if symbol not in allowed_symbols:
             log.info(f"Strategy {strategy_id} is restricted and not allowed for {symbol}. Skipping.")
             return None
@@ -3825,9 +3832,13 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
     try:
         s5 = CONFIG['STRATEGY_5']
 
-        # Restrict to BTC/ETH only as per plan
-        if symbol not in ("BTCUSDT", "ETHUSDT"):
-            _record_rejection(symbol, "S5-Restricted symbol", {"allowed": "BTCUSDT,ETHUSDT"})
+        # Restrict to selected majors only (expanded list)
+        allowed_s5 = (
+            "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT",
+            "LTCUSDT", "ADAUSDT", "XRPUSDT", "LINKUSDT", "DOTUSDT"
+        )
+        if symbol not in allowed_s5:
+            _record_rejection(symbol, "S5-Restricted symbol", {"allowed": ",".join(allowed_s5)})
             return
 
         # Basic data checks
