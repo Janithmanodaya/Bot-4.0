@@ -3854,9 +3854,17 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S5-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
             return
 
-        # Compute additional M15 indicators         df_m15 = df_m15.copy()         # Use Wilder ATR for stop sizing consistency         df_m15['s5_atr'] = atr_wilder(df_m15, s5['ATR_PERIOD'])       ] df_m15['s5_rsi'] = rsi(df_m15['close'], s5['RSI_PERIOD'])       e df_m15['s5_vol_ma10'] = df_m15['volume'].rolling(10).mean()
-        sig = df_m15.iloc[-2]       b prev = df_m15.iloc[-3]
-        # Defensive: ensure we have aig['close']) if sig['close'] > 0 else 0
+        # Compute additional M15 indicators
+        df_m15 = df_m15.copy()
+        df_m15['s5_atr'] = atr(df_m15, s5['ATR_PERIOD'])
+        df_m15['s5_rsi'] = rsi(df_m15['close'], s5['RSI_PERIOD'])
+        df_m15['s5_vol_ma10'] = df_m15['volume'].rolling(10).mean()
+
+        sig = df_m15.iloc[-2]
+        prev = df_m15.iloc[-3]
+
+        # Volatility band filter (M15 ATR%)
+        atr_pct = (sig['s5_atr'] / sig['close']) if sig['close'] > 0 else 0
         if not (s5['VOL_MIN_PCT'] <= atr_pct <= s5['VOL_MAX_PCT']):
             _record_rejection(symbol, "S5-ATR pct out of band", {"atr_pct": atr_pct})
             return
@@ -3897,8 +3905,16 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         # Entry at signal close (limit)
         entry_price = float(sig['close'])
 
-        # Initial stop: structure + ATR hybrid (choose the stricter/closer invalidation)         swing_lookback = 5         if side == 'BUY':             tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())             atr_stop = entry_price - 1.5 * s5_atr_val           r # For BUY, choose the higher (closer to entry) of ATR stop and swing low           g stop_price = max(atr_stop, tech_inval)       t else:  # SELL             tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())           k atr_stop = entry_price + 1.5 * s5_atr_val             # For SELL, choose the lower (closer to entry) of ATR stop and swing high           T stop_price = min(atr_stop, tech_in_code
-price = min(atr_stop, tech_inval)
+        # Initial stop: structure + ATR hybrid
+        swing_lookback = 5
+        if side == 'BUY':
+            tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())
+            atr_stop = entry_price - 1.5 * float(sig['s5_atr'])
+            stop_price = min(atr_stop, tech_inval)  # ensure stop at/below swing low
+        else:  # SELL
+            tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())
+            atr_stop = entry_price + 1.5 * float(sig['s5_atr'])
+            stop_price = max(atr_stop, tech_inval)  # ensure stop at/above swing high
 
         distance = abs(entry_price - stop_price)
         if distance <= 0 or not np.isfinite(distance):
@@ -3944,8 +3960,9 @@ price = min(atr_stop, tech_inval)
             "stop_price": stop_price, "take_price": None, "leverage": leverage,
             "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
             "expiry_time": expiry_time.isoformat(),
-            "strategy_id": 5,             "atr_at_entry": s5_atr_val,           , "trailing": True      _code
-ue
+            "strategy_id": 5,
+            "atr_at_entry": float(sig['s5_atr']),
+            "trailing": True
         }
 
         async with pending_limit_orders_lock:
