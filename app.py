@@ -79,15 +79,8 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 # CONFIG (edit values here)
 # -------------------------
-CONFIG = {
-    # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7"),  # 0=all, or comma-separated, e.g., "1,2"
-    "STRATEGY_1": {  # Original Bollinger Band strategy
-        "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
-        "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
-        "MIN_RSI_FOR_BUY": int(os.getenv("S1_MIN_RSI_FOR_BUY", "30")),
-        "MAX_RSI_FOR_SELL": int(os.getenv("S1_MAX_RSI_FOR_SELL", "70")),
-        "MAX_VOLATILITY_FOR_ENTRY": float(os.getenv("S1_MAX_VOL_ENTRY", "0.03")),
+CONFIG = {     # --- STRATEGY ---    " STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7,8,9"),  # 0=all, or comma-separated, e.g., "1,2"     "STRATEGY_1": {  # Original Bollinger Band strategy         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),         "MIN_RSI_FOR_BUY": int(os.getenv("S1_MIN_RSI_FOR_BUY", "30")),         "MAX_RSI_FOR_SELL": int(os.getenv("S1_MAX_RSI_FOR_SELL", "70")),         "MAX_VOLATILITY_FOR_ENTRY": float(os.getenv("S1_MAX_VOL_ENTRY", "0.03")),   _code) new}</,
+),
     },
     "STRATEGY_2": {  # New SuperTrend strategy
         "SUPERTREND_PERIOD": int(os.getenv("ST_PERIOD", "7")),
@@ -3028,19 +3021,7 @@ async def evaluate_and_enter(symbol: str):
                     log.warning(f"Skipping S4 evaluation for {symbol} due to empty Renko data.")
             
             # --- Standard OHLCV Path for other strategies ---
-            if run_others:
-                df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)
-                if df_standard is not None and not df_standard.empty:
-                    if 1 in modes or 0 in modes:
-                        await evaluate_strategy_bb(symbol, df_standard)
-                    if 2 in modes or 0 in modes:
-                        await evaluate_strategy_supertrend(symbol, df_standard)
-                    if 3 in modes or 0 in modes:
-                        await evaluate_strategy_3(symbol, df_standard)
-                    if run_s5:
-                        await evaluate_strategy_5(symbol, df_standard)
-                    if run_s6:
-                        await evaluate_strategy_6(symbol, df_standard)
+            if run_others:                 df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)                 if df_standard is not None and not df_standard.empty:                     if 1 in modes or 0 in modes:                         await evaluate_strategy_bb(symbol, df_standard)                     if 2 in modes or 0 in modes:                         await evaluate_strategy_supertrend(symbol, df_standard)                     if 3 in modes or 0 in modes:                         await evaluate_strategy_3(symbol, df_standard)                     if run_s5:                         await evaluate_strategy_5(symbol, df_standard)                     if run_s6:                         await        await evaluate_strategy_6(symbol, df_standard)
                     if 7 in modes or 0 in modes:
                         await evaluate_strategy_7(symbol, df_standard)
                     if 8 in modes or 0 in modes:
