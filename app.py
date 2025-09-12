@@ -3028,13 +3028,26 @@ async def evaluate_and_enter(symbol: str):
                 else:
                     log.warning(f"Skipping S4 evaluation for {symbol} due to empty Renko data.")
             
-            # --- Standard OHLCV Path for other strategies ---             if run_others:                 df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)                 if df_standard is not None and not df_standard.empty:                     if 1 in modes or 0 in modes:                         await evaluate_strategy_bb(symbol, df_standard)                     if 2 in modes or 0 in modes:                         await evaluate_strategy_supertrend(symbol, df_standard)                     if 3 in modes or 0 in modes:                         await evaluate_strategy_3(symbol, df_standard)                     if run_s5:                         await evaluate_strategy_5(symbol, df_standard)                     if run_s_s6:                         await        await evaluate_strategy_6(symbol, df_standard)
+            # --- Standard OHLCV Path for other strategies ---
+            if run_others:
+                df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)
+                if df_standard is not None and not df_standard.empty:
+                    if 1 in modes or 0 in modes:
+                        await evaluate_strategy_bb(symbol, df_standard)
+                    if 2 in modes or 0 in modes:
+                        await evaluate_strategy_supertrend(symbol, df_standard)
+                    if 3 in modes or 0 in modes:
+                        await evaluate_strategy_3(symbol, df_standard)
+                    if run_s5:
+                        await evaluate_strategy_5(symbol, df_standard)
+                    if run_s6:
+                        await evaluate_strategy_6(symbol, df_standard)
                     if 7 in modes or 0 in modes:
                         await evaluate_strategy_7(symbol, df_standard)
                     if 8 in modes or 0 in modes:
                         await evaluate_strategy_8(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3/S5/S6 evaluation for {symbol} due to empty indicator data.")
+                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8 evaluation for {symbol} due to empty indicator data.")
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
