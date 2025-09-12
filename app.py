@@ -3953,9 +3953,7 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             return
 
         # Risk model: same as S4 (fixed USDT risk)
-        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0._code
-
-
+        risk_usd = float(s5.get('RISK_USD', CONFIG.get('STRATEGY_4', {}).get('RISK_USD', 0.5)))
 
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
