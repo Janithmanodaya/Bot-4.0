@@ -169,6 +169,16 @@ CONFIG = {
         "SYMBOLS": os.getenv("S7_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
         "RISK_USD": float(os.getenv("S7_RISK_USD", "0.0")),  # kept optional; default 0 uses min notional
     },
+    "STRATEGY_8": {  # SMC + Chart-Pattern Sniper Entry — break+retest inside OB/FVG
+        "ATR_PERIOD": int(os.getenv("S8_ATR_PERIOD", "14")),
+        "ATR_BUFFER": float(os.getenv("S8_ATR_BUFFER", "0.25")),
+        "BOS_LOOKBACK_H1": int(os.getenv("S8_BOS_LOOKBACK_H1", "72")),
+        "VOL_MA_LEN": int(os.getenv("S8_VOL_MA_LEN", "10")),
+        "RETEST_EXPIRY_CANDLES": int(os.getenv("S8_RETEST_EXPIRY_CANDLES", "3")),
+        "USE_OB": os.getenv("S8_USE_OB", "true").lower() in ("true", "1", "yes"),
+        "USE_FVG": os.getenv("S8_USE_FVG", "true").lower() in ("true", "1", "yes"),
+        "SYMBOLS": os.getenv("S8_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -3016,6 +3026,8 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_6(symbol, df_standard)
                     if 7 in modes or 0 in modes:
                         await evaluate_strategy_7(symbol, df_standard)
+                    if 8 in modes or 0 in modes:
+                        await evaluate_strategy_8(symbol, df_standard)
                 else:
                     log.warning(f"Skipping S1/S2/S3/S5/S6 evaluation for {symbol} due to empty indicator data.")
         except Exception as e:
@@ -4513,6 +4525,305 @@ async def evaluate_strategy_7(symbol: str, df_m15: pd.DataFrame):
 
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"S7 evaluation error for {symbol}", e)
+        return
+
+# ------------- Strategy 8 (SMC + Chart-Pattern Sniper Entry) helpers -------------
+def _s8_htf_direction(symbol: str) -> Optional[str]:
+    try:
+        df_h4 = fetch_klines_sync(symbol, '4h', 400)
+        df_d = fetch_klines_sync(symbol, '1d', 400)
+        if df_h4 is None or df_d is None or len(df_h4) < 50 or len(df_d) < 50:
+            return None
+        bias_d = _s6_trend_from_swings(df_d, swing_lookback=20)
+        bias_h4 = _s6_trend_from_swings(df_h4, swing_lookback=20)
+        if bias_d in ('BULL', 'BEAR'):
+            return 'BUY' if bias_d == 'BULL' else 'SELL'
+        df_h1 = fetch_klines_sync(symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < 80 or bias_h4 not in ('BULL', 'BEAR'):
+            return None
+        bias_h1 = _s6_trend_from_swings(df_h1, swing_lookback=20)
+        if bias_h1 and bias_h1 == bias_h4:
+            return 'BUY' if bias_h4 == 'BULL' else 'SELL'
+        return None
+    except Exception:
+        return None
+
+def _s8_last_bos_and_poi(df_h1: pd.DataFrame, lookback: int) -> tuple[Optional[str], Optional[tuple[float, float]], Optional[tuple[float, float]]]:
+    if df_h1 is None or len(df_h1) < lookback + 5:
+        return None, None, None
+    sig_h1 = df_h1.iloc[-2]
+    prev_high = float(df_h1['high'].iloc[-(lookback+2):-2].max())
+    prev_low = float(df_h1['low'].iloc[-(lookback+2):-2].min())
+    direction = None
+    if float(sig_h1['close']) > prev_high:
+        direction = 'BUY'
+    elif float(sig_h1['close']) < prev_low:
+        direction = 'SELL'
+    else:
+        return None, None, None
+    bos_idx = df_h1.index.get_loc(sig_h1.name)
+    start_scan = max(0, bos_idx - 10)
+    segment = df_h1.iloc[start_scan:bos_idx]
+    ob_lows, ob_highs = [], []
+    for i in range(len(segment)-1, -1, -1):
+        c = segment.iloc[i]
+        is_opp = (direction == 'BUY' and float(c['close']) < float(c['open'])) or (direction == 'SELL' and float(c['close']) > float(c['open']))
+        if is_opp:
+            ob_lows.append(float(c['low']))
+            ob_highs.append(float(c['high']))
+            if len(ob_lows) >= 3:
+                break
+    ob_zone = (min(ob_lows), max(ob_highs)) if ob_lows and ob_highs else None
+
+    # Find last strict body gap (FVG) near BOS
+    def find_last_fvg(idx: int, dir_side: str) -> Optional[tuple[float, float]]:
+        start = max(1, idx - 5)
+        end = min(len(df_h1) - 1, idx)
+        for j in range(end, start - 1, -1):
+            prev = df_h1.iloc[j - 1]
+            curr = df_h1.iloc[j]
+            prev_close = float(prev['close']); curr_open = float(curr['open'])
+            if dir_side == 'BUY' and curr_open > prev_close:
+                return (prev_close, curr_open)
+            if dir_side == 'SELL' and curr_open < prev_close:
+                return (curr_open, prev_close)
+        return None
+
+    fvg_zone = find_last_fvg(bos_idx, direction)
+    return direction, ob_zone, fvg_zone
+
+def _s8_zone_touch(cndl: pd.Series, zone: tuple[float,float], atr_val: float) -> bool:
+    zl, zh = zone
+    h = float(cndl['high']); l = float(cndl['low'])
+    tol = 0.25 * float(atr_val)
+    return (l <= zh and h >= zl) or abs(h - zl) <= tol or abs(l - zh) <= tol
+
+def _s8_volume_confirm(breakout: pd.Series, retest: pd.Series, vol_ma: float) -> bool:
+    try:
+        b_vol = float(breakout['volume']); r_vol = float(retest['volume'])
+        b_rng = float(breakout['high'] - breakout['low']); r_rng = float(retest['high'] - retest['low'])
+        vol_ok = (b_vol >= vol_ma) or (r_vol >= vol_ma) if np.isfinite(vol_ma) and vol_ma > 0 else False
+        rng_ok = r_rng >= 0.7 * b_rng if np.isfinite(b_rng) else False
+        return vol_ok or rng_ok
+    except Exception:
+        return False
+
+async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG
+    - HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)
+    - Require recent H1 BOS and a POI (Order Block or strict body-gap FVG)
+    - Pattern: generic range/flag breakout with retest rejection OR micro pin + confirm
+    - Entry: limit at retest (or confirm) candle close; cancel if not filled in 3 candles
+    - Stop: beyond OB extreme or pattern extreme ± 0.25*ATR(14)
+    - Sizing: reuse central risk model (small account friendly)
+    """
+    try:
+        s8 = CONFIG['STRATEGY_8']
+        allowed = [s.strip().upper() for s in s8.get('SYMBOLS', []) if s.strip()]
+        if allowed and symbol not in allowed:
+            _record_rejection(symbol, "S8-Restricted symbol", {"allowed": ",".join(allowed)})
+            return
+
+        if df_m15 is None or len(df_m15) < 120:
+            _record_rejection(symbol, "S8-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
+            return
+
+        df_m15 = df_m15.copy()
+        atr_period = int(s8.get('ATR_PERIOD', 14))
+        df_m15['s8_atr'] = atr(df_m15, atr_period)
+        atr_m15 = float(df_m15['s8_atr'].iloc[-2]) if 's8_atr' in df_m15.columns else 0.0
+        if atr_m15 <= 0:
+            _record_rejection(symbol, "S8-ATR not ready", {})
+            return
+
+        # HTF alignment
+        direction_bias = await asyncio.to_thread(_s8_htf_direction, symbol)
+        if direction_bias not in ('BUY','SELL'):
+            _record_rejection(symbol, "S8-HTF bias unclear", {})
+            return
+
+        # H1 BOS + POI
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < 120:
+            _record_rejection(symbol, "S8-Not enough H1 data", {"len": len(df_h1) if df_h1 is not None else 0})
+            return
+        lookback = int(s8.get('BOS_LOOKBACK_H1', 72))
+        direction_bos, ob_zone, fvg_zone = _s8_last_bos_and_poi(df_h1.copy(), lookback)
+        if direction_bos is None:
+            _record_rejection(symbol, "S8-No BOS on H1", {})
+            return
+        if direction_bos != direction_bias:
+            _record_rejection(symbol, "S8-BOS dir != HTF bias", {"bos": direction_bos, "htf": direction_bias})
+            return
+
+        use_ob = bool(s8.get('USE_OB', True))
+        use_fvg = bool(s8.get('USE_FVG', True))
+
+        poi_zone = None
+        zone_type = None
+        if use_ob and ob_zone is not None:
+            poi_zone = ob_zone
+            zone_type = "OB"
+        elif use_fvg and fvg_zone is not None:
+            poi_zone = fvg_zone
+            zone_type = "FVG"
+        else:
+            _record_rejection(symbol, "S8-No POI zone (OB/FVG)", {"use_ob": use_ob, "use_fvg": use_fvg})
+            return
+
+        # Define candidate pattern window (last N bars before retest candle)
+        N = 6
+        sig = df_m15.iloc[-2]   # breakout candle (for break+retest), or pin for micro pattern
+        ret = df_m15.iloc[-1]   # retest/confirm candle
+        prev = df_m15.iloc[-3]
+
+        range_high = float(df_m15['high'].iloc[-(N+1):-1].max())
+        range_low = float(df_m15['low'].iloc[-(N+1):-1].min())
+        # Ensure pattern forms inside or touching POI
+        if not _s8_zone_touch(sig, poi_zone, atr_m15) and not _s8_zone_touch(prev, poi_zone, atr_m15):
+            _record_rejection(symbol, "S8-Pattern not inside/touching POI", {"zone": zone_type})
+            return
+
+        vol_ma_len = int(s8.get('VOL_MA_LEN', 10))
+        vol_ma10 = float(df_m15['volume'].rolling(vol_ma_len).mean().iloc[-2]) if vol_ma_len > 0 else float('nan')
+
+        side = None
+        entry_price = None
+        stop_price = None
+        pattern_ok = False
+        pattern_name = None
+
+        # --- Generic Break + Retest (flags/wedges/H&S neckline/double) ---
+        # Check breakout and retest on last two closed candles
+        if direction_bos == 'BUY':
+            breakout_ok = float(sig['close']) > range_high
+            retest_ok = (float(ret['low']) <= range_high <= float(ret['high'])) and float(ret['close']) > range_high
+            # Retrace size 20–50% of prior impulse
+            impL = 14
+            imp_high = float(df_m15['high'].iloc[-(N+1+impL):-(N+1)].max()) if len(df_m15) >= (N+1+impL) else float('nan')
+            imp_low = float(df_m15['low'].iloc[-(N+1+impL):-(N+1)].min()) if len(df_m15) >= (N+1+impL) else float('nan')
+            impulse_len = imp_high - imp_low if (np.isfinite(imp_high) and np.isfinite(imp_low)) else float('nan')
+            pullback = imp_high - range_low if np.isfinite(imp_high) else float('nan')
+            retrace_pct = (pullback / impulse_len) if (np.isfinite(pullback) and impulse_len and impulse_len > 0) else float('nan')
+            retrace_ok = (0.2 <= retrace_pct <= 0.5) if np.isfinite(retrace_pct) else True  # soft gate if unknown
+            vol_ok = _s8_volume_confirm(sig, ret, vol_ma10)
+            if breakout_ok and retest_ok and vol_ok and retrace_ok and _s8_zone_touch(ret, poi_zone, atr_m15):
+                side = 'BUY'
+                entry_price = float(ret['close'])
+                # Stop beyond OB extremes if OB exists, else below pattern extreme
+                if zone_type == 'OB':
+                    ob_low, ob_high = poi_zone
+                    stop_price = float(ob_low) - float(s8.get('ATR_BUFFER', 0.25)) * atr_m15
+                else:
+                    stop_price = float(range_low) - float(s8.get('ATR_BUFFER', 0.25)) * atr_m15
+                pattern_ok = True
+                pattern_name = "Break+Retest"
+        else:  # SELL
+            breakout_ok = float(sig['close']) < range_low
+            retest_ok = (float(ret['low']) <= range_low <= float(ret['high'])) and float(ret['close']) < range_low
+            impL = 14
+            imp_low = float(df_m15['low'].iloc[-(N+1+impL):-(N+1)].min()) if len(df_m15) >= (N+1+impL) else float('nan')
+            imp_high = float(df_m15['high'].iloc[-(N+1+impL):-(N+1)].max()) if len(df_m15) >= (N+1+impL) else float('nan')
+            impulse_len = imp_high - imp_low if (np.isfinite(imp_high) and np.isfinite(imp_low)) else float('nan')
+            pullback = range_high - imp_low if np.isfinite(imp_low) else float('nan')
+            retrace_pct = (pullback / impulse_len) if (np.isfinite(pullback) and impulse_len and impulse_len > 0) else float('nan')
+            retrace_ok = (0.2 <= retrace_pct <= 0.5) if np.isfinite(retrace_pct) else True
+            vol_ok = _s8_volume_confirm(sig, ret, vol_ma10)
+            if breakout_ok and retest_ok and vol_ok and retrace_ok and _s8_zone_touch(ret, poi_zone, atr_m15):
+                side = 'SELL'
+                entry_price = float(ret['close'])
+                if zone_type == 'OB':
+                    ob_low, ob_high = poi_zone
+                    stop_price = float(ob_high) + float(s8.get('ATR_BUFFER', 0.25)) * atr_m15
+                else:
+                    stop_price = float(range_high) + float(s8.get('ATR_BUFFER', 0.25)) * atr_m15
+                pattern_ok = True
+                pattern_name = "Break+Retest"
+
+        # --- Micro Pin + Confirm inside POI (alternative) ---
+        if not pattern_ok:
+            pin = _s6_is_pin_bar(sig, direction_bos)
+            follow_ok = _s6_follow_through_ok(sig, ret, direction_bos, vol_ma10, 0.7)
+            if pin and _s8_zone_touch(sig, poi_zone, atr_m15) and follow_ok:
+                side = direction_bos
+                entry_price = float(ret['close'])
+                if direction_bos == 'BUY':
+                    stop_price = float(sig['low']) - float(s8.get('ATR_BUFFER', 0.25)) * atr_m15
+                else:
+                    stop_price = float(sig['high']) + float(s8.get('ATR_BUFFER', 0.25)) * atr_m15
+                pattern_ok = True
+                pattern_name = "MicroPin+Confirm"
+
+        if not pattern_ok or side is None or entry_price is None or stop_price is None:
+            _record_rejection(symbol, "S8-No valid pattern/confirmation", {"zone": zone_type, "dir": direction_bos})
+            return
+
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S8-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        # Sizing: use central risk model (small-account friendly)
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        risk_usdt = calculate_risk_amount(balance, strategy_id=8)
+        ideal_qty = risk_usdt / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+        final_qty = max(ideal_qty, qty_min)
+        if final_qty <= 0:
+            _record_rejection(symbol, "S8-Qty zero after sizing", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        notional = final_qty * entry_price
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else risk_usdt
+        uncapped_leverage = int(math.floor(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place limit order at retest/confirm close
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = int(s8.get("RETEST_EXPIRY_CANDLES", 3))
+        expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": None, "leverage": leverage,
+            "risk_usdt": risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 8,
+            "atr_at_entry": atr_m15,
+            "trailing": True,
+            "s8_zone_type": zone_type,
+            "s8_pattern": pattern_name,
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S8-SMC+Pattern"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Pattern: `{pattern_name}` in `{zone_type}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S8 evaluation error for {symbol}", e)
         return
 
 async def force_trade_entry(strategy_id: int, symbol: str, side: str):
