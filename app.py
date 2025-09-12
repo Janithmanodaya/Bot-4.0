@@ -166,7 +166,10 @@ CONFIG = {
         "LIMIT_EXPIRY_CANDLES": int(os.getenv("S7_LIMIT_EXPIRY_CANDLES", "4")),
         "USE_MIN_NOTIONAL": os.getenv("S7_USE_MIN_NOTIONAL", "true").lower() in ("true", "1", "yes"),
         "ALLOW_M5_MICRO_CONFIRM": os.getenv("S7_ALLOW_M5_MICRO_CONFIRM", "false").lower() in ("true", "1", "yes"),
-        "SYMBOLS": os.getenv(           " "S7_SYMBOLS",           t "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT"        ).
+        "SYMBOLS": os.getenv(
+            "S7_SYMBOLS",
+            "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT"
+        ).split(","),
 
         "RISK_USD": float(os.getenv("S7_RISK_USD", "0.0")),  # kept optional; default 0 uses min notional
     },
@@ -263,10 +266,15 @@ CONFIG = {
     "CANDLE_SYNC_BUFFER_SEC": int(os.getenv("CANDLE_SYNC_BUFFER_SEC", "10")),
     "MAX_CONCURRENT_TRADES": int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
     "START_MODE": os.getenv("START_MODE", "running").lower(),
-    "SESSION_FREEZE_ENABLED": os.getenv("SESSION_FREEZE_ENABLED", "true").lower() in ("true", "1", "yes"),    # --- ACCOUNT MODE ---
-    # Local preference for hedging (dualSidePosition). The live exchange mode takes precedence at runtime.    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "SESSION_FREEZE_ENABLED": os.getenv("SESSION_FREEZE_ENABLED", "true").lower() in ("true", "1", "yes"),
+
+    # --- ACCOUNT MODE ---
+    # Local preference for hedging (dualSidePosition). The live exchange mode takes precedence at runtime.
+    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"),
+
     # --- MONITORING / PERFORMANCE ---
-    # Warn if a single monitor loop exceeds this duration (in seconds)    "MONITOR_LOOP_THRESHOLD_SEC": float(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "5"_code))new,</
+    # Warn if a single monitor loop exceeds this duration (in seconds)
+    "MONITOR_LOOP_THRESHOLD_SEC": float(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "5")),
 
 
 
@@ -5135,6 +5143,78 @@ async def evaluate_strategy_9(symbol: str, df_m15: pd.DataFrame):
             return
 
         max_stop_ok = distance <= float(s9.get('MAX_STOP_TO_AVG_RANGE_M5', 1.5)) * avg_m5_range
+        if not max_stop_ok:
+            _record_rejection(symbol, "S9-Stop too wide vs M5 range", {"distance": distance, "max_allowed": float(s9.get('MAX_STOP_TO_AVG_RANGE_M5', 1.5)) * avg_m5_range})
+            return
+
+        # Sizing: fixed-risk (S6 model) with min-notional enforcement
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        risk_usd = float(s9.get('RISK_USD', 0.50))
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        # Enforce minimum notional
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+
+        if ideal_qty < qty_min or ideal_qty <= 0:
+            _record_rejection(symbol, "S9-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        final_qty = ideal_qty
+        notional = final_qty * entry_price
+
+        # Leverage from actual risk (like S6)
+        actual_risk_usdt = final_qty * distance
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Target: 0.5R
+        take_price = entry_price + 0.5 * distance if side == 'BUY' else entry_price - 0.5 * distance
+
+        # Place LIMIT at signal close, expiry in LIMIT_EXPIRY_M1_CANDLES
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta("1m")
+        expiry_candles = int(s9.get("LIMIT_EXPIRY_M1_CANDLES", 3))
+        expiry_time = df_m1.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 9,
+            "atr_at_entry": atr_m5,
+            "trailing": False,
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S9-Scalp"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`\n"
+            f"Target: `0.5R`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+        return
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S9 evaluation error for {symbol}", e)
+        return
         if not max_stop_ok:
             _record_rejection(symbol, "S9-Stop too wide vs M5 range", {"dist": distance, "avg_m5_range": avg_m5_range})
             return
