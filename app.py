@@ -2134,7 +2134,7 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, lev
 
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
 
-    # 1) Try to set requested leverage first (if provided), else set to a safe default (MAX_BOT_LEVERAGE capped by exchange)
+    # 1) Try to set requested leverage first (if provided), else set to a safe default
     try:
         max_lev_allowed = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
         if leverage is None:
@@ -2147,6 +2147,9 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, lev
         log.info(f"Leverage set to {lev_to_set}x for {symbol} before LIMIT order.")
     except Exception as e:
         log.warning(f"Failed to change leverage for {symbol} to {leverage if leverage is not None else 'default'}x (non-fatal): {e}")
+
+    # Ensure qty respects step size precision
+    qty = round_qty(symbol, float(qty), rounding=ROUND_DOWN)
 
     # 2) Optional pre-check: estimate initial margin and compare against available balance
     try:
@@ -2229,6 +2232,9 @@ def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, lev
                 log.exception(f"Retry after -2019 failed for {symbol}: {retry_e}")
                 raise
         log.exception("BinanceAPIException placing limit order: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception placing limit order: %s", e)
         raise
     except Exception as e:
         log.exception("Exception placing limit order: %s", e)
@@ -2327,6 +2333,9 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
     except Exception as e:
         log.warning("Failed to change leverage (non-fatal, may use previous leverage): %s", e)
 
+    # Ensure qty respects step size precision
+    qty = round_qty(symbol, float(qty), rounding=ROUND_DOWN)
+
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
     close_side = 'SELL' if side == 'BUY' else 'BUY'
 
@@ -2350,7 +2359,10 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
         close_order_params['reduceOnly'] = True
 
     # Build the full order batch
-    order_batch = [market_order_params]
+    order_batch = []
+    
+    # First element MUST be the market order
+    order_batch.append(market_order_params)
     
     sl_order = close_order_params.copy()
     sl_order.update({
@@ -2474,7 +2486,10 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
             log.exception(f"Failed to fetch position info for {symbol} in place_batch_sl_tp_sync")
             raise
     else:
-        current_qty = qty
+        current_qty = float(qty)
+
+    # Always ensure quantity respects step size precision (defensive)
+    current_qty = round_qty(symbol, current_qty, rounding=ROUND_DOWN)
 
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
@@ -2536,6 +2551,9 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
         return processed_orders
     except BinanceAPIException as e:
         log.exception("BinanceAPIException placing batch SL/TP: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception placing batch SL/TP: %s", e)
         raise
     except Exception as e:
         log.exception("Exception placing batch SL/TP: %s", e)
