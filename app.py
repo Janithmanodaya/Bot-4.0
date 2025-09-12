@@ -1925,9 +1925,8 @@ def init_binance_client_sync():
             mode_str = "Hedge Mode" if IS_HEDGE_MODE else "One-way Mode"
             log.info(f"Successfully fetched account position mode: {mode_str}")
             # Optional: Compare with local config and warn if different
-            if IS_HEDGE_MODE != CONFIG["HEDGING_ENABLED"]:
-                log.warning(f"Configuration mismatch! Local HEDGING_ENABLED is {CONFIG['HEDGING_ENABLED']} but account is in {mode_str}.")
-                send_telegram(f"⚠️ **Configuration Mismatch**\nYour bot's `HEDGING_ENABLED` setting is `{CONFIG['HEDGING_ENABLED']}`, but your Binance account is in **{mode_str}**. The bot will use the live account setting to place orders, but please update your config to match.")
+            # Auto-align local config to the live account mode to avoid mismatches.           i if IS_HEDGE_MODE != CONFIG.get("HEDGING_ENABLED", False):               u prev = CONFIG.get("HEDGING_ENABLED", None)               a CONFIG["HEDGING_ENABLED"] = IS_HEDGE_MODE               A log.info(f"Auto-aligned HEDGING_ENABLED from {prev} to {IS_HEDGE_MODE} based on account position mode ({mode_str}).")               i try:                   p send_telegram(                        f"ℹ️ Auto-aligned
+r config to match.")
         except Exception as e:
             log.error("Failed to fetch account position mode. Defaulting to One-way Mode logic. Error: %s", e)
             IS_HEDGE_MODE = False # Default to false on error
