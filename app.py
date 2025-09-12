@@ -2980,7 +2980,7 @@ async def evaluate_and_enter(symbol: str):
     async with lock:
         log.info("Evaluating symbol: %s", symbol)
         global running, frozen, symbol_loss_cooldown, symbol_trade_cooldown, managed_trades, pending_limit_orders
-        
+
         # --- Pre-evaluation checks ---
         if frozen or not running:
             _log_env_rejection(symbol, "Bot Paused", {"running": running, "frozen": frozen})
@@ -3006,14 +3006,14 @@ async def evaluate_and_enter(symbol: str):
         try:
             modes = CONFIG["STRATEGY_MODE"]
             run_s4 = 4 in modes or 0 in modes
-            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7]) or 0 in modes
             run_s5 = 5 in modes or 0 in modes
             run_s6 = 6 in modes or 0 in modes
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9]) or 0 in modes
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
             df_raw = await asyncio.to_thread(fetch_klines_sync, symbol, CONFIG["TIMEFRAME"], limit)
-            
+
             if df_raw is None or df_raw.empty:
                 log.warning(f"fetch_klines_sync returned empty for {symbol}. Skipping all evaluations.")
                 return
@@ -3027,7 +3027,7 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_4(symbol, df_s4)
                 else:
                     log.warning(f"Skipping S4 evaluation for {symbol} due to empty Renko data.")
-            
+
             # --- Standard OHLCV Path for other strategies ---
             if run_others:
                 df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)
@@ -3046,8 +3046,10 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_7(symbol, df_standard)
                     if 8 in modes or 0 in modes:
                         await evaluate_strategy_8(symbol, df_standard)
+                    if 9 in modes or 0 in modes:
+                        await evaluate_strategy_9(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8 evaluation for {symbol} due to empty indicator data.")
+                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data.")
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
@@ -5110,6 +5112,39 @@ async def evaluate_strategy_9(symbol: str, df_m15: pd.DataFrame):
         # Expiry: 3 M1 candles
         candle_duration = timedelta(minutes=1)
         expiry_candles = int(s9.get("LIMIT_EXPIRY_M1_CANDLES", 3))
+        expiry_time = df_m1.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 9,
+            "atr_at_entry": atr_m5,
+            "trailing": False
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S9-SMC Scalping"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+        return
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S9 evaluation error for {symbol}", e)
+        return
         expiry_time = df_m1.index[-1] + (candle_duration * (expiry_candles - 1))
 
         pending_meta = {
