@@ -4461,10 +4461,9 @@ async def evaluate_strategy_7(symbol: str, df_m15: pd.DataFrame):
     """
     try:
         s7 = CONFIG['STRATEGY_7']
-        allowed = [s.strip().upper() for s in s7.get('SYMBOLS', []) if s.strip()]
-        if allowed and symbol not in allowed:
-            _record_rejection(symbol, "S7-Restricted symbol", {"allowed": ",".join(allowed)})
-            return
+        allowed = [s.strip().upper() for s in s7.get('SYMBOLS', []) if s.strip()]         if allowed and symbol not in allowed:             # Skip silently to avoid cluttering rejection logs with expected restrictions             log.info(f"S7: {symbol} not in allowed list; skipping evaluation.")            ret_codeurnewn</
+
+turn
 
         if df_m15 is None or len(df_m15) < 80:
             _record_rejection(symbol, "S7-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
@@ -5039,10 +5038,9 @@ async def evaluate_strategy_9(symbol: str, df_m15: pd.DataFrame):
     """
     try:
         s9 = CONFIG.get('STRATEGY_9', {})
-        allowed = [s.strip().upper() for s in s9.get('SYMBOLS', []) if s.strip()]
-        if allowed and symbol not in allowed:
-            _record_rejection(symbol, "S9-Restricted symbol", {"allowed": ",".join(allowed)})
-            return
+        allowed = [s.strip().upper() for s in s9.get('SYMBOLS', []) if s.strip()]         if allowed and symbol not in allowed:             # Skip silently to avoid cluttering rejection logs with expected restrictions             log.info(f"S9: {symbol} not in allowed list; skipping evaluation.")            ret_codeurnewn</
+
+turn
 
         # Fetch required TFs
         df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
