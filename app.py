@@ -131,8 +131,25 @@ CONFIG = {
         "EMA_FILTER_PERIOD": int(os.getenv("S4_EMA_FILTER_PERIOD", "200")),
         "EMA_FILTER_ENABLED": os.getenv("S4_EMA_FILTER_ENABLED", "false").lower() in ("true", "1", "yes"),
     },
-    "STRATEGY_5": { # Advanced crypto-futures strategy (H1 trend + M15 execution)         "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),         "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),         "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),         "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),         "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),         "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),         "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%         "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),  # 3.5%         "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),         # Same risk model as S4 (fixed risk)         "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")),# 30% at 1R        " TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),        " TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),        " MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),        " SYMBOLS": os.getenv("S5_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT").split(","),  _code  new}</,
-},
+    "STRATEGY_5": {  # Advanced crypto-futures strategy (H1 trend + M15 execution)
+        "H1_ST_PERIOD": int(os.getenv("S5_H1_ST_PERIOD", "10")),
+        "H1_ST_MULT": float(os.getenv("S5_H1_ST_MULT", "3.0")),
+        "EMA_FAST": int(os.getenv("S5_EMA_FAST", "21")),
+        "EMA_SLOW": int(os.getenv("S5_EMA_SLOW", "55")),
+        "ATR_PERIOD": int(os.getenv("S5_ATR_PERIOD", "14")),
+        "RSI_PERIOD": int(os.getenv("S5_RSI_PERIOD", "14")),
+        "VOL_MIN_PCT": float(os.getenv("S5_VOL_MIN_PCT", "0.003")),   # 0.3%
+        "VOL_MAX_PCT": float(os.getenv("S5_VOL_MAX_PCT", "0.035")),   # 3.5%
+        "RISK_USD": float(os.getenv("S5_RISK_USD", "0.50")),          # Same risk model as S4 (fixed risk)
+        "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")), # 30% at 1R
+        "TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
+        "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
+        "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
+        "SYMBOLS": os.getenv(
+            "S5_SYMBOLS",
+            "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT"
+        ).split(","),
+    },
     "STRATEGY_6": { # Price-Action only (single high-probability trade per day)
         "ATR_PERIOD": int(os.getenv("S6_ATR_PERIOD", "14")),
         "ATR_BUFFER_MULT": float(os.getenv("S6_ATR_BUFFER", "0.25")),
