@@ -1158,6 +1158,24 @@ def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     send_telegram(telegram_msg, parse_mode='Markdown')
 
 
+def _json_native(val: Any) -> Any:
+    """Convert numpy/pandas/scalars to JSON-serializable native Python types."""
+    try:
+        # Numpy scalars -> native
+        if isinstance(val, np.generic):
+            return val.item()
+        # Pandas Timestamp -> ISO string
+        if isinstance(val, pd.Timestamp):
+            return val.isoformat()
+        # Numpy arrays -> list
+        if isinstance(val, np.ndarray):
+            return val.tolist()
+        # Fallback: leave as-is (json.dumps will handle str, int, float, bool, None, dict, list)
+        return val
+    except Exception:
+        # Last resort: stringify
+        return str(val)
+
 def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Optional[pd.Series] = None):
     """Adds a rejected trade event to the deque and persists it to a file."""
     global rejected_trades
@@ -1169,8 +1187,15 @@ def _record_rejection(symbol: str, reason: str, details: dict, signal_candle: Op
             if key in signal_candle and pd.notna(signal_candle[key]):
                 details[key] = signal_candle[key]
 
+    # Normalize to JSON-native types first (so numpy types don't break json.dumps)
+    native_details = {k: _json_native(v) for k, v in details.items()}
+
     # Format floats in details to a reasonable precision for display
-    formatted_details = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in details.items()}
+    formatted_details = {
+        k: (f"{v:.4f}" if isinstance(v, float) else v)
+        for k, v in native_details.items()
+    }
+
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
