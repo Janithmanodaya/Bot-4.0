@@ -81,7 +81,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7"),  # 0=all, or comma-separated, e.g., "1,2"
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7,8,9"),
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -179,6 +179,23 @@ CONFIG = {
         "USE_FVG": os.getenv("S8_USE_FVG", "true").lower() in ("true", "1", "yes"),
         "SYMBOLS": os.getenv("S8_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
     },
+    "STRATEGY_9": {  # SMC Scalping — high-win probability (M1/M5 execution, H1 BOS, H4/D bias)
+        "REJECTION_WICK_RATIO": float(os.getenv("S9_REJECTION_WICK_RATIO", "0.7")),
+        "M1_RANGE_AVG_LEN": int(os.getenv("S9_M1_RANGE_AVG_LEN", "20")),
+        "M5_ATR_PERIOD": int(os.getenv("S9_M5_ATR_PERIOD", "14")),
+        "ATR_BUFFER_MULT_M5": float(os.getenv("S9_ATR_BUFFER_MULT_M5", "0.6")),
+        "MAX_STOP_TO_AVG_RANGE_M5": float(os.getenv("S9_MAX_STOP_TO_AVG_RANGE_M5", "1.5")),
+        "LIMIT_EXPIRY_M1_CANDLES": int(os.getenv("S9_LIMIT_EXPIRY_M1_CANDLES", "3")),
+        "BOS_LOOKBACK_H1_MIN": int(os.getenv("S9_BOS_LOOKBACK_H1_MIN", "12")),
+        "BOS_LOOKBACK_H1_MAX": int(os.getenv("S9_BOS_LOOKBACK_H1_MAX", "48")),
+        "SESSION_START_UTC_HOUR": int(os.getenv("S9_SESSION_START_HOUR", "7")),
+        "SESSION_END_UTC_HOUR": int(os.getenv("S9_SESSION_END_HOUR", "15")),
+        "RISK_USD": float(os.getenv("S9_RISK_USD", "0.50")),  # Use S6 fixed-risk sizing model
+        "SYMBOLS": os.getenv("S9_SYMBOLS", "BTCUSDT,ETHUSDT").split(","),
+        "HIGH_WIN_TP_R_MULT": float(os.getenv("S9_HIGH_WIN_TP_R_MULT", "0.5")),  # Conservative target 0.5R
+        "MICRO_SWEEP_LOOKBACK_M1": int(os.getenv("S9_MICRO_SWEEP_LOOKBACK_M1", "20")),
+        "SWEEP_RECLAIM_MAX_BARS": int(os.getenv("S9_SWEEP_RECLAIM_MAX_BARS", "5"))
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -273,13 +290,14 @@ CONFIG = {
     
     "DRY_RUN": os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes"),
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
-    "HEDGING_ENABLED": os.getenv("HEDGING_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "MONITOR_LOOP_THRESHOLD_SEC": int(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "25")),
-    "AUTO_RESTART_ON_IP_ERROR": os.getenv("AUTO_RESTART_ON_IP_ERROR", "true").lower() in ("true", "1", "yes"),
-    "TELEGRAM_NOTIFY_REJECTIONS": os.getenv("TELEGRAM_NOTIFY_REJECTIONS", "false").lower() in ("true", "1", "yes"),
 }
 
 # --- Parse STRATEGY_MODE into a list of ints ---
+try:
+    CONFIG['STRATEGY_MODE'] = [int(x.strip()) for x in str(CONFIG['STRATEGY_MODE']).split(',')]
+except (ValueError, TypeError):
+    log.error(f"Invalid STRATEGY_MODE: '{CONFIG['STRATEGY_MODE']}'. Must be a comma-separated list of numbers. Defaulting to auto (0).")
+    CONFIG['STRATEGY_MODE'] = [0]
 try:
     # This will now be a list of ints, e.g., [1, 2] or [0]
     CONFIG['STRATEGY_MODE'] = [int(x.strip()) for x in str(CONFIG['STRATEGY_MODE']).split(',')]
@@ -3010,20 +3028,7 @@ async def evaluate_and_enter(symbol: str):
                 else:
                     log.warning(f"Skipping S4 evaluation for {symbol} due to empty Renko data.")
             
-            # --- Standard OHLCV Path for other strategies ---
-            if run_others:
-                df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)
-                if df_standard is not None and not df_standard.empty:
-                    if 1 in modes or 0 in modes:
-                        await evaluate_strategy_bb(symbol, df_standard)
-                    if 2 in modes or 0 in modes:
-                        await evaluate_strategy_supertrend(symbol, df_standard)
-                    if 3 in modes or 0 in modes:
-                        await evaluate_strategy_3(symbol, df_standard)
-                    if run_s5:
-                        await evaluate_strategy_5(symbol, df_standard)
-                    if run_s6:
-                        await evaluate_strategy_6(symbol, df_standard)
+            # --- Standard OHLCV Path for other strategies ---             if run_others:                 df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)                 if df_standard is not None and not df_standard.empty:                     if 1 in modes or 0 in modes:                         await evaluate_strategy_bb(symbol, df_standard)                     if 2 in modes or 0 in modes:                         await evaluate_strategy_supertrend(symbol, df_standard)                     if 3 in modes or 0 in modes:                         await evaluate_strategy_3(symbol, df_standard)                     if run_s5:                         await evaluate_strategy_5(symbol, df_standard)                     if run_s_s6:                         await        await evaluate_strategy_6(symbol, df_standard)
                     if 7 in modes or 0 in modes:
                         await evaluate_strategy_7(symbol, df_standard)
                     if 8 in modes or 0 in modes:
@@ -4824,6 +4829,305 @@ async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
 
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"S8 evaluation error for {symbol}", e)
+        return
+
+# --------- Strategy 9 (SMC Scalping — High-Win Probability) helpers ---------
+def _s9_in_session_window(ts: pd.Timestamp) -> bool:
+    try:
+        s9 = CONFIG.get('STRATEGY_9', {})
+        start_h = int(s9.get('SESSION_START_UTC_HOUR', 7))
+        end_h = int(s9.get('SESSION_END_UTC_HOUR', 15))
+        hour = ts.tz_convert('UTC').hour if ts.tzinfo is not None else ts.hour
+        if start_h <= end_h:
+            return start_h <= hour < end_h
+        return hour >= start_h or hour < end_h
+    except Exception:
+        return True
+
+def _s9_recent_h1_bos(df_h1: pd.DataFrame, min_lb: int, max_lb: int) -> Optional[str]:
+    try:
+        if df_h1 is None or len(df_h1) < max_lb + 5:
+            return None
+        sig_h1 = df_h1.iloc[-2]
+        prev_high = float(df_h1['high'].iloc[-(max_lb+2):-2].max())
+        prev_low = float(df_h1['low'].iloc[-(max_lb+2):-2].min())
+        c = float(sig_h1['close'])
+        if c > prev_high:
+            return 'BUY'
+        if c < prev_low:
+            return 'SELL'
+        return None
+    except Exception:
+        return None
+
+def _s9_h1_ob_zone(df_h1: pd.DataFrame, direction: str) -> Optional[tuple[float, float]]:
+    try:
+        if df_h1 is None or len(df_h1) < 20:
+            return None
+        sig_h1 = df_h1.iloc[-2]
+        bos_idx = df_h1.index.get_loc(sig_h1.name)
+        start_scan = max(0, bos_idx - 10)
+        segment = df_h1.iloc[start_scan:bos_idx]
+        ob_lows, ob_highs = [], []
+        for i in range(len(segment)-1, -1, -1):
+            c = segment.iloc[i]
+            is_opp = (direction == 'BUY' and float(c['close']) < float(c['open'])) or (direction == 'SELL' and float(c['close']) > float(c['open']))
+            if is_opp:
+                ob_lows.append(float(c['low']))
+                ob_highs.append(float(c['high']))
+                if len(ob_lows) >= 3:
+                    break
+        if ob_lows and ob_highs:
+            return (min(ob_lows), max(ob_highs))
+        return None
+    except Exception:
+        return None
+
+def _s9_rejection_wick_ratio(candle: pd.Series, direction: str) -> float:
+    try:
+        o = float(candle['open']); h = float(candle['high']); l = float(candle['low']); c = float(candle['close'])
+        rng = max(1e-9, h - l)
+        up_w = h - max(o, c)
+        dn_w = min(o, c) - l
+        return (dn_w / rng) if direction == 'BUY' else (up_w / rng)
+    except Exception:
+        return 0.0
+
+def _s9_avg_range(series_high: pd.Series, series_low: pd.Series, length: int) -> float:
+    try:
+        if series_high is None or series_low is None or len(series_high) < length + 2 or len(series_low) < length + 2:
+            return 0.0
+        rng = (series_high - series_low).iloc[-(length+1):-1]
+        return float(max(1e-9, rng.mean()))
+    except Exception:
+        return 0.0
+
+def _s9_detect_sweep_reclaim(df_m1: pd.DataFrame, direction: str, sweep_lookback: int, reclaim_max_bars: int) -> bool:
+    try:
+        if df_m1 is None or len(df_m1) < sweep_lookback + reclaim_max_bars + 5:
+            return False
+        # Use last closed as reference
+        sig_idx = len(df_m1) - 2
+        pre_end = sig_idx - reclaim_max_bars
+        pre_start = max(0, pre_end - sweep_lookback)
+        if pre_end <= pre_start:
+            return False
+        pre_window_high = float(df_m1['high'].iloc[pre_start:pre_end].max())
+        pre_window_low = float(df_m1['low'].iloc[pre_start:pre_end].min())
+        sweep_window = df_m1.iloc[pre_end:sig_idx+1]  # includes signal candle for reclaim
+        swept = False
+        reclaimed = False
+        if direction == 'BUY':
+            # Any low that pierces pre_window_low
+            for i in range(len(sweep_window)):
+                c = sweep_window.iloc[i]
+                if float(c['low']) < pre_window_low:
+                    swept = True
+                    # Reclaim: any close afterwards back above pre_window_low within the window
+                    after = sweep_window.iloc[i:min(i+reclaim_max_bars+1, len(sweep_window))]
+                    if any(float(x['close']) > pre_window_low for _, x in after.iterrows()):
+                        reclaimed = True
+                    break
+        else:
+            for i in range(len(sweep_window)):
+                c = sweep_window.iloc[i]
+                if float(c['high']) > pre_window_high:
+                    swept = True
+                    after = sweep_window.iloc[i:min(i+reclaim_max_bars+1, len(sweep_window))]
+                    if any(float(x['close']) < pre_window_high for _, x in after.iterrows()):
+                        reclaimed = True
+                    break
+        return swept and reclaimed
+    except Exception:
+        return False
+
+async def evaluate_strategy_9(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 9: SMC Scalping — high-win probability (sniper rules)
+    - HTF bias: Daily/H4 alignment
+    - H1 BOS present (12–48 bars window)
+    - Micro liquidity sweep + quick reclaim on M1
+    - OB retest on M1 inside H1 OB zone with strong rejection (wick >= 70%)
+    - Stop: OB extreme ± 0.6*ATR(14,M5). Skip if stop > 1.5x avg M5 range
+    - Target: 0.5R (high win-rate). Limit expires in 3 M1 candles.
+    - Sizing: same fixed-risk model as S6 (RISK_USD / SL distance), min-notional enforced, leverage from actual risk.
+    """
+    try:
+        s9 = CONFIG.get('STRATEGY_9', {})
+        allowed = [s.strip().upper() for s in s9.get('SYMBOLS', []) if s.strip()]
+        if allowed and symbol not in allowed:
+            _record_rejection(symbol, "S9-Restricted symbol", {"allowed": ",".join(allowed)})
+            return
+
+        # Fetch required TFs
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        df_h4 = await asyncio.to_thread(fetch_klines_sync, symbol, '4h', 400)
+        df_d  = await asyncio.to_thread(fetch_klines_sync, symbol, '1d', 400)
+        df_m5 = await asyncio.to_thread(fetch_klines_sync, symbol, '5m', 300)
+        df_m1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1m', 600)
+
+        if any(x is None or len(x) < 60 for x in [df_h1, df_h4, df_d, df_m5, df_m1]):
+            _record_rejection(symbol, "S9-Insufficient TF data", {
+                "h1": len(df_h1) if df_h1 is not None else 0,
+                "h4": len(df_h4) if df_h4 is not None else 0,
+                "d": len(df_d) if df_d is not None else 0,
+                "m5": len(df_m5) if df_m5 is not None else 0,
+                "m1": len(df_m1) if df_m1 is not None else 0,
+            })
+            return
+
+        # Session filter on last closed M1
+        sig_ts_m1 = df_m1.index[-2]
+        if not _s9_in_session_window(sig_ts_m1):
+            _record_rejection(symbol, "S9-Outside session window", {"ts": str(sig_ts_m1)})
+            return
+
+        # HTF bias from Daily, confirm H4 does not contradict
+        bias_d = _s6_trend_from_swings(df_d.copy(), swing_lookback=20)
+        bias_h4 = _s6_trend_from_swings(df_h4.copy(), swing_lookback=20)
+        if bias_d is None:
+            _record_rejection(symbol, "S9-Daily bias unclear", {})
+            return
+        if bias_h4 is not None and bias_h4 != bias_d:
+            _record_rejection(symbol, "S9-H4 contradicts Daily", {"daily": bias_d, "h4": bias_h4})
+            return
+        direction = 'BUY' if bias_d == 'BULL' else 'SELL'
+
+        # H1 BOS (12–48 bars)
+        bos_dir = _s9_recent_h1_bos(df_h1.copy(), int(s9.get('BOS_LOOKBACK_H1_MIN', 12)), int(s9.get('BOS_LOOKBACK_H1_MAX', 48)))
+        if bos_dir is None or bos_dir != direction:
+            _record_rejection(symbol, "S9-No matching H1 BOS", {"bos": bos_dir, "dir": direction})
+            return
+
+        # H1 OB zone near BOS
+        ob_zone = _s9_h1_ob_zone(df_h1.copy(), direction)
+        if not ob_zone:
+            _record_rejection(symbol, "S9-No OB zone", {})
+            return
+        ob_low, ob_high = ob_zone
+
+        # Micro sweep + reclaim on M1
+        sweep_ok = _s9_detect_sweep_reclaim(
+            df_m1.copy(), direction,
+            int(s9.get('MICRO_SWEEP_LOOKBACK_M1', 20)),
+            int(s9.get('SWEEP_RECLAIM_MAX_BARS', 5))
+        )
+        if not sweep_ok:
+            _record_rejection(symbol, "S9-No micro sweep+reclaim", {})
+            return
+
+        # Rejection candle inside OB on M1
+        sig = df_m1.iloc[-2]          # rejection/entry candle
+        if not (ob_low <= float(sig['close']) <= ob_high):
+            _record_rejection(symbol, "S9-Entry not inside OB", {"close": float(sig['close']), "ob_low": ob_low, "ob_high": ob_high})
+            return
+
+        wick_ratio = _s9_rejection_wick_ratio(sig, direction)
+        if wick_ratio < float(s9.get('REJECTION_WICK_RATIO', 0.7)):
+            _record_rejection(symbol, "S9-Rejection wick too small", {"ratio": wick_ratio})
+            return
+
+        # Confirm candle size vs avg M1 range
+        m1_len = int(s9.get('M1_RANGE_AVG_LEN', 20))
+        avg_m1_range = _s9_avg_range(df_m1['high'], df_m1['low'], m1_len)
+        sig_range = float(sig['high'] - sig['low'])
+        if not (sig_range >= 0.60 * avg_m1_range):
+            _record_rejection(symbol, "S9-Weak M1 rejection range", {"sig_range": sig_range, "avg_m1_range": avg_m1_range})
+            return
+
+        # ATR on M5 and max stop constraint
+        atr_p = int(s9.get('M5_ATR_PERIOD', 14))
+        atr_m5_series = atr_wilder(df_m5.copy(), atr_p)
+        atr_m5 = float(atr_m5_series.iloc[-2]) if atr_m5_series is not None and len(atr_m5_series) >= 2 else 0.0
+        if atr_m5 <= 0:
+            _record_rejection(symbol, "S9-M5 ATR invalid", {})
+            return
+
+        avg_m5_range = _s9_avg_range(df_m5['high'], df_m5['low'], 20)
+
+        entry_price = float(sig['close'])
+        if direction == 'BUY':
+            zone_extreme = ob_low
+            stop_price = zone_extreme - float(s9.get('ATR_BUFFER_MULT_M5', 0.6)) * atr_m5
+            side = 'BUY'
+        else:
+            zone_extreme = ob_high
+            stop_price = zone_extreme + float(s9.get('ATR_BUFFER_MULT_M5', 0.6)) * atr_m5
+            side = 'SELL'
+
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S9-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        max_stop_ok = distance <= float(s9.get('MAX_STOP_TO_AVG_RANGE_M5', 1.5)) * avg_m5_range
+        if not max_stop_ok:
+            _record_rejection(symbol, "S9-Stop too wide vs M5 range", {"dist": distance, "avg_m5_range": avg_m5_range})
+            return
+
+        # Sizing (use S6 model): fixed RISK_USD, min-notional enforcement, leverage by actual risk
+        risk_usd = float(s9.get('RISK_USD', CONFIG.get('STRATEGY_6', {}).get('RISK_USD', 0.5)))
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+        if ideal_qty < qty_min or ideal_qty <= 0:
+            _record_rejection(symbol, "S9-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        final_qty = ideal_qty
+        notional = final_qty * entry_price
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        actual_risk_usdt = final_qty * distance
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # High win-rate TP: 0.5R
+        r_mult = float(s9.get('HIGH_WIN_TP_R_MULT', 0.5))
+        take_price = entry_price + r_mult * distance if side == 'BUY' else entry_price - r_mult * distance
+
+        # Place limit order at rejection close
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        # Expiry: 3 M1 candles
+        candle_duration = timedelta(minutes=1)
+        expiry_candles = int(s9.get("LIMIT_EXPIRY_M1_CANDLES", 3))
+        expiry_time = df_m1.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 9,
+            "atr_at_entry": atr_m5,
+            "trailing": False,
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S9-SMC Scalping"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S9 evaluation error for {symbol}", e)
         return
 
 async def force_trade_entry(strategy_id: int, symbol: str, side: str):
