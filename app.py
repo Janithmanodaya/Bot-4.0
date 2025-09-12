@@ -1924,9 +1924,20 @@ def init_binance_client_sync():
             IS_HEDGE_MODE = position_mode.get('dualSidePosition', False)
             mode_str = "Hedge Mode" if IS_HEDGE_MODE else "One-way Mode"
             log.info(f"Successfully fetched account position mode: {mode_str}")
-            # Optional: Compare with local config and warn if different
-            # Auto-align local config to the live account mode to avoid mismatches.           i if IS_HEDGE_MODE != CONFIG.get("HEDGING_ENABLED", False):               u prev = CONFIG.get("HEDGING_ENABLED", None)               a CONFIG["HEDGING_ENABLED"] = IS_HEDGE_MODE               A log.info(f"Auto-aligned HEDGING_ENABLED from {prev} to {IS_HEDGE_MODE} based on account position mode ({mode_str}).")               i try:                   p send_telegram(                        f"ℹ️ Auto-aligned
-r config to match.")
+            # Auto-align local config to the live account mode to avoid mismatches.
+            if IS_HEDGE_MODE != CONFIG.get("HEDGING_ENABLED", False):
+                prev = CONFIG.get("HEDGING_ENABLED", None)
+                CONFIG["HEDGING_ENABLED"] = IS_HEDGE_MODE
+                log.info(f"Auto-aligned HEDGING_ENABLED from {prev} to {IS_HEDGE_MODE} based on account position mode ({mode_str}).")
+                try:
+                    send_telegram(
+                        f"ℹ️ Auto-aligned config\n\n"
+                        f"Detected account position mode: *{mode_str}*.\n"
+                        f"Updated local `HEDGING_ENABLED` to `{IS_HEDGE_MODE}` to match.",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             log.error("Failed to fetch account position mode. Defaulting to One-way Mode logic. Error: %s", e)
             IS_HEDGE_MODE = False # Default to false on error
@@ -4669,11 +4680,18 @@ def _s8_volume_confirm(breakout: pd.Series, retest: pd.Series, vol_ma: float) ->
     except Exception:
         return False
 
-async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):     """    Strategyt 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG    -  HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)    -  Require recent H1 BOS and a POI (Order Block or strict body-gap FVG)    -  Pattern: generic range/flag breakout with retest rejection OR micro pin + confirm    -  Entry: limit at retest (or confirm) candle close; cancel if not filled in 3 candles    -  Stop: beyond OB extreme or pattern extreme ± 0.25*ATR(14)    -  Sizing: reuse central risk model (small account friendly)    """
-    try:         s8 = CONFIG['STRATEGY_8']        #  Removed symbol restriction: S8 is now allowed on any symbol provided to the bot.
-        if df_m15 is None or len(df_m15 <o 120
-            _record_rejection(symbol, "S8-Restricted symbol", {"allowed": ",".join(allowed)})
-            return
+async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG
+    - HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)
+    - Require recent H1 BOS and a POI (Order Block or strict body-gap FVG)
+    - Pattern: generic range/flag breakout with retest rejection OR micro pin + confirm
+    - Entry: limit at retest (or confirm) candle close; cancel if not filled in 3 candles
+    - Stop: beyond OB extreme or pattern extreme ± 0.25*ATR(14)
+    - Sizing: reuse central risk model (small account friendly)
+    """
+    try:
+        s8 = CONFIG['STRATEGY_8']  # S8 allowed on any symbol provided to the bot.
 
         if df_m15 is None or len(df_m15) < 120:
             _record_rejection(symbol, "S8-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
@@ -4689,7 +4707,7 @@ async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):     """    Str
 
         # HTF alignment
         direction_bias = await asyncio.to_thread(_s8_htf_direction, symbol)
-        if direction_bias not in ('BUY','SELL'):
+        if direction_bias not in ('BUY', 'SELL'):
             _record_rejection(symbol, "S8-HTF bias unclear", {})
             return
 
