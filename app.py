@@ -48,7 +48,10 @@ import telegram
 from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 import mplfinance as mpf
-from stocktrends import Renko
+try:
+    from stocktrends import Renko
+except Exception:
+    Renko = None  # Optional dependency; S4 Renko path will be disabled if unavailable.
 
 from dotenv import load_dotenv
 
@@ -2695,14 +2698,13 @@ def fetch_klines_sync(symbol: str, interval: str, limit: int = 200) -> pd.DataFr
     return df[['open','high','low','close','volume']]
 
 
-def get_renko_data(df_raw: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:
-    """
-    Converts OHLCV data to Renko bricks.
-    The brick size is determined by the ATR(14) of the input data.
-    """
-    if df_raw is None or df_raw.empty:
-        log.warning(f"Cannot generate Renko data for {symbol}, input DataFrame is empty.")
-        return None
+def get_renko_data(df_raw: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:     """    Convertse OHLCV data to Renko bricks.    The  brick size is determined by the ATR(14) of the input data.    """
+    if Renko is None:       r log.warning("stocktrends not installed; skipping Renko generation for %s. Install 'stocktrends' to enable S4 Renko path.", symbol)        return None
+    if df_raw is None or df_raw.empty:        log.warning(f"Cannot generate Renko data for {symbol}, input DataFrame is empty.")
+        return _codeNonewn</e
+
+
+rn None
 
     try:
         # 1. Calculate ATR for brick size from the raw data
