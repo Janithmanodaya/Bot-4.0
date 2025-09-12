@@ -300,19 +300,28 @@ CONFIG = {
     "MIN_NOTIONAL_USDT": float(os.getenv("MIN_NOTIONAL_USDT", "5.0")),
 }
 
-# --- Parse STRATEGY_MODE into a list of ints ---
+# --- Ensure required config keys exist with sane defaults ---
+# Some downstream code accesses these with direct indexing.
+CONFIG.setdefault("HEDGING_ENABLED", os.getenv("HEDGING_ENABLED", "false").lower() in ("true", "1", "yes"))
 try:
-    CONFIG['STRATEGY_MODE'] = [int(x.strip()) for x in str(CONFIG['STRATEGY_MODE']).split(',')]
-except (ValueError, TypeError):
-    log.error(f"Invalid STRATEGY_MODE: '{CONFIG['STRATEGY_MODE']}'. Must be a comma-separated list of numbers. Defaulting to auto (0).")
-    CONFIG['STRATEGY_MODE'] = [0]
-try:
-    # This will now be a list of ints, e.g., [1, 2] or [0]
-    CONFIG['STRATEGY_MODE'] = [int(x.strip()) for x in str(CONFIG['STRATEGY_MODE']).split(',')]
-except (ValueError, TypeError):
-    log.error(f"Invalid STRATEGY_MODE: '{CONFIG['STRATEGY_MODE']}'. Must be a comma-separated list of numbers. Defaulting to auto (0).")
-    CONFIG['STRATEGY_MODE'] = [0]
+    CONFIG.setdefault("MONITOR_LOOP_THRESHOLD_SEC", float(os.getenv("MONITOR_LOOP_THRESHOLD_SEC", "5")))
+except Exception:
+    CONFIG["MONITOR_LOOP_THRESHOLD_SEC"] = 5.0
 
+# --- Parse STRATEGY_MODE into a list of ints (robustly) ---
+mode_raw = CONFIG.get('STRATEGY_MODE', 0)
+if isinstance(mode_raw, list):
+    try:
+        CONFIG['STRATEGY_MODE'] = [int(x) for x in mode_raw]
+    except Exception:
+        log.error(f"Invalid STRATEGY_MODE list: '{mode_raw}'. Defaulting to auto (0).")
+        CONFIG['STRATEGY_MODE'] = [0]
+else:
+    try:
+        CONFIG['STRATEGY_MODE'] = [int(x.strip()) for x in str(mode_raw).split(',')]
+    except (ValueError, TypeError):
+        log.error(f"Invalid STRATEGY_MODE: '{mode_raw}'. Must be a comma-separated list of numbers. Defaulting to auto (0).")
+        CONFIG['STRATEGY_MODE'] = [0]
 
 running = (CONFIG["START_MODE"] == "running")
 overload_notified = False
