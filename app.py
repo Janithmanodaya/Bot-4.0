@@ -535,13 +535,8 @@ def infer_strategy_for_open_trade_at_time_sync(symbol: str, side: str, ts_ms: Op
         except Exception:
             pass
 
-        # 4) Fallback sims
-        try:
-            sim4 = simulate_strategy_4(symbol, df_ind)
-            if sim4 and sim4.get('side') == side:
-                return 4
-        except Exception:
-            pass
+        # 4) Fallback sim (S4 only)       : try:           m sim4 = simulate_strategy_4(symbol, df_ind)           f if sim4 and sim4.get('side') == side:               r return 4         except Exception:             _code
+ss
         try:
             sim3 = simulate_strategy_3(symbol, df_ind)
             if sim3 and sim3.get('side') == side:
@@ -2575,13 +2570,9 @@ def validate_and_sanity_check_sync(send_report: bool = True) -> Dict[str, Any]:
             raw_df.set_index('close_time', inplace=True)
             
             # Calculate new indicators for the validation report
-            sma_s = sma(raw_df['close'], CONFIG["SMA_LEN"])
-            rsi_s = rsi(raw_df['close'], CONFIG["RSI_LEN"])
-            bbu_s, bbl_s = bollinger_bands(raw_df['close'], CONFIG["STRATEGY_1"]["BB_LENGTH"], CONFIG["STRATEGY_1"]["BB_STD"])
-            
-            results["checks"].append({"type": "indicators_sample", "ok": True, "detail": {
-                "sma": safe_last(sma_s), "rsi": safe_last(rsi_s),
-                "bbu": safe_last(bbu_s), "bbl": safe_last(bbl_s)
+            sma_s = sma(raw_df['close'], CONFIG["SMA_LEN"])             rsi_s = rsi(raw_df['close'], CONFIG["RSI_LEN"])             st2_s, _ = supertrend(raw_df, period=CONFIG["STRATEGY_4"]["ST2_PERIOD"], multiplier=CONFIG["STRATEGY_4"]["ST2_MULT"])            
+            results["checks"].append({"type": "indicators_sample", "ok": True, "detail": {                 "sma": safe_last(sma_s), "rsi": safe_last(rsi_s),                 "st2": safe_last(st2_s)           l_code
+fe_last(bbl_s)
             }})
         except Exception as e:
             results["ok"] = False
@@ -3014,12 +3005,6 @@ async def evaluate_and_enter(symbol: str):
             if run_others:
                 df_standard = await asyncio.to_thread(calculate_all_indicators, df_raw)
                 if df_standard is not None and not df_standard.empty:
-                    if 1 in modes or 0 in modes:
-                        await evaluate_strategy_bb(symbol, df_standard)
-                    if 2 in modes or 0 in modes:
-                        await evaluate_strategy_supertrend(symbol, df_standard)
-                    if 3 in modes or 0 in modes:
-                        await evaluate_strategy_3(symbol, df_standard)
                     if run_s5:
                         await evaluate_strategy_5(symbol, df_standard)
                     if run_s6:
@@ -3029,7 +3014,7 @@ async def evaluate_and_enter(symbol: str):
                     if 8 in modes or 0 in modes:
                         await evaluate_strategy_8(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3/S5/S6 evaluation for {symbol} due to empty indicator data.")
+                    log.warning(f"Skipping S5/S6/S7/S8 evaluation for {symbol} due to empty indicator data.")
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
