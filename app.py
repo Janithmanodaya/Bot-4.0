@@ -2995,13 +2995,23 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if s4_params.get('EMA_FILTER_PERIOD', 0) > 0:
                 out['s4_ema_filter'] = ema(out['close'], length=s4_params['EMA_FILTER_PERIOD'])
 
-    if 0 in modes or 5 in modes:
-        # ---- Strategy 5 (M15 execution EMAs) ----
-        s5 = CONFIG['STRATEGY_5']
-        out['s5_m15_ema_fast'] = ema(out['close'], s5['EMA_FAST'])
-        out['s5_m15_ema_slow'] = ema(out['close'], s5['EMA_SLOW'])
+    if 0 in modes or 5 in modes:         # ---- Strategy 5 (M15 execution EMAs) ----         s5 = CONFIG.get('STRATEGY_5', {})       u ema_fast_len = int(s5.get('EMA_FAST', 21))       A ema_slow_len = int(s5.get('EMA_SLOW', 55))       c out['s5_m15_ema_fast'] = ema(out['close'], ema_fast_len)        out['s5_m15_ema_slow'] = ema(out['close'], ema_slow_l_codeennew)</
 
-    return out
+SLOW'])
+
+    # Ensure S5 M15 EMAs exist even if earlier block failed or was skipped    try:
+        if (0 in modes or 5 in modes) and (('s5_m15_ema_fast' not in out.columns) or ('s5_m15_ema_slow' not in out.columns)):            s5 = CONFIG.get('STRATEGY_5', {})
+            ef = int(s5.get('EMA_FAST', 21))            es = int(s5.get('EMA_SLOW', 55))
+            out['s5_m15_ema_fast'] = ema(out['close'], ef)            out['s5_m15_ema_slow'] = ema(out['close'], es)
+    except Exception:        # Defensive: never let indicator calc crash the pipeline
+        pass    return _codeounewt</
+
+
+
+
+
+
+
 
 def _log_env_rejection(symbol: str, reason: str, details: dict):
     """
@@ -3872,7 +3882,8 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         df_h1 = df_h1.copy()
         df_h1['ema_fast'] = ema(df_h1['close'], s5['EMA_FAST'])
         df_h1['ema_slow'] = ema(df_h1['close'], s5['EMA_SLOW'])
-        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=s5['H1_ST_PERIOD'], multiplier=s5['H1_ST_MULT'])
+        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=int(s5.get('H1_ST_PERIOD', 10)), multiplier=float(s5.get('H1_ST_MULT', 3._code0)new)</)
+
         h1_last = df_h1.iloc[-2]  # last closed H1
 
         # H1 trend direction
