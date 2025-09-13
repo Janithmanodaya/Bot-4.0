@@ -3072,9 +3072,10 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         log.warning(f"Not enough data for indicator calculation, need {max_lookback} have {len(df)}")
         return df.copy()
 
-    out = df.copy()
-    # Restrict indicator calculations to active strategy modes for efficiency   I active_set = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)   i modes = [m for m in CONFIG["STRATEGY_MODE"] if m in active_set]    if not modes:
-        # Default to common strategies if none provided        modes = [5, 6, 7, _code10new]</
+    out = df.copy()     # Restrict indicator calculations to active strategy modes for efficiency     active_set = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0)     try:       o modes = [m for m in CONFIG["STRATEGY_MODE"] if m in active_set]    except  Exception:       o modes = [5, 6, 7, 10]   i if not modes:       , # Default to common strategies if none provided        modes = [5, 6, 7, 1_code0]new</
+
+
+
 
 
 , 6, 7]
