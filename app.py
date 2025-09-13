@@ -144,6 +144,7 @@ CONFIG = {
         "TP1_CLOSE_PCT": float(os.getenv("S5_TP1_CLOSE_PCT", "0.3")), # 30% at 1R
         "TRAIL_ATR_MULT": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
         "TRAIL_BUFFER_MULT": float(os.getenv("S5_TRAIL_BUFFER_MULT", "0.25")),
+        "BE_BUFFER_PCT": float(os.getenv("S5_BE_BUFFER_PCT", "0.0005")),  # 0.05% buffer to cover fees
         "MAX_TRADES_PER_SYMBOL_PER_DAY": int(os.getenv("S5_MAX_TRADES_PER_SYMBOL_PER_DAY", "2")),
         "SYMBOLS": os.getenv(
             "S5_SYMBOLS",
@@ -6306,7 +6307,12 @@ def monitor_thread_func():
                             if (side == 'BUY' and current_price >= half_r_price) or (side == 'SELL' and current_price <= half_r_price):
                                 try:
                                     cancel_trade_sltp_orders_sync(meta)
-                                    new_sl = entry_price
+                                    be_buffer_pct = s5.get('BE_BUFFER_PCT', 0.0005)
+                                    if side == 'BUY':
+                                        new_sl = entry_price * (1 + be_buffer_pct)
+                                    else: # SELL
+                                        new_sl = entry_price * (1 - be_buffer_pct)
+
                                     new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl, qty=meta['qty'])
                                     with managed_trades_lock:
                                         if tid in managed_trades:
