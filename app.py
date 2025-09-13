@@ -3189,11 +3189,8 @@ async def evaluate_and_enter(symbol: str):
                 return
 
         try:
-            modes = CONFIG["STRATEGY_MODE"]
-            run_s4 = 4 in modes or 0 in modes
-            run_s5 = 5 in modes or 0 in modes
-            run_s6 = 6 in modes or 0 in modes
-            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9]) or 0 in modes
+            modes = CONFIG["STRATEGY_MODE"]             run_s4 = 4 in modes or 0 in modes             run_s5 = 5 in modes or 0 in modes             run_s6 = 6 in modes or 0 in modes             run_s10 = 10 in modes or 0 in modes           2 run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10]) or 0 in m_codeodnewe</s
+ modes
 
             # Fetch a larger dataset if S4/Renko is active, otherwise default.
             limit = 1000 if run_s4 else 250
@@ -3233,8 +3230,10 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_8(symbol, df_standard)
                     if 9 in modes or 0 in modes:
                         await evaluate_strategy_9(symbol, df_standard)
+                    if run_s10:
+                        await evaluate_strategy_10(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data.")
+                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9/S10 evaluation for {symbol} due to empty indicator data.")
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
@@ -4217,6 +4216,284 @@ def _s6_within_poi(candle: pd.Series, poi_level: float, atr_val: float) -> bool:
     h = float(candle['high']); l = float(candle['low'])
     tol = 0.25 * float(atr_val)
     return (l <= poi_level <= h) or (abs(h - poi_level) <= tol) or (abs(l - poi_level) <= tol)
+
+async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 10: Combined Active-Adaptive (AA: SMC + retest on M15) + Volatility Breakout Momentum (VBM on M5)
+    - Runs on a 1-minute scheduler upstream but uses M15/H1 for AA and M5/M15 for VBM confirmation.
+    - Sizing: reuse S5 fixed-USDT risk model with min-notional enforcement.
+    - Execution: limit-first at signal close; expiry windows per config.
+    """
+    try:
+        s10 = CONFIG.get('STRATEGY_10', {})
+        # Symbol universe (defaults to S5 symbols)
+        allowed = [s.strip().upper() for s in s10.get('SYMBOLS', []) if s.strip()]
+        if allowed and symbol not in allowed:
+            _record_rejection(symbol, "S10-Restricted symbol", {"allowed": ",".join(allowed)})
+            return
+
+        # Basic M15 data check
+        if df_m15 is None or len(df_m15) < 120:
+            _record_rejection(symbol, "S10-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
+            return
+
+        # Clone and compute needed M15 indicators locally (don't rely on global indicator pass)
+        df_m15 = df_m15.copy()
+        atr_m15 = atr_wilder(df_m15, int(s10.get('ATR_PERIOD_M15', 14)))
+        df_m15['s10_atr_m15'] = atr_m15
+        df_m15['s10_ema_fast_m15'] = ema(df_m15['close'], int(s10.get('EMA_FAST', 21)))
+        df_m15['s10_ema_slow_m15'] = ema(df_m15['close'], int(s10.get('EMA_SLOW', 55)))
+        df_m15['s10_vol_ma10'] = df_m15['volume'].rolling(10).mean()
+
+        sig_m15 = df_m15.iloc[-2]
+        prev_m15 = df_m15.iloc[-3]
+        ft_m15 = df_m15.iloc[-1]
+
+        # Fetch H1 for bias and BOS
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < 120:
+            _record_rejection(symbol, "S10-Not enough H1 data", {"len": len(df_h1) if df_h1 is not None else 0})
+            return
+        df_h1 = df_h1.copy()
+        df_h1['ema_fast'] = ema(df_h1['close'], int(s10.get('EMA_FAST', 21)))
+        df_h1['ema_slow'] = ema(df_h1['close'], int(s10.get('EMA_SLOW', 55)))
+        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=int(s10.get('H1_ST_PERIOD', 10)), multiplier=float(s10.get('H1_ST_MULT', 3.0)))
+        h1_sig = df_h1.iloc[-2]
+
+        # HF bias on H1 (simple, consistent with S5)
+        h1_bull = (h1_sig['ema_fast'] > h1_sig['ema_slow']) and (h1_sig['close'] > h1_sig['st_h1'])
+        h1_bear = (h1_sig['ema_fast'] < h1_sig['ema_slow']) and (h1_sig['close'] < h1_sig['st_h1'])
+
+        # H1 BOS in 24–72 candles window
+        lb_min, lb_max = 24, 72
+        prev_window_high = float(df_h1['high'].iloc[-(lb_max+2):-2].max())
+        prev_window_low  = float(df_h1['low'].iloc[-(lb_max+2):-2].min())
+        bos_dir = 'BUY' if float(h1_sig['close']) > prev_window_high else ('SELL' if float(h1_sig['close']) < prev_window_low else None)
+
+        # AA Preconditions and detection (M15 retest + rejection + follow-through)
+        aa_ok = False
+        aa_side = None
+        aa_entry = None
+        aa_stop = None
+
+        REJ_WICK = float(s10.get('REJECTION_WICK_RATIO', 0.6))
+        CONF_VOL_MULT = float(s10.get('CONFIRM_VOL_MULT', 1.5))
+
+        # POI level (simplified): use BOS swing level from H1 window
+        poi_level = prev_window_high if bos_dir == 'BUY' else (prev_window_low if bos_dir == 'SELL' else None)
+
+        def _wick_ratio(candle: pd.Series, direction: str) -> float:
+            try:
+                o = float(candle['open']); h = float(candle['high']); l = float(candle['low']); c = float(candle['close'])
+                rng = max(1e-9, h - l)
+                up_w = h - max(o, c)
+                dn_w = min(o, c) - l
+                return (dn_w / rng) if direction == 'BUY' else (up_w / rng)
+            except Exception:
+                return 0.0
+
+        def _within_tolerance(cndl: pd.Series, lvl: float, atr_val: float, mult: float = 0.25) -> bool:
+            h = float(cndl['high']); l = float(cndl['low'])
+            tol = mult * float(atr_val)
+            return (l <= lvl <= h) or abs(h - lvl) <= tol or abs(l - lvl) <= tol
+
+        # Only attempt AA if BOS and H1 bias align
+        if bos_dir and ((bos_dir == 'BUY' and h1_bull) or (bos_dir == 'SELL' and h1_bear)):
+            # Retest to POI on signal candle
+            if poi_level is not None and _within_tolerance(sig_m15, poi_level, float(sig_m15['s10_atr_m15'])):
+                # Rejection candle: pin wick >= REJ_WICK OR engulfing reclaim
+                is_pin = _wick_ratio(sig_m15, bos_dir) >= REJ_WICK
+                is_engulf = _s6_is_engulfing_reclaim(sig_m15, prev_m15, bos_dir, poi_level)
+                if is_pin or is_engulf:
+                    # Follow-through on next M15
+                    rej_range = float(sig_m15['high'] - sig_m15['low'])
+                    ft_range = float(ft_m15['high'] - ft_m15['low'])
+                    vol_ma10 = float(df_m15['s10_vol_ma10'].iloc[-2]) if pd.notna(df_m15['s10_vol_ma10'].iloc[-2]) else float('nan')
+                    vol_ok = (float(ft_m15['volume']) >= CONF_VOL_MULT * vol_ma10) if np.isfinite(vol_ma10) and vol_ma10 > 0 else False
+                    range_ok = ft_range >= 0.70 * rej_range if np.isfinite(rej_range) else False
+                    if ((bos_dir == 'BUY' and ft_m15['close'] > ft_m15['open']) or (bos_dir == 'SELL' and ft_m15['close'] < ft_m15['open'])) and (vol_ok or range_ok):
+                        aa_ok = True
+                        aa_side = bos_dir
+                        aa_entry = float(sig_m15['close'])
+                        # Initial stop: stricter of ATR(1.5x) and recent swing extreme
+                        swing_lookback = 5
+                        if aa_side == 'BUY':
+                            tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())
+                            atr_stop = aa_entry - 1.5 * float(sig_m15['s10_atr_m15'])
+                            aa_stop = max(atr_stop, tech_inval)
+                        else:
+                            tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())
+                            atr_stop = aa_entry + 1.5 * float(sig_m15['s10_atr_m15'])
+                            aa_stop = min(atr_stop, tech_inval)
+                        # Reject if stop too wide
+                        avg_m15_range = float((df_m15['high'] - df_m15['low']).iloc[-21:-1].mean())
+                        if abs(aa_entry - aa_stop) > 3.0 * max(1e-9, avg_m15_range):
+                            aa_ok = False
+                            _record_rejection(symbol, "S10-AA stop too wide", {"dist": abs(aa_entry - aa_stop), "avg_m15_range": avg_m15_range})
+
+        # VBM detection (M5 consolidation and breakout)
+        vbm_ok = False
+        vbm_side = None
+        vbm_entry = None
+        vbm_stop = None
+
+        df_m5 = await asyncio.to_thread(fetch_klines_sync, symbol, '5m', 300)
+        if df_m5 is not None and len(df_m5) >= 80:
+            df_m5 = df_m5.copy()
+            atr_m5 = atr_wilder(df_m5, int(s10.get('ATR_PERIOD_M5', 14)))
+            df_m5['s10_atr_m5'] = atr_m5
+            avg_range_10 = (df_m5['high'] - df_m5['low']).rolling(10).mean()
+            avg_vol_10 = df_m5['volume'].rolling(10).mean()
+
+            min_w = int(s10.get('VBM_RANGE_MIN_M5', 6))
+            max_w = int(s10.get('VBM_RANGE_MAX_M5', 12))
+            breakout = df_m5.iloc[-2]
+            window_len = max(min_w, min(max_w, 10))
+            rng_high = float(df_m5['high'].iloc[-(window_len+2):-2].max())
+            rng_low  = float(df_m5['low'].iloc[-(window_len+2):-2].min())
+            rng_width = rng_high - rng_low
+
+            close = float(breakout['close'])
+            prev_avg_range = float(avg_range_10.iloc[-2]) if pd.notna(avg_range_10.iloc[-2]) else float('nan')
+            prev_avg_vol = float(avg_vol_10.iloc[-2]) if pd.notna(avg_vol_10.iloc[-2]) else float('nan')
+            breakout_range = float(breakout['high'] - breakout['low'])
+            breakout_vol = float(breakout['volume'])
+
+            size_ok = (np.isfinite(prev_avg_range) and breakout_range >= float(s10.get('VBM_MIN_RANGE_PCT_OF_AVG', 1.2)) * prev_avg_range)
+            vol_ok = (np.isfinite(prev_avg_vol) and breakout_vol >= 2.0 * prev_avg_vol)
+
+            # Direction by breakout
+            if close > rng_high and (size_ok or vol_ok):
+                vbm_side = 'BUY'
+            elif close < rng_low and (size_ok or vol_ok):
+                vbm_side = 'SELL'
+
+            if vbm_side:
+                # If HF contradicts, require a safer confirmation on M15 follow-through
+                hf_ok = (vbm_side == 'BUY' and h1_bull) or (vbm_side == 'SELL' and h1_bear)
+                if not hf_ok:
+                    # require M15 confirmation (ft candle direction)
+                    if not ((vbm_side == 'BUY' and ft_m15['close'] > ft_m15['open']) or (vbm_side == 'SELL' and ft_m15['close'] < ft_m15['open'])):
+                        vbm_side = None  # drop
+                if vbm_side:
+                    # Entry at M15 confirm close (safer)
+                    vbm_entry = float(ft_m15['close'])
+                    # Stop = entry - max(1.75*ATR(M5), 0.5*range_width)
+                    rng_term = 0.5 * max(1e-9, rng_width)
+                    atr_term = 1.75 * float(df_m5['s10_atr_m5'].iloc[-2])
+                    if vbm_side == 'BUY':
+                        vbm_stop = vbm_entry - max(atr_term, rng_term)
+                    else:
+                        vbm_stop = vbm_entry + max(atr_term, rng_term)
+                    # Reject if stop > 4x avg M5 range
+                    avg_m5_rng = float((df_m5['high'] - df_m5['low']).iloc[-21:-1].mean())
+                    if abs(vbm_entry - vbm_stop) <= 4.0 * max(1e-9, avg_m5_rng):
+                        vbm_ok = True
+                    else:
+                        _record_rejection(symbol, "S10-VBM stop too wide", {"dist": abs(vbm_entry - vbm_stop), "avg_m5_range": avg_m5_rng})
+
+        # Resolve stacking
+        stacked = aa_ok and vbm_ok and (aa_side == vbm_side)
+        if not (aa_ok or vbm_ok):
+            _record_rejection(symbol, "S10-No valid AA/VBM setup", {"aa_ok": aa_ok, "vbm_ok": vbm_ok})
+            return
+
+        if stacked:
+            side = aa_side
+            # Use safer entry: M15 confirm close (ft_m15) to reduce false fills
+            entry_price = float(ft_m15['close'])
+            # Wider of AA & VBM stops
+            # For BUY, wider means lower (further from entry); for SELL, higher
+            if side == 'BUY':
+                aa_dist = abs(entry_price - aa_stop) if aa_stop is not None else 0.0
+                vbm_dist = abs(entry_price - vbm_stop) if vbm_stop is not None else 0.0
+                stop_price = entry_price - max(aa_dist, vbm_dist)
+            else:
+                aa_dist = abs(entry_price - aa_stop) if aa_stop is not None else 0.0
+                vbm_dist = abs(entry_price - vbm_stop) if vbm_stop is not None else 0.0
+                stop_price = entry_price + max(aa_dist, vbm_dist)
+        elif aa_ok:
+            side = aa_side
+            entry_price = aa_entry
+            stop_price = aa_stop
+        else:
+            side = vbm_side
+            entry_price = vbm_entry
+            stop_price = vbm_stop
+
+        # Safety checks
+        if entry_price is None or stop_price is None:
+            _record_rejection(symbol, "S10-Entry/Stop calc failed", {})
+            return
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S10-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        # Sizing: reuse S5 model (fixed-USDT risk with min-notional)
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        risk_usd = float(s10.get('RISK_USD', CONFIG.get('STRATEGY_5', {}).get('RISK_USD', 0.5)))
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+
+        if ideal_qty < qty_min or ideal_qty <= 0:
+            _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        final_qty = ideal_qty
+        notional = final_qty * entry_price
+        actual_risk_usdt = final_qty * distance
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place limit order at entry, stop only (TP/trailing handled by monitor/general)
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price, leverage)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        # Expiry: use M15 expiry for AA/stacked; for VBM-only, still keep conservative default M15 expiry
+        candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
+        expiry_candles = int(s10.get("LIMIT_EXPIRY_M15_CANDLES", 3))
+        expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": None, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 10,
+            "atr_at_entry": float(sig_m15['s10_atr_m15']),
+            "trailing": True,
+            "s10_stacked": bool(stacked),
+            "s10_component": "STACKED" if stacked else ("AA" if aa_ok else "VBM"),
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S10-AA+VBM"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{side}`\n"
+            f"Mode: `{'STACKED' if stacked else ('AA' if aa_ok else 'VBM')}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S10 evaluation error for {symbol}", e)
+        return
 
 async def evaluate_strategy_6(symbol: str, df_m15: pd.DataFrame):
     """
