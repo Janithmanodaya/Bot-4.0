@@ -81,7 +81,7 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 # -------------------------
 CONFIG = {
     # --- STRATEGY ---
-    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7,8,9"),
+    "STRATEGY_MODE": os.getenv("STRATEGY_MODE", "5,6,7,8,9,10"),
     "STRATEGY_1": {  # Original Bollinger Band strategy
         "BB_LENGTH": int(os.getenv("BB_LENGTH_CUSTOM", "20")),
         "BB_STD": float(os.getenv("BB_STD_CUSTOM", "2.5")),
@@ -206,6 +206,29 @@ CONFIG = {
         "MICRO_SWEEP_LOOKBACK_M1": int(os.getenv("S9_MICRO_SWEEP_LOOKBACK_M1", "20")),
         "SWEEP_RECLAIM_MAX_BARS": int(os.getenv("S9_SWEEP_RECLAIM_MAX_BARS", "5"))
     },
+    "STRATEGY_10": {  # Combined Active-Adaptive (AA) + Volatility Breakout Momentum (VBM)
+        "H1_ST_PERIOD": int(os.getenv("S10_H1_ST_PERIOD", "10")),     # SuperTrend on H1
+        "H1_ST_MULT": float(os.getenv("S10_H1_ST_MULT", "3.0")),
+        "EMA_FAST": int(os.getenv("S10_EMA_FAST", "21")),             # EMA 21/55 on H1 and M15
+        "EMA_SLOW": int(os.getenv("S10_EMA_SLOW", "55")),
+        "ATR_PERIOD_M15": int(os.getenv("S10_ATR_PERIOD_M15", "14")), # Wilder ATR on M15 for AA
+        "ATR_PERIOD_M5": int(os.getenv("S10_ATR_PERIOD_M5", "14")),   # Wilder ATR on M5 for VBM
+        "VBM_RANGE_MIN_M5": int(os.getenv("S10_VBM_RANGE_MIN_M5", "6")),   # 30m consolidation on M5
+        "VBM_RANGE_MAX_M5": int(os.getenv("S10_VBM_RANGE_MAX_M5", "12")),  # 60m consolidation on M5
+        "VBM_ATR_MULT_STOP": float(os.getenv("S10_VBM_ATR_MULT_STOP", "1.75")),
+        "VBM_MIN_RANGE_PCT_OF_AVG": float(os.getenv("S10_VBM_MIN_RANGE_PCT_OF_AVG", "1.2")),  # 120% of avg M5 range
+        "CONFIRM_VOL_MULT": float(os.getenv("S10_CONFIRM_VOL_MULT", "1.5")),  # vs 10-bar avg
+        "REJECTION_WICK_RATIO": float(os.getenv("S10_REJECTION_WICK_RATIO", "0.6")),          # AA rejection candle wick ratio
+        "LIMIT_EXPIRY_M5_CANDLES": int(os.getenv("S10_LIMIT_EXPIRY_M5_CANDLES", "2")),
+        "LIMIT_EXPIRY_M15_CANDLES": int(os.getenv("S10_LIMIT_EXPIRY_M15_CANDLES", "3")),
+        # Sizing: reuse S5 model (fixed USDT risk with min-notional enforcement)
+        "RISK_USD": float(os.getenv("S10_RISK_USD", os.getenv("S5_RISK_USD", "0.50"))),
+        # Symbol universe defaults to S5 symbols
+        "SYMBOLS": os.getenv(
+            "S10_SYMBOLS",
+            os.getenv("S5_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT")
+        ).split(","),
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -217,15 +240,15 @@ CONFIG = {
             "BE_TRIGGER": float(os.getenv("S2_BE_TRIGGER", "0.006")),
             "BE_SL_OFFSET": float(os.getenv("S2_BE_SL_OFFSET", "0.001"))
         },
-        "3": {  # Advanced SuperTrend strategy (custom trailing logic)
-            "ATR_MULTIPLIER": float(os.getenv("S3_TRAIL_ATR_MULT", "3.0")), # Value from S3 config
-            "BE_TRIGGER": 0.0, # Not used in S3
-            "BE_SL_OFFSET": 0.0 # Not used in S3
+        "3": {  # MA Cross strategy (uses its own trailing config)
+            "ATR_MULTIPLIER": float(os.getenv("S3_TRAIL_ATR_MULT", "3.0")),  # Value from S3 config
+            "BE_TRIGGER": 0.0,  # Not used in S3
+            "BE_SL_OFFSET": 0.0  # Not used in S3
         },
-        "4": {  # Advanced SuperTrend v2 strategy (custom trailing logic)
-            "ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")), # Value from S4 config
-            "BE_TRIGGER": 0.0, # Not used in S4
-            "BE_SL_OFFSET": 0.0 # Not used in S4
+        "4": {  # 3x SuperTrend strategy (custom trailing logic)
+            "ATR_MULTIPLIER": float(os.getenv("S4_TRAIL_ATR_MULT", "3.0")),  # Value from S4 config
+            "BE_TRIGGER": 0.0,  # Not used in S4
+            "BE_SL_OFFSET": 0.0  # Not used in S4
         },
         "5": {  # Advanced H1/M15 strategy (custom trailing logic)
             "ATR_MULTIPLIER": float(os.getenv("S5_TRAIL_ATR_MULT", "1.0")),
@@ -234,6 +257,11 @@ CONFIG = {
         },
         "7": {  # SMC trailing is structural; keep generic minimal trailing disabled by default
             "ATR_MULTIPLIER": float(os.getenv("S7_TRAIL_ATR_MULT", "0.0")),
+            "BE_TRIGGER": 0.0,
+            "BE_SL_OFFSET": 0.0
+        },
+        "10": {  # S10 uses S5-style management; no generic BE/TP here
+            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.0"))),
             "BE_TRIGGER": 0.0,
             "BE_SL_OFFSET": 0.0
         }
