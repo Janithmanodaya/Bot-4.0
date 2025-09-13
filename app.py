@@ -40,11 +40,12 @@ import matplotlib
 matplotlib.use('Agg') # Use non-interactive backend for server-side plotting
 import matplotlib.pyplot as plt
 from fastapi import FastAPI
-from binance.client import Clientfromo binance.exceptions import BinanceAPIException
-import telegramfromf telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-import mplfinance as mpf#s Optional dependency: stocktrends (Renko). Gracefully handle if not installed.trye:   y from stocktrends import Renkoexcepte Exception:   o Renko = None  # type: ignore
-from dotenv import load_dotenv#_ Load .env file into environment (if present)loade_dot_codedot_codet_dot_codet_codede_dote_code
-ronment (if present)
+# --- Clean Binance imports ---fromt binance.client import Clientfromi binance.exceptions import BinanceAPIException
+# --- Clean Telegram imports ---importr telegramfromn telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+import mplfinance as mpf
+# Optional dependency: stocktrends (Renko). Gracefully handle if not installed.try :   e from stocktrends import Renkoexcepte Exception:   _ Renko = None  # type: ignore
+# Load .env file into environment (if present)fromo dotenv import load_dotenvloade_dote_code
+sent)
 load_dotenv()
 
 # -------------------------
@@ -1055,20 +1056,31 @@ def format_timedelta(td) -> str:
     return ", ".join(parts)
 
 
-def get_public_ip() -> str:     try:         return requests.get("https://api.ipify.org", timeout=5).text     except Exception:         return "unable-to-fetch-ip"
-defe get_account_balance_usdt() -> float:     """     Returns the available USDT balance on the futures account.     In DRY_RUN or if client is not initialized, returns 0.0.     """     global client     try:         if CONFIG.get("DRY_RUN") or client is None:             return 0.0         balances = client.futures_account_balance()         usdt_row = next((b for b in balances if str(b.get('asset')) == 'USDT'), None)         if usdt_row:             # availableBalance is the recommended field for free margin             return float(usdt_row.get('availableBalance') or usdt_row.get('balance') or 0.0)     except Exception:         # Keep it simple and safe         pass     return_code
-de 0new.</0
+def get_public_ip() -> str:
+    try:
+        return requests.get("https://api.ipify.org", timeout=5).text
+    except Exception:
+        return "unable-to-fetch-ip"
 
 
-
-
-
-
-
-
-
-
-h-ip"
+def get_account_balance_usdt() -> float:
+    """
+    Returns the available USDT balance on the futures account.
+    In DRY_RUN or if client is not initialized, returns 0.0.
+    """
+    global client
+    try:
+        if CONFIG.get("DRY_RUN") or client is None:
+            return 0.0
+        balances = client.futures_account_balance()
+        usdt_row = next((b for b in balances if str(b.get('asset')) == 'USDT'), None)
+        if usdt_row:
+            # availableBalance is the recommended field for free margin
+            return float(usdt_row.get('availableBalance') or usdt_row.get('balance') or 0.0)
+    except Exception:
+        # Keep it simple and safe
+        pass
+    return 0.0
 
 def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:
     """
@@ -3229,7 +3241,8 @@ async def evaluate_and_enter(symbol: str):
                     if 10 in modes or 0 in modes:
                         await evaluate_strategy_10(symbol, df_standard)
                 else:
-                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data.")</
+                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator dat_code
+/
 
 a.")
         except Exception as e:
@@ -4861,8 +4874,7 @@ def _s8_volume_confirm(breakout: pd.Series, retest: pd.Series, vol_ma: float) ->
     except Exception:
         return False
 
-async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFra_code
-
+async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
     """
     Strategy 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG
     - HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)
