@@ -1,5 +1,6 @@
 # app.py
 """
+This code version is - 1.10 every time if you make any small update increase this number for tracking purposes - last update 1.09
 EMA/BB Strategy Bot — Refactored from KAMA base.
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
@@ -265,7 +266,8 @@ CONFIG = {
             "BE_SL_OFFSET": 0.0
         },
         "10": {  # S10 uses S5-style management; no generic BE/TP here
-            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.0"))),
+            # Make trailing less aggressive by default (increase ATR multiplier)
+            "ATR_MULTIPLIER": float(os.getenv("S10_TRAIL_ATR_MULT", os.getenv("S5_TRAIL_ATR_MULT", "1.75"))),
             "BE_TRIGGER": 0.0,
             "BE_SL_OFFSET": 0.0
         }
@@ -1272,6 +1274,130 @@ def send_telegram(msg: str, document_content: Optional[bytes] = None, document_n
         log.exception("Failed to send telegram message")
 
 
+def _symbol_base_asset(symbol: str) -> str:
+    """
+    Try to infer the base asset for a symbol like BTCUSDT -> BTC.
+    Falls back to stripping a stable-quote suffix.
+    """
+    try:
+        si = get_symbol_info(symbol)
+        if si and 'baseAsset' in si:
+            return str(si['baseAsset']).upper()
+    except Exception:
+        pass
+    # Fallback heuristics
+    for quote in ("USDT", "BUSD", "USDC", "FDUSD", "TUSD", "BTC", "ETH"):
+        if symbol.upper().endswith(quote):
+            return symbol.upper()[: -len(quote)]
+    return symbol.upper()
+
+
+def _alphavantage_time_from(dt: datetime) -> str:
+    """
+    Format datetime for Alpha Vantage NEWS_SENTIMENT time_from param: YYYYMMDDTHHMM
+    """
+    return dt.strftime("%Y%m%dT%H%M")
+
+
+def fetch_recent_news_impact(symbol: str, hours: int = 24, max_items: int = 3) -> Dict[str, Any]:
+    """
+    Fetch recent news using Alpha Vantage NEWS_SENTIMENT for the base asset and
+    provide a lightweight impact classification and reason text.
+    Returns dict: {impact, reason, articles:[{title,url,time,summary}]}
+    """
+    base = _symbol_base_asset(symbol)
+    api_key = ALPHA_VANTAGE_API_KEY or ""
+    if not api_key:
+        return {"impact": "None", "reason": "No API key configured for news.", "articles": []}
+    # Try a few ticker formats to increase hit rate
+    candidates = [f"CRYPTO:{base}", base]
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    time_from = _alphavantage_time_from(cutoff)
+    articles: list[dict] = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": "ema-bb-bot/1.0"})
+    for t in candidates:
+        try:
+            url = "https://www.alphavantage.co/query"
+            params = {
+                "function": "NEWS_SENTIMENT",
+                "tickers": t,
+                "sort": "LATEST",
+                "time_from": time_from,
+                "apikey": api_key,
+            }
+            resp = session.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            feed = data.get("feed") or []
+            for item in feed:
+                try:
+                    ts = item.get("time_published")
+                    # format: 20250101T120000
+                    dt = datetime.strptime(ts, "%Y%m%dT%H%M%S") if ts else None
+                    title = item.get("title") or ""
+                    url_i = item.get("url") or ""
+                    summary = item.get("summary") or ""
+                    # Vendor sentiment may exist
+                    overall = item.get("overall_sentiment_label") or ""
+                    articles.append({
+                        "time": dt.isoformat() if dt else ts,
+                        "title": title[:180],
+                        "url": url_i,
+                        "summary": summary[:280],
+                        "sentiment": overall
+                    })
+                except Exception:
+                    continue
+            if articles:
+                break
+        except Exception:
+            continue
+
+    if not articles:
+        return {"impact": "None", "reason": "No recent news found.", "articles": []}
+
+    # Simple impact scoring
+    positive_kw = [
+        "etf approval", "etf inflow", "partnership", "integration", "upgrade",
+        "mainnet", "testnet", "milestone", "adoption", "institutional", "launch", "listing", "raised"
+    ]
+    negative_kw = [
+        "hack", "exploit", "outage", "downtime", "regulatory", "ban", "lawsuit",
+        "sec sues", "delist", "bug", "halt", "penalty", "warning", "vulnerability"
+    ]
+    pos, neg = 0, 0
+    reasons = []
+    for a in articles[:max_items]:
+        text = f"{a.get('title','')} {a.get('summary','')}".lower()
+        # bias by vendor sentiment if present
+        s = (a.get("sentiment") or "").lower()
+        if "positive" in s:
+            pos += 1
+        elif "negative" in s:
+            neg += 1
+        # keyword scoring
+        for kw in positive_kw:
+            if kw in text:
+                pos += 1
+                reasons.append(f"+ {kw}")
+        for kw in negative_kw:
+            if kw in text:
+                neg += 1
+                reasons.append(f"- {kw}")
+
+    if pos > neg and (pos - neg) >= 1:
+        impact = "Positive"
+    elif neg > pos and (neg - pos) >= 1:
+        impact = "Negative"
+    else:
+        impact = "Neutral"
+
+    reason = ", ".join(reasons[:5]) if reasons else "Mixed/low-signal headlines in the last 24h."
+    return {"impact": impact, "reason": reason, "articles": articles[:max_items]}
+
+
 def log_and_send_error(context_msg: str, exc: Optional[Exception] = None):
     """
     Logs an exception and sends a formatted error message to Telegram.
@@ -2273,6 +2399,76 @@ def round_price(symbol: str, price: float) -> str:
     except Exception:
         log.exception("round_price failed; falling back to basic formatting")
     return f"{price:.8f}"
+
+
+def get_price_tick_size(symbol: str) -> float:
+    """
+    Returns the tick size (minimum price increment) for the given symbol, or 0 if unavailable.
+    """
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict):
+            return 0.0
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return 0.0
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'PRICE_FILTER':
+                ts = f.get('tickSize')
+                return float(ts) if ts is not None else 0.0
+    except Exception:
+        log.exception("get_price_tick_size failed")
+    return 0.0
+
+
+def get_current_price_sync(symbol: str) -> float:
+    """
+    Fetches current futures price for symbol. Tries symbol ticker then mark price.
+    """
+    global client
+    if client is None:
+        return 0.0
+    try:
+        tkr = client.futures_symbol_ticker(symbol=symbol)
+        p = tkr.get('price')
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    try:
+        mp = client.futures_mark_price(symbol=symbol)
+        p = mp.get('markPrice')
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    return 0.0
+
+
+def compute_be_sl(symbol: str, side: Optional[str], entry_price: float, strategy_id: Optional[int]) -> float:
+    """
+    Returns the break-even stop price with a small buffer for the given strategy.
+    - For BUY: BE = entry_price * (1 + buffer_pct)
+    - For SELL: BE = entry_price * (1 - buffer_pct)
+    Defaults to 0 buffer if not configured.
+    """
+    try:
+        if strategy_id == 10:
+            pct = float(CONFIG.get('STRATEGY_10', {}).get('BE_BUFFER_PCT', 0.0))
+        elif strategy_id == 5:
+            pct = float(CONFIG.get('STRATEGY_5', {}).get('BE_BUFFER_PCT', 0.0))
+        else:
+            pct = 0.0
+    except Exception:
+        pct = 0.0
+
+    if pct <= 0 or not np.isfinite(entry_price) or entry_price <= 0:
+        return float(entry_price)
+
+    if str(side).upper() == 'BUY':
+        return float(entry_price) * (1.0 + pct)
+    else:
+        return float(entry_price) * (1.0 - pct)
 
 def place_limit_order_sync(symbol: str, side: str, qty: float, price: float, leverage: Optional[int] = None):
     """
@@ -4578,17 +4774,42 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
         qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
 
-        if ideal_qty < qty_min or ideal_qty <= 0:
-            _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
-            return
+        # Adopt S5's minimum-notional small-account path for S10 as well
+        if balance <= CONFIG.get('RISK_SMALL_BALANCE_THRESHOLD', 50.0):
+            # Small-account path: use minimum notional with a slight buffer and dynamic margin/leverage
+            target_notional = float(min_notional) * 1.10  # small buffer above min notional
+            base_margin = max(1.0, round(0.10 * float(min_notional), 2))  # e.g., 10% of min notional, min 1 USDT
 
-        final_qty = ideal_qty
-        notional = final_qty * entry_price
-        actual_risk_usdt = final_qty * distance
-        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
-        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
-        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
-        leverage = max(1, min(uncapped_leverage, max_leverage))
+            qty_for_target = (target_notional / entry_price) if entry_price > 0 else 0.0
+            final_qty = await asyncio.to_thread(round_qty, symbol, qty_for_target, rounding=ROUND_CEILING)
+
+            # Ensure we still satisfy the target notional after rounding
+            notional = final_qty * entry_price
+            if notional < target_notional:
+                bump_qty = await asyncio.to_thread(round_qty, symbol, final_qty + 1e-9, rounding=ROUND_CEILING)
+                if bump_qty > final_qty:
+                    final_qty = bump_qty
+                    notional = final_qty * entry_price
+
+            # Leverage derived from target_notional and chosen base margin; cap by exchange/config
+            uncapped_leverage = int(math.ceil(target_notional / max(base_margin, 1e-9)))
+            max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+            leverage = max(1, min(uncapped_leverage, max_leverage))
+            actual_risk_usdt = final_qty * distance
+        else:
+            # Default path: fixed-risk sizing; reject if min notional not met
+            if ideal_qty < qty_min or ideal_qty <= 0:
+                _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+                return
+
+            final_qty = ideal_qty
+            notional = final_qty * entry_price
+
+            actual_risk_usdt = final_qty * distance
+            margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+            uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+            max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+            leverage = max(1, min(uncapped_leverage, max_leverage))
 
         # Place limit order at entry, stop only (TP/trailing handled by monitor/general)
         limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price, leverage)
@@ -4618,15 +4839,24 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
         title = "⏳ New Pending Order: S10-AA+VBM"
+        # Fetch recent news sentiment/impact for context (best-effort)
+        try:
+            news = await asyncio.to_thread(fetch_recent_news_impact, symbol, 24, 3)
+        except Exception:
+            news = {"impact": "None", "reason": "news fetch failed", "articles": []}
+
+        # Build and send Telegram notification
         new_order_msg = (
             f"{title}\n\n"
             f"Symbol: `{symbol}`\n"
             f"Side: `{side}`\n"
-            f"Mode: `{'STACKED' if stacked else ('AA' if aa_ok else 'VBM')}`\n"
             f"Price: `{entry_price:.4f}`\n"
             f"Qty: `{final_qty}`\n"
             f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
-            f"Leverage: `{leverage}x`"
+            f"Leverage: `{leverage}x`\n"
+            f"Stacked: `{bool(stacked)}`\n"
+            f"Component: `{pending_meta.get('s10_component', 'N/A')}`\n"
+            f"News impact: `{news.get('impact', 'None')}` — {news.get('reason', '')}"
         )
         await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
@@ -6344,7 +6574,7 @@ def monitor_thread_func():
                                 
                                 cancel_trade_sltp_orders_sync(meta)
                                 new_qty = meta['qty'] - qty_to_close
-                                new_sl_price = entry_price # Move to BE
+                                new_sl_price = compute_be_sl(symbol, side, float(entry_price), int(meta.get('strategy_id') if isinstance(meta, dict) else strategy_id if 'strategy_id' in locals() else 10)) # Move to BE with buffer
                                 new_orders = place_batch_sl_tp_sync(sym, side, sl_price=new_sl_price, qty=new_qty) if new_qty > 0 else {}
 
                                 trade_to_update_in_db = None
