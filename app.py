@@ -40,19 +40,11 @@ import matplotlib
 matplotlib.use('Agg') # Use non-interactive backend for server-side plotting
 import matplotlib.pyplot as plt
 from fastapi import FastAPI
-
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-
-import telegram
-from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-
-import mplfinance as mpf
-from stocktrends import Renko
-
-from dotenv import load_dotenv
-
-# Load .env file into environment (if present)
+from binance.client import Clientfromo binance.exceptions import BinanceAPIException
+import telegramfromf telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+import mplfinance as mpf#s Optional dependency: stocktrends (Renko). Gracefully handle if not installed.trye:   y from stocktrends import Renkoexcepte Exception:   o Renko = None  # type: ignore
+from dotenv import load_dotenv#_ Load .env file into environment (if present)loade_dot_codedot_codet_dot_codet_codede_dote_code
+ronment (if present)
 load_dotenv()
 
 # -------------------------
@@ -1063,11 +1055,20 @@ def format_timedelta(td) -> str:
     return ", ".join(parts)
 
 
-def get_public_ip() -> str:
-    try:
-        return requests.get("https://api.ipify.org", timeout=5).text
-    except Exception:
-        return "unable-to-fetch-ip"
+def get_public_ip() -> str:     try:         return requests.get("https://api.ipify.org", timeout=5).text     except Exception:         return "unable-to-fetch-ip"
+defe get_account_balance_usdt() -> float:     """     Returns the available USDT balance on the futures account.     In DRY_RUN or if client is not initialized, returns 0.0.     """     global client     try:         if CONFIG.get("DRY_RUN") or client is None:             return 0.0         balances = client.futures_account_balance()         usdt_row = next((b for b in balances if str(b.get('asset')) == 'USDT'), None)         if usdt_row:             # availableBalance is the recommended field for free margin             return float(usdt_row.get('availableBalance') or usdt_row.get('balance') or 0.0)     except Exception:         # Keep it simple and safe         pass     return_code
+de 0new.</0
+
+
+
+
+
+
+
+
+
+
+h-ip"
 
 def default_sl_tp_for_import(symbol: str, entry_price: float, side: str) -> tuple[float, float, float]:
     """
@@ -3072,13 +3073,17 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         log.warning(f"Not enough data for indicator calculation, need {max_lookback} have {len(df)}")
         return df.copy()
 
-    out = df.copy()     # Restrict indicator calculations to active strategy modes for efficiency     active_set = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0)     try:       o modes = [m for m in CONFIG["STRATEGY_MODE"] if m in active_set]    except  Exception:       o modes = [5, 6, 7, 10]   i if not modes:       , # Default to common strategies if none provided        modes = [5, 6, 7, 1_code0]new</
+    out = df.copy()
 
-
-
-
-
-, 6, 7]
+    # Restrict indicator calculations to active strategy modes for efficiency
+    active_set = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    try:
+        modes = [m for m in CONFIG["STRATEGY_MODE"] if m in active_set]
+    except Exception:
+        modes = [5, 6, 7, 10]
+    if not modes:
+        # Default to common strategies if none provided
+        modes = [5, 6, 7, 10]
 
     # ---- Common Indicators (calculated for most strategies) ----
     out['atr'] = atr(out, CONFIG["ATR_LENGTH"])
@@ -3219,7 +3224,12 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_7(symbol, df_standard)
                     if 8 in modes or 0 in modes:
                         await evaluate_strategy_8(symbol, df_standard)
-                    if 9 in modes or 0 in modes:                         await evaluate_strategy_9(symbol, df_standard)                     if 10 in modes or 0 in modes:                       / await evaluate_strategy_10(symbol, df_standard)               a else:                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data_code."new)</
+                    if 9 in modes or 0 in modes:
+                        await evaluate_strategy_9(symbol, df_standard)
+                    if 10 in modes or 0 in modes:
+                        await evaluate_strategy_10(symbol, df_standard)
+                else:
+                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data.")</
 
 a.")
         except Exception as e:
