@@ -4031,7 +4031,8 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
 
         balance = await asyncio.to_thread(get_account_balance_usdt)
 
-        if balance < 50.0:
+        if balance <= CONFIG.get('RISK_SMALL_BALANCE_THRESHOLD', 50_code.0new)</:
+50.0:
             # Small-account path: use minimum notional with a slight buffer and dynamic margin/leverage
             target_notional = float(min_notional) * 1.10  # e.g., 10 -> 11 (little bit increase)
             base_margin = max(1.0, round(0.10 * float(min_notional), 2))  # e.g., 10% of min notional, min 1 USDT
@@ -4069,7 +4070,7 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
             leverage = max(1, min(uncapped_leverage, max_leverage))
 
         # Place LIMIT order with SL only (TP handled by monitor logic)
-        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price, leverage)
         order_id = str(limit_order_resp.get('orderId'))
         pending_order_id = f"{symbol}_{order_id}"
 
