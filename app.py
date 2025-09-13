@@ -1109,12 +1109,19 @@ def send_telegram(msg: str, document_content: Optional[bytes] = None, document_n
     """
     Synchronously sends a message to Telegram. Can optionally attach a document.
     This is a blocking call.
+    Falls back to plain text if Telegram rejects Markdown/HTML entities.
     """
     if not telegram_bot or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured; message: %s", msg[:200])
         return
-    
+
     safe_msg = _shorten_for_telegram(msg)
+
+    # Helper to strip common markdown characters when falling back
+    def _strip_markdown(text: str) -> str:
+        # Remove characters that commonly break Telegram entity parsing
+        return re.sub(r"[`*_\\[\\]()~`>#\\+\\-=|{}.!]", "", text)
+
     try:
         if document_content:
             doc_stream = io.BytesIO(document_content)
@@ -1128,11 +1135,39 @@ def send_telegram(msg: str, document_content: Optional[bytes] = None, document_n
             )
         else:
             telegram_bot.send_message(
-                chat_id=int(TELEGRAM_CHAT_ID), 
+                chat_id=int(TELEGRAM_CHAT_ID),
                 text=safe_msg,
                 timeout=30,
                 parse_mode=parse_mode
             )
+    except telegram.error.BadRequest as e:
+        # Typical cause: malformed Markdown/HTML -> "can't parse entities"
+        if "can't parse entities" in str(e).lower():
+            try:
+                plain = _strip_markdown(safe_msg)
+                if document_content:
+                    doc_stream = io.BytesIO(document_content)
+                    doc_stream.name = document_name
+                    telegram_bot.send_document(
+                        chat_id=int(TELEGRAM_CHAT_ID),
+                        document=doc_stream,
+                        caption=plain,
+                        timeout=30,
+                        parse_mode=None
+                    )
+                else:
+                    telegram_bot.send_message(
+                        chat_id=int(TELEGRAM_CHAT_ID),
+                        text=plain,
+                        timeout=30,
+                        parse_mode=None
+                    )
+                log.warning("Telegram parse error encountered. Retried without parse mode.")
+                return
+            except Exception:
+                log.exception("Fallback send without parse mode failed.")
+        # Log original error if not a parse-entities issue or fallback failed
+        log.exception("Failed to send telegram message (BadRequest).")
     except Exception:
         log.exception("Failed to send telegram message")
 
