@@ -4029,19 +4029,44 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         qty_min = min_notional / entry_price if entry_price > 0 else 0.0
         qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
 
-        if ideal_qty < qty_min or ideal_qty <= 0:
-            _record_rejection(symbol, "S5-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
-            return
-
-        final_qty = ideal_qty
-        notional = final_qty * entry_price
-
         balance = await asyncio.to_thread(get_account_balance_usdt)
-        actual_risk_usdt = final_qty * distance
-        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
-        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
-        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
-        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        if balance < 50.0:
+            # Small-account path: use minimum notional with a slight buffer and dynamic margin/leverage
+            target_notional = float(min_notional) * 1.10  # e.g., 10 -> 11 (little bit increase)
+            base_margin = max(1.0, round(0.10 * float(min_notional), 2))  # e.g., 10% of min notional, min 1 USDT
+
+            qty_for_target = (target_notional / entry_price) if entry_price > 0 else 0.0
+            final_qty = await asyncio.to_thread(round_qty, symbol, qty_for_target, rounding=ROUND_CEILING)
+
+            # Ensure we still satisfy the target notional after rounding
+            notional = final_qty * entry_price
+            if notional < target_notional:
+                bump_qty = await asyncio.to_thread(round_qty, symbol, final_qty + 1e-9, rounding=ROUND_CEILING)
+                if bump_qty > final_qty:
+                    final_qty = bump_qty
+                    notional = final_qty * entry_price
+
+            # Leverage derived from target_notional and chosen base margin; cap by exchange/config
+            uncapped_leverage = int(math.ceil(target_notional / max(base_margin, 1e-9)))
+            max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+            leverage = max(1, min(uncapped_leverage, max_leverage))
+
+            actual_risk_usdt = final_qty * distance
+        else:
+            # Default path: fixed-risk sizing; reject if min notional not met
+            if ideal_qty < qty_min or ideal_qty <= 0:
+                _record_rejection(symbol, "S5-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+                return
+
+            final_qty = ideal_qty
+            notional = final_qty * entry_price
+
+            actual_risk_usdt = final_qty * distance
+            margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+            uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+            max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+            leverage = max(1, min(uncapped_leverage, max_leverage))
 
         # Place LIMIT order with SL only (TP handled by monitor logic)
         limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price)
