@@ -206,6 +206,20 @@ CONFIG = {
         "MICRO_SWEEP_LOOKBACK_M1": int(os.getenv("S9_MICRO_SWEEP_LOOKBACK_M1", "20")),
         "SWEEP_RECLAIM_MAX_BARS": int(os.getenv("S9_SWEEP_RECLAIM_MAX_BARS", "5"))
     },
+    "STRATEGY_10": {  # Combined Active-Adaptive (AA) + Volatility Breakout Momentum (VBM)
+        # Sizing parameters mirror S5's small-balance logic; indicators reuse S5 for now.
+        "RISK_USD": float(os.getenv("S10_RISK_USD", "0.50")),
+        "BALANCE_SMALL_THRESHOLD": float(os.getenv("S10_BALANCE_SMALL_THRESHOLD", "50.0")),
+        "MIN_NOTIONAL_BUFFER": float(os.getenv("S10_MIN_NOTIONAL_BUFFER", "0.10")),  # 10% buffer over min notional
+        "BASE_MARGIN_MIN_USDT": float(os.getenv("S10_BASE_MARGIN_MIN_USDT", "1.0")),  # min 1 USDT
+        "BASE_MARGIN_PCT_OF_MIN_NOTIONAL": float(os.getenv("S10_BASE_MARGIN_PCT", "0.10")),  # 10%
+        "SYMBOLS": os.getenv(
+            "S10_SYMBOLS",
+            "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT"
+        ).split(","),
+        "ENABLE_AA": os.getenv("S10_ENABLE_AA", "true").lower() in ("true", "1", "yes"),
+        "ENABLE_VBM": os.getenv("S10_ENABLE_VBM", "true").lower() in ("true", "1", "yes"),
+    },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
             "ATR_MULTIPLIER": float(os.getenv("S1_ATR_MULTIPLIER", "1.5")),
@@ -3059,10 +3073,11 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
 
     out = df.copy()
-    # Restrict to strategies 5, 6, 7 only per plan
-    modes = [m for m in CONFIG["STRATEGY_MODE"] if m in (5, 6, 7)]
-    if not modes:
-        modes = [5, 6, 7]
+    # Restrict indicator calculations to active strategy modes for efficiency   I active_set = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)   i modes = [m for m in CONFIG["STRATEGY_MODE"] if m in active_set]    if not modes:
+        # Default to common strategies if none provided        modes = [5, 6, 7, _code10new]</
+
+
+, 6, 7]
 
     # ---- Common Indicators (calculated for most strategies) ----
     out['atr'] = atr(out, CONFIG["ATR_LENGTH"])
@@ -3203,10 +3218,9 @@ async def evaluate_and_enter(symbol: str):
                         await evaluate_strategy_7(symbol, df_standard)
                     if 8 in modes or 0 in modes:
                         await evaluate_strategy_8(symbol, df_standard)
-                    if 9 in modes or 0 in modes:
-                        await evaluate_strategy_9(symbol, df_standard)
-                else:
-                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data.")
+                    if 9 in modes or 0 in modes:                         await evaluate_strategy_9(symbol, df_standard)                     if 10 in modes or 0 in modes:                       / await evaluate_strategy_10(symbol, df_standard)               a else:                    log.warning(f"Skipping S1/S2/S3/S5/S6/S7/S8/S9 evaluation for {symbol} due to empty indicator data_code."new)</
+
+a.")
         except Exception as e:
             await asyncio.to_thread(log_and_send_error, f"Failed to evaluate symbol {symbol} for a new trade", e)
 
@@ -4836,7 +4850,8 @@ def _s8_volume_confirm(breakout: pd.Series, retest: pd.Series, vol_ma: float) ->
     except Exception:
         return False
 
-async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
+async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFra_code
+
     """
     Strategy 8: SMC + Chart-Pattern Sniper Entry — break + retest inside H1 OB/FVG
     - HTF alignment: Daily/H4 agree (fallback H4+H1 if Daily neutral)
@@ -5061,6 +5076,266 @@ async def evaluate_strategy_8(symbol: str, df_m15: pd.DataFrame):
 
     except Exception as e:
         await asyncio.to_thread(log_and_send_error, f"S8 evaluation error for {symbol}", e)
+        return
+
+# --------- Strategy 10 (AA + VBM Combined) ---------
+async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
+    """
+    Strategy 10: Combined Active-Adaptive (AA) + Volatility Breakout Momentum (VBM)
+    - For now, AA uses S5-style H1 trend + M15 pullback logic.
+    - VBM uses M5 breakout of 1h box with momentum/volume confirmation.
+    - Sizing: identical to S5, including small-balance min-notional handling.
+    """
+    try:
+        s10 = CONFIG.get("STRATEGY_10", {})
+        # Reuse S5 indicator params for now
+        s5 = CONFIG.get("STRATEGY_5", {})
+
+        # Symbol allow-list (reuse S5 set)
+        allowed = s10.get("SYMBOLS") or s5.get("SYMBOLS")
+        if isinstance(allowed, str):
+            allowed = [x.strip().upper() for x in allowed.split(",") if x.strip()]
+        if not allowed or not isinstance(allowed, (list, tuple)):
+            allowed = [
+                "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","AVAXUSDT",
+                "LTCUSDT","ADAUSDT","XRPUSDT","LINKUSDT","DOTUSDT"
+            ]
+        if symbol not in allowed:
+            _record_rejection(symbol, "S10-Restricted symbol", {"allowed": ",".join(allowed)})
+            return
+
+        if df_m15 is None or len(df_m15) < 80:
+            _record_rejection(symbol, "S10-Not enough M15 data", {"len": len(df_m15) if df_m15 is not None else 0})
+            return
+
+        # Ensure required M15 indicators (reuse S5)
+        df_m15 = df_m15.copy()
+        df_m15['s5_atr'] = df_m15.get('s5_atr', atr_wilder(df_m15, int(s5.get('ATR_PERIOD', 14))))
+        df_m15['s5_rsi'] = df_m15.get('s5_rsi', rsi(df_m15['close'], int(s5.get('RSI_PERIOD', 14))))
+        if 's5_m15_ema_fast' not in df_m15.columns or 's5_m15_ema_slow' not in df_m15.columns:
+            df_m15['s5_m15_ema_fast'] = ema(df_m15['close'], s5.get('EMA_FAST', 21))
+            df_m15['s5_m15_ema_slow'] = ema(df_m15['close'], s5.get('EMA_SLOW', 55))
+        if 's5_vol_ma10' not in df_m15.columns:
+            df_m15['s5_vol_ma10'] = df_m15['volume'].rolling(10).mean()
+
+        sig15 = df_m15.iloc[-2]
+        prev15 = df_m15.iloc[-3]
+
+        # HF trend (H1) for AA and to gate VBM conflicts
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < 80:
+            _record_rejection(symbol, "S10-Not enough H1 data", {"len": len(df_h1) if df_h1 is not None else 0})
+            return
+        df_h1 = df_h1.copy()
+        df_h1['ema_fast'] = ema(df_h1['close'], s5.get('EMA_FAST', 21))
+        df_h1['ema_slow'] = ema(df_h1['close'], s5.get('EMA_SLOW', 55))
+        df_h1['st_h1'], df_h1['st_h1_dir'] = supertrend(df_h1, period=s5.get('H1_ST_PERIOD', 10), multiplier=s5.get('H1_ST_MULT', 3.0))
+        h1_last = df_h1.iloc[-2]
+        h1_bull = (h1_last['ema_fast'] > h1_last['ema_slow']) and (h1_last['close'] > h1_last['st_h1'])
+        h1_bear = (h1_last['ema_fast'] < h1_last['ema_slow']) and (h1_last['close'] < h1_last['st_h1'])
+
+        # Engine AA (reuse S5 trigger)
+        vol_spike_15 = (sig15['volume'] >= 1.2 * sig15['s5_vol_ma10']) if pd.notna(sig15['s5_vol_ma10']) else False
+        rsi_ok_15 = 35 <= sig15['s5_rsi'] <= 65
+        m15_bull_pullback = (sig15['s5_m15_ema_fast'] >= sig15['s5_m15_ema_slow']) and (prev15['low'] <= prev15['s5_m15_ema_fast']) and (sig15['close'] > sig15['s5_m15_ema_fast']) and (sig15['close'] > sig15['open'])
+        m15_bear_pullback = (sig15['s5_m15_ema_fast'] <= sig15['s5_m15_ema_slow']) and (prev15['high'] >= prev15['s5_m15_ema_fast']) and (sig15['close'] < sig15['s5_m15_ema_fast']) and (sig15['close'] < sig15['open'])
+
+        aa_side = None
+        if h1_bull and m15_bull_pullback and vol_spike_15 and rsi_ok_15:
+            aa_side = 'BUY'
+        elif h1_bear and m15_bear_pullback and vol_spike_15 and rsi_ok_15:
+            aa_side = 'SELL'
+
+        # Engine VBM on M5
+        df_m5 = await asyncio.to_thread(fetch_klines_sync, symbol, '5m', 200)
+        vbm_side = None
+        vbm_entry = None
+        vbm_stop = None
+        stacked = False
+        if df_m5 is not None and len(df_m5) >= 80:
+            df_m5 = df_m5.copy()
+            df_m5['atr_m5'] = atr_wilder(df_m5, 14)
+            df_m5['vol_ma10'] = df_m5['volume'].rolling(10).mean()
+            # Define range box: last 12 bars before signal (approx 1 hour)
+            sig5 = df_m5.iloc[-2]
+            box = df_m5.iloc[-14:-2]  # 12 bars
+            if not box.empty:
+                range_high = float(box['high'].max())
+                range_low = float(box['low'].min())
+                range_width = range_high - range_low
+                # Breakout conditions
+                sig_range = float(sig5['high'] - sig5['low'])
+                avg_range10 = float((df_m5['high'] - df_m5['low']).rolling(10).mean().iloc[-2])
+                vol_ma10_5 = float(df_m5['vol_ma10'].iloc[-2]) if pd.notna(df_m5['vol_ma10'].iloc[-2]) else float('nan')
+                momentum_ok = (sig_range >= 1.2 * avg_range10) if np.isfinite(avg_range10) else False
+                volume_ok = (float(sig5['volume']) >= 2.0 * vol_ma10_5) if np.isfinite(vol_ma10_5) else False
+
+                if float(sig5['close']) > range_high and (momentum_ok or volume_ok):
+                    vbm_side = 'BUY'
+                    vbm_entry = float(sig5['close'])
+                    atr_m5 = float(df_m5['atr_m5'].iloc[-2]) if pd.notna(df_m5['atr_m5'].iloc[-2]) else 0.0
+                    vbm_stop = vbm_entry - max(1.75 * atr_m5, 0.5 * range_width)
+                elif float(sig5['close']) < range_low and (momentum_ok or volume_ok):
+                    vbm_side = 'SELL'
+                    vbm_entry = float(sig5['close'])
+                    atr_m5 = float(df_m5['atr_m5'].iloc[-2]) if pd.notna(df_m5['atr_m5'].iloc[-2]) else 0.0
+                    vbm_stop = vbm_entry + max(1.75 * atr_m5, 0.5 * range_width)
+
+                # Gate by H1: if contradicting, require previous candle also beyond range in same direction
+                if vbm_side:
+                    contradicts = (vbm_side == 'BUY' and h1_bear) or (vbm_side == 'SELL' and h1_bull)
+                    if contradicts:
+                        prev5 = df_m5.iloc[-3]
+                        if not ((vbm_side == 'BUY' and float(prev5['close']) > range_high) or (vbm_side == 'SELL' and float(prev5['close']) < range_low)):
+                            # Not enough follow-through under contradiction
+                            vbm_side = None
+                            vbm_entry = None
+                            vbm_stop = None
+
+        # Resolve signals
+        chosen_side = None
+        entry_price = None
+        stop_price = None
+        engine = None
+
+        if aa_side and vbm_side and aa_side == vbm_side:
+            chosen_side = aa_side
+            stacked = True
+            engine = "STACKED"
+            # Use AA entry (M15 close) by default; choose wider stop between AA and VBM
+            entry_price = float(sig15['close'])
+            # AA stop (reuse S5 hybrid)
+            swing_lookback = 5
+            if chosen_side == 'BUY':
+                tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())
+                atr_stop = entry_price - 1.5 * float(sig15['s5_atr'])
+                aa_stop = max(atr_stop, tech_inval)
+            else:
+                tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())
+                atr_stop = entry_price + 1.5 * float(sig15['s5_atr'])
+                aa_stop = min(atr_stop, tech_inval)
+            stop_price = aa_stop
+            if vbm_stop is not None:
+                # pick wider (further from entry)
+                if chosen_side == 'BUY':
+                    stop_price = min(stop_price, vbm_stop)
+                else:
+                    stop_price = max(stop_price, vbm_stop)
+        elif aa_side:
+            chosen_side = aa_side
+            engine = "AA"
+            entry_price = float(sig15['close'])
+            swing_lookback = 5
+            if chosen_side == 'BUY':
+                tech_inval = float(df_m15['low'].iloc[-swing_lookback:].min())
+                atr_stop = entry_price - 1.5 * float(sig15['s5_atr'])
+                stop_price = max(atr_stop, tech_inval)
+            else:
+                tech_inval = float(df_m15['high'].iloc[-swing_lookback:].max())
+                atr_stop = entry_price + 1.5 * float(sig15['s5_atr'])
+                stop_price = min(atr_stop, tech_inval)
+        elif vbm_side:
+            chosen_side = vbm_side
+            engine = "VBM"
+            entry_price = float(vbm_entry)
+            stop_price = float(vbm_stop) if vbm_stop is not None else None
+
+        if not chosen_side or entry_price is None or stop_price is None:
+            _record_rejection(symbol, "S10-No valid AA/VBM signal", {"aa": aa_side, "vbm": vbm_side})
+            return
+
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S10-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        # Sizing: identical to S5
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        # Ideal qty from fixed USDT risk (reuse RISK_USD S10 default)
+        risk_usd = float(s10.get("RISK_USD", s5.get("RISK_USD", 0.50)))
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        qty_min = (min_notional / entry_price) if entry_price > 0 else 0.0
+        qty_min = await asyncio.to_thread(round_qty, symbol, qty_min, rounding=ROUND_CEILING)
+
+        small_thresh = float(s10.get("BALANCE_SMALL_THRESHOLD", 50.0))
+        if balance < small_thresh:
+            # Small-account path: use minimum notional + buffer and dynamic leverage
+            buffer = float(s10.get("MIN_NOTIONAL_BUFFER", 0.10))
+            target_notional = float(min_notional) * (1.0 + buffer)
+            base_margin = max(
+                float(s10.get("BASE_MARGIN_MIN_USDT", 1.0)),
+                round(float(s10.get("BASE_MARGIN_PCT_OF_MIN_NOTIONAL", 0.10)) * float(min_notional), 2)
+            )
+            qty_for_target = (target_notional / entry_price) if entry_price > 0 else 0.0
+            final_qty = await asyncio.to_thread(round_qty, symbol, qty_for_target, rounding=ROUND_CEILING)
+
+            notional = final_qty * entry_price
+            if notional < target_notional:
+                bump_qty = await asyncio.to_thread(round_qty, symbol, final_qty + 1e-9, rounding=ROUND_CEILING)
+                if bump_qty > final_qty:
+                    final_qty = bump_qty
+                    notional = final_qty * entry_price
+
+            uncapped_leverage = int(math.ceil(target_notional / max(base_margin, 1e-9)))
+            max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+            leverage = max(1, min(uncapped_leverage, max_leverage))
+            actual_risk_usdt = final_qty * distance
+        else:
+            if ideal_qty < qty_min or ideal_qty <= 0:
+                _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+                return
+            final_qty = ideal_qty
+            notional = final_qty * entry_price
+            actual_risk_usdt = final_qty * distance
+            margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+            uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+            max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+            leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place LIMIT entry; TP managed by monitor logic. Stop stored in pending meta.
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, chosen_side, final_qty, entry_price)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        candle_duration = timeframe_to_timedelta(CONFIG["TIMEFRAME"])
+        expiry_candles = CONFIG.get("ORDER_EXPIRY_CANDLES", 2)
+        expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": chosen_side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": float(stop_price), "take_price": None, "leverage": leverage,
+            "risk_usdt": float(actual_risk_usdt), "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 10,
+            "atr_at_entry": float(sig15['s5_atr']),
+            "trailing": True,
+            "s10_engine": engine,
+            "s10_stacked": bool(stacked),
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S10 (AA+VBM)"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Side: `{chosen_side}`\n"
+            f"Engine: `{engine}`\n"
+            f"Price: `{entry_price:.4f}`\n"
+            f"Qty: `{final_qty}`\n"
+            f"Risk: `{actual_risk_usdt:.2f} USDT`\n"
+            f"Leverage: `{leverage}x`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S10 evaluation error for {symbol}", e)
         return
 
 # --------- Strategy 9 (SMC Scalping — High-Win Probability) helpers ---------
