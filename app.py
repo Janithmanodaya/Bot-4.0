@@ -1,6 +1,6 @@
 # app.py
 """
-This code version is - 1.10 every time if you make any small update increase this number for tracking purposes - last update 1.09
+This code version is - 1.10 every time if you make any small update increase this number for tracking purposes - last update 1.10
 EMA/BB Strategy Bot — Refactored from KAMA base.
  - DualLock for cross-thread locking
  - Exchange info cache to avoid repeated futures_exchange_info calls
@@ -233,6 +233,26 @@ CONFIG = {
             "S10_SYMBOLS",
             os.getenv("S5_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,AVAXUSDT,LTCUSDT,ADAUSDT,XRPUSDT,LINKUSDT,DOTUSDT")
         ).split(","),
+        # --- Trailing/BE Plan A knobs (config only; to be consumed by trailing logic) ---
+        # Gate trailing: do not trail until the trade proves itself
+        "BE_TRIGGER_R": float(os.getenv("S10_BE_TRIGGER_R", "1.0")),              # prefer R multiple trigger (>= 1.0R)
+        "BE_TRIGGER_PCT": float(os.getenv("S10_BE_TRIGGER_PCT", "0.0")),          # optional pct trigger; 0.0 disables
+        # Break-even nuance: offset to cover fees on BE moves
+        "BE_SL_OFFSET_PCT": float(os.getenv("S10_BE_SL_OFFSET_PCT", "0.001")),    # 0.10%
+        "BE_BUFFER_PCT": float(os.getenv("S10_BE_SL_OFFSET_PCT", "0.001")),       # used by compute_be_sl()
+        # Anti-whipsaw guards / cadence
+        "NO_TRAIL_BARS": int(os.getenv("S10_NO_TRAIL_BARS", "2")),                # skip trailing first N bars
+        "MIN_SL_MOVE_PCT": float(os.getenv("S10_MIN_SL_MOVE_PCT", "0.001")),      # min % move to update SL
+        # Hybrid trail components
+        "PIVOT_LOOKBACK": int(os.getenv("S10_PIVOT_LOOKBACK", "5")),              # swing pivot lookback
+        "TRAIL_ATR_MULT_STRONG": float(os.getenv("S10_TRAIL_ATR_MULT_STRONG", "2.0")),  # ADX strong trend
+        "TRAIL_ATR_MULT_WEAK": float(os.getenv("S10_TRAIL_ATR_MULT_WEAK", "2.8")),      # ADX weak/unclear
+        "TRAIL_BUFFER_MULT": float(os.getenv("S10_TRAIL_BUFFER_MULT", "0.30")),   # additional buffer × ATR
+        "ADX_TREND_MIN": float(os.getenv("S10_ADX_TREND_MIN", "25")),             # ADX threshold for strong trend
+        "USE_ADAPTIVE_TRAIL": os.getenv("S10_USE_ADAPTIVE_TRAIL", "true").lower() in ("true", "1", "yes"),
+        # Stacked setups handling
+        "STACKED_PARTIAL_CLOSE_PCT": float(os.getenv("S10_STACKED_PARTIAL_CLOSE_PCT", "0.25")),  # 25% at 1R
+        "STACKED_WIDER_MULT_BONUS": float(os.getenv("S10_STACKED_WIDER_MULT_BONUS", "0.25")),    # temporary widen
     },
     "STRATEGY_EXIT_PARAMS": {
         "1": {  # BB strategy
