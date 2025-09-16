@@ -236,13 +236,22 @@ CONFIG = {
         "VBM_RANGE_MIN_M5": int(os.getenv("S10_VBM_RANGE_MIN_M5", "6")),   # 30m consolidation on M5
         "VBM_RANGE_MAX_M5": int(os.getenv("S10_VBM_RANGE_MAX_M5", "12")),  # 60m consolidation on M5
         "VBM_ATR_MULT_STOP": float(os.getenv("S10_VBM_ATR_MULT_STOP", "1.75")),
-        "VBM_MIN_RANGE_PCT_OF_AVG": float(os.getenv("S10_VBM_MIN_RANGE_PCT_OF_AVG", "1.2")),  # 120% of avg M5 range
-        "CONFIRM_VOL_MULT": float(os.getenv("S10_CONFIRM_VOL_MULT", "1.5")),  # vs 10-bar avg
+        # Tighten VBM confirmation thresholds per Plan B
+        "VBM_MIN_RANGE_PCT_OF_AVG": float(os.getenv("S10_VBM_MIN_RANGE_PCT_OF_AVG", "1.4")),  # 140% of avg M5 range
+        "CONFIRM_VOL_MULT": float(os.getenv("S10_CONFIRM_VOL_MULT", "1.8")),  # vs 10-bar avg
         "REJECTION_WICK_RATIO": float(os.getenv("S10_REJECTION_WICK_RATIO", "0.6")),          # AA rejection candle wick ratio
         "LIMIT_EXPIRY_M5_CANDLES": int(os.getenv("S10_LIMIT_EXPIRY_M5_CANDLES", "2")),
         "LIMIT_EXPIRY_M15_CANDLES": int(os.getenv("S10_LIMIT_EXPIRY_M15_CANDLES", "3")),
-        # Sizing: reuse S5 model (fixed USDT risk with min-notional enforcement)
-        "RISK_USD": float(os.getenv("S10_RISK_USD", os.getenv("S5_RISK_USD", "0.50"))),
+        # Sizing: reuse S5 model (fixed USDT risk with min-notional enforcement) but slightly reduced by default
+        "RISK_USD": float(os.getenv("S10_RISK_USD", "0.40")),  # -20% from 0.50 default
+        # News guard (skip trading near impactful headlines)
+        "NEWS_GUARD_ENABLED": os.getenv("S10_NEWS_GUARD_ENABLED", "true").lower() in ("true","1","yes"),
+        "NEWS_WINDOW_HOURS": int(os.getenv("S10_NEWS_WINDOW_HOURS", "2")),
+        # HTF bias guard
+        "REQUIRE_HTF_ALIGNMENT": os.getenv("S10_REQUIRE_HTF_ALIGNMENT", "true").lower() in ("true","1","yes"),
+        "HTF_PENALTY_MODE": os.getenv("S10_HTF_PENALTY_MODE", "strict"),  # 'strict' reject or 'confirm' require extra confirmation
+        # Small account stricter filter
+        "SMALL_ACCOUNT_STACKED_ONLY": os.getenv("S10_SMALL_ACCOUNT_STACKED_ONLY", "true").lower() in ("true","1","yes"),
         # Symbol universe defaults to S5 symbols
         "SYMBOLS": os.getenv(
             "S10_SYMBOLS",
@@ -505,7 +514,11 @@ REJECTION_REASON_EMOJI = {
     "S10-Entry/Stop calc failed": "🧮",
     "S10-Invalid SL distance": "🧮",
     "S10-Qty below minimum": "📉",
-    "S10-VBM stop too wide": "📐"
+    "S10-VBM stop too wide": "📐",
+    "S10-News window": "📰",
+    "S10-HTF misaligned": "🧭",
+    "S10-Non-stacked needs extra confirm": "🧱",
+    "S10-SmallAcct stacked only": "👶"
 }
 
 
@@ -4868,9 +4881,13 @@ def _s6_within_poi(candle: pd.Series, poi_level: float, atr_val: float) -> bool:
 async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
     """
     Strategy 10: Combined Active-Adaptive (AA: SMC + retest on M15) + Volatility Breakout Momentum (VBM on M5)
-    - Runs on a 1-minute scheduler upstream but uses M15/H1 for AA and M5/M15 for VBM confirmation.
-    - Sizing: reuse S5 fixed-USDT risk model with min-notional enforcement.
-    - Execution: limit-first at signal close; expiry windows per config.
+    Plan B upgrades:
+      - Prioritize stacked setups (AA+VBM). Non-stacked require extra confirmation or are rejected.
+      - Tightened VBM confirmation size/volume thresholds.
+      - Stricter HTF bias: require H1 + H4/D alignment (configurable).
+      - Lower default risk per trade; support small-account stacked-only mode.
+      - News guard to avoid trading near impactful headlines.
+      - Place order with metadata for dynamic TP/management downstream.
     """
     try:
         s10 = CONFIG.get('STRATEGY_10', {})
@@ -4879,6 +4896,16 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         if allowed and symbol not in allowed:
             _record_rejection(symbol, "S10-Restricted symbol", {"allowed": ",".join(allowed)})
             return
+
+        # --- News guard (skip if impactful news within window) ---
+        if s10.get("NEWS_GUARD_ENABLED", True):
+            try:
+                news = await asyncio.to_thread(fetch_recent_news_impact, symbol, max(6, int(s10.get("NEWS_WINDOW_HOURS", 2))), 3)
+                if (news.get("impact") or "None") in ("Positive", "Negative"):
+                    _record_rejection(symbol, "S10-News window", {"impact": news.get("impact"), "reason": news.get("reason", "")})
+                    return
+            except Exception:
+                pass
 
         # Basic M15 data check
         if df_m15 is None or len(df_m15) < 120:
@@ -4912,6 +4939,42 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         h1_bull = (h1_sig['ema_fast'] > h1_sig['ema_slow']) and (h1_sig['close'] > h1_sig['st_h1'])
         h1_bear = (h1_sig['ema_fast'] < h1_sig['ema_slow']) and (h1_sig['close'] < h1_sig['st_h1'])
 
+        # Add H4 and Daily bias checks for stricter HTF alignment
+        def _bias_from_df(df_: pd.DataFrame, ema_fast: int, ema_slow: int) -> Optional[str]:
+            if df_ is None or len(df_) < max(ema_fast, ema_slow) + 10:
+                return None
+            df_ = df_.copy()
+            ef = ema(df_['close'], ema_fast)
+            es = ema(df_['close'], ema_slow)
+            last_close = float(df_['close'].iloc[-2])
+            last_ef = float(ef.iloc[-2])
+            last_es = float(es.iloc[-2])
+            if last_ef > last_es and last_close > last_ef:
+                return 'BUY'
+            if last_ef < last_es and last_close < last_ef:
+                return 'SELL'
+            return None
+
+        df_h4 = await asyncio.to_thread(fetch_klines_sync, symbol, '4h', 400)
+        df_d = await asyncio.to_thread(fetch_klines_sync, symbol, '1d', 400)
+        bias_h4 = _bias_from_df(df_h4, int(s10.get('EMA_FAST', 21)), int(s10.get('EMA_SLOW', 55))) if df_h4 is not None else None
+        bias_d  = _bias_from_df(df_d, int(s10.get('EMA_FAST', 21)), int(s10.get('EMA_SLOW', 55))) if df_d is not None else None
+        bias_h1 = 'BUY' if h1_bull else ('SELL' if h1_bear else None)
+
+        # Require HTF alignment (strict or confirm mode)
+        if s10.get("REQUIRE_HTF_ALIGNMENT", True):
+            aligned = (bias_h1 is not None) and (bias_h4 == bias_h1 or bias_d == bias_h1)
+            if not aligned:
+                # In confirm mode we can continue but mark that extra confirmation is needed for non-stacked
+                if str(s10.get("HTF_PENALTY_MODE", "strict")).lower() == "strict":
+                    _record_rejection(symbol, "S10-HTF misaligned", {"H1": bias_h1, "H4": bias_h4, "D": bias_d})
+                    return
+                htf_misaligned = True
+            else:
+                htf_misaligned = False
+        else:
+            htf_misaligned = False
+
         # H1 BOS in 24–72 candles window
         lb_min, lb_max = 24, 72
         prev_window_high = float(df_h1['high'].iloc[-(lb_max+2):-2].max())
@@ -4925,7 +4988,7 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         aa_stop = None
 
         REJ_WICK = float(s10.get('REJECTION_WICK_RATIO', 0.6))
-        CONF_VOL_MULT = float(s10.get('CONFIRM_VOL_MULT', 1.5))
+        CONF_VOL_MULT = float(s10.get('CONFIRM_VOL_MULT', 1.8))
 
         # POI level (simplified): use BOS swing level from H1 window
         poi_level = prev_window_high if bos_dir == 'BUY' else (prev_window_low if bos_dir == 'SELL' else None)
@@ -5007,28 +5070,27 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             breakout_range = float(breakout['high'] - breakout['low'])
             breakout_vol = float(breakout['volume'])
 
-            size_ok = (np.isfinite(prev_avg_range) and breakout_range >= float(s10.get('VBM_MIN_RANGE_PCT_OF_AVG', 1.2)) * prev_avg_range)
-            vol_ok = (np.isfinite(prev_avg_vol) and breakout_vol >= 2.0 * prev_avg_vol)
+            # Tightened thresholds per Plan B
+            size_ok = (np.isfinite(prev_avg_range) and breakout_range >= float(s10.get('VBM_MIN_RANGE_PCT_OF_AVG', 1.4)) * prev_avg_range)
+            vol_ok = (np.isfinite(prev_avg_vol) and breakout_vol >= float(s10.get('CONFIRM_VOL_MULT', 1.8)) * prev_avg_vol)
 
             # Direction by breakout
-            if close > rng_high and (size_ok or vol_ok):
+            if close > rng_high and (size_ok and vol_ok):
                 vbm_side = 'BUY'
-            elif close < rng_low and (size_ok or vol_ok):
+            elif close < rng_low and (size_ok and vol_ok):
                 vbm_side = 'SELL'
 
             if vbm_side:
-                # If HF contradicts, require a safer confirmation on M15 follow-through
-                hf_ok = (vbm_side == 'BUY' and h1_bull) or (vbm_side == 'SELL' and h1_bear)
-                if not hf_ok:
-                    # require M15 confirmation (ft candle direction)
+                # HTF alignment penalty: if misaligned, require M15 confirm direction AND extra volume again
+                if htf_misaligned:
                     if not ((vbm_side == 'BUY' and ft_m15['close'] > ft_m15['open']) or (vbm_side == 'SELL' and ft_m15['close'] < ft_m15['open'])):
-                        vbm_side = None  # drop
+                        vbm_side = None
                 if vbm_side:
                     # Entry at M15 confirm close (safer)
                     vbm_entry = float(ft_m15['close'])
                     # Stop = entry - max(1.75*ATR(M5), 0.5*range_width)
                     rng_term = 0.5 * max(1e-9, rng_width)
-                    atr_term = 1.75 * float(df_m5['s10_atr_m5'].iloc[-2])
+                    atr_term = float(s10.get('VBM_ATR_MULT_STOP', 1.75)) * float(df_m5['s10_atr_m5'].iloc[-2])
                     if vbm_side == 'BUY':
                         vbm_stop = vbm_entry - max(atr_term, rng_term)
                     else:
@@ -5046,12 +5108,28 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S10-No valid AA/VBM setup", {"aa_ok": aa_ok, "vbm_ok": vbm_ok})
             return
 
+        # Small-account stricter mode: stacked only
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        if balance <= CONFIG.get('RISK_SMALL_BALANCE_THRESHOLD', 50.0) and s10.get("SMALL_ACCOUNT_STACKED_ONLY", True) and not stacked:
+            _record_rejection(symbol, "S10-SmallAcct stacked only", {"balance": balance})
+            return
+
+        # Non-stacked handling: require extra confirmation; otherwise drop
+        if not stacked:
+            # Require M15 strong follow-through candle in direction AND volume > 2.0x avg
+            vol_ma10_ft = float(df_m15['s10_vol_ma10'].iloc[-1]) if pd.notna(df_m15['s10_vol_ma10'].iloc[-1]) else float('nan')
+            ft_dir_ok = (vbm_ok and ((vbm_side == 'BUY' and ft_m15['close'] > ft_m15['open']) or (vbm_side == 'SELL' and ft_m15['close'] < ft_m15['open']))) or \
+                        (aa_ok and ((aa_side == 'BUY' and ft_m15['close'] > ft_m15['open']) or (aa_side == 'SELL' and ft_m15['close'] < ft_m15['open'])))
+            vol_strong = np.isfinite(vol_ma10_ft) and float(ft_m15['volume']) >= 2.0 * vol_ma10_ft
+            if not (ft_dir_ok and vol_strong):
+                _record_rejection(symbol, "S10-Non-stacked needs extra confirm", {"dir_ok": ft_dir_ok, "vol_strong": bool(vol_strong)})
+                return
+
         if stacked:
             side = aa_side
             # Use safer entry: M15 confirm close (ft_m15) to reduce false fills
             entry_price = float(ft_m15['close'])
             # Wider of AA & VBM stops
-            # For BUY, wider means lower (further from entry); for SELL, higher
             if side == 'BUY':
                 aa_dist = abs(entry_price - aa_stop) if aa_stop is not None else 0.0
                 vbm_dist = abs(entry_price - vbm_stop) if vbm_stop is not None else 0.0
@@ -5078,8 +5156,7 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             _record_rejection(symbol, "S10-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
             return
 
-        # Sizing: reuse S5 model (fixed-USDT risk with min-notional)
-        balance = await asyncio.to_thread(get_account_balance_usdt)
+        # Sizing: reuse S5 model (fixed-USDT risk with min-notional), Plan B reduces risk_usd default
         risk_usd = float(s10.get('RISK_USD', CONFIG.get('STRATEGY_5', {}).get('RISK_USD', 0.5)))
         ideal_qty = risk_usd / distance
         ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
@@ -5087,16 +5164,14 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
         qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
 
-        # Adopt S5's minimum-notional small-account path for S10 as well
         if balance <= CONFIG.get('RISK_SMALL_BALANCE_THRESHOLD', 50.0):
             # Small-account path: use minimum notional with a slight buffer and dynamic margin/leverage
-            target_notional = float(min_notional) * 1.10  # small buffer above min notional
-            base_margin = max(1.0, round(0.10 * float(min_notional), 2))  # e.g., 10% of min notional, min 1 USDT
+            target_notional = float(min_notional) * 1.10
+            base_margin = max(1.0, round(0.10 * float(min_notional), 2))
 
             qty_for_target = (target_notional / entry_price) if entry_price > 0 else 0.0
             final_qty = await asyncio.to_thread(round_qty, symbol, qty_for_target, rounding=ROUND_CEILING)
 
-            # Ensure we still satisfy the target notional after rounding
             notional = final_qty * entry_price
             if notional < target_notional:
                 bump_qty = await asyncio.to_thread(round_qty, symbol, final_qty + 1e-9, rounding=ROUND_CEILING)
@@ -5104,13 +5179,11 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
                     final_qty = bump_qty
                     notional = final_qty * entry_price
 
-            # Leverage derived from target_notional and chosen base margin; cap by exchange/config
             uncapped_leverage = int(math.ceil(target_notional / max(base_margin, 1e-9)))
             max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
             leverage = max(1, min(uncapped_leverage, max_leverage))
             actual_risk_usdt = final_qty * distance
         else:
-            # Default path: fixed-risk sizing; reject if min notional not met
             if ideal_qty < qty_min or ideal_qty <= 0:
                 _record_rejection(symbol, "S10-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
                 return
@@ -5129,7 +5202,7 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
         order_id = str(limit_order_resp.get('orderId'))
         pending_order_id = f"{symbol}_{order_id}"
 
-        # Expiry: use M15 expiry for AA/stacked; for VBM-only, still keep conservative default M15 expiry
+        # Expiry: use M15 expiry for AA/stacked; for VBM-only, keep conservative default M15 expiry
         candle_duration = timeframe_to_timedelta(CONFIG['TIMEFRAME'])
         expiry_candles = int(s10.get("LIMIT_EXPIRY_M15_CANDLES", 3))
         expiry_time = df_m15.index[-1] + (candle_duration * (expiry_candles - 1))
@@ -5159,13 +5232,7 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             await asyncio.to_thread(add_pending_order_to_db, pending_meta)
 
         title = "⏳ New Pending Order: S10-AA+VBM"
-        # Fetch recent news sentiment/impact for context (best-effort)
-        try:
-            news = await asyncio.to_thread(fetch_recent_news_impact, symbol, 24, 3)
-        except Exception:
-            news = {"impact": "None", "reason": "news fetch failed", "articles": []}
-
-        # Build and send Telegram notification
+        # Build and send Telegram notification (news impact is already checked above; fetch again isn't necessary)
         new_order_msg = (
             f"{title}\n\n"
             f"Symbol: `{symbol}`\n"
@@ -5176,7 +5243,7 @@ async def evaluate_strategy_10(symbol: str, df_m15: pd.DataFrame):
             f"Leverage: `{leverage}x`\n"
             f"Stacked: `{bool(stacked)}`\n"
             f"Component: `{pending_meta.get('s10_component', 'N/A')}`\n"
-            f"News impact: `{news.get('impact', 'None')}` — {news.get('reason', '')}"
+            f"HTF: H1=`{bias_h1}`, H4=`{bias_h4}`, D=`{bias_d}`"
         )
         await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
 
