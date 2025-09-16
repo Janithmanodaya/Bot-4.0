@@ -2401,6 +2401,83 @@ def round_price(symbol: str, price: float) -> str:
     return f"{price:.8f}"
 
 
+def round_price_to(symbol: str, price: float, rounding=ROUND_DOWN) -> str:
+    """
+    Round a price to the symbol's tick size using the specified rounding mode.
+    """
+    try:
+        info = get_exchange_info_sync()
+        if not info or not isinstance(info, dict):
+            # Fallback formatting
+            return f"{price:.8f}"
+        symbol_info = next((s for s in info.get('symbols', []) if s.get('symbol') == symbol), None)
+        if not symbol_info:
+            return f"{price:.8f}"
+        for f in symbol_info.get('filters', []):
+            if f.get('filterType') == 'PRICE_FILTER':
+                tick_size_str = f.get('tickSize', '0.00000001')
+                tick_size = Decimal(tick_size_str)
+                decimal_places = abs(tick_size.as_tuple().exponent)
+
+                getcontext().prec = 28
+                p = Decimal(str(price))
+                rounded_price = (p / tick_size).to_integral_value(rounding=rounding) * tick_size
+                return f"{rounded_price:.{decimal_places}f}"
+    except Exception:
+        log.exception("round_price_to failed; falling back to basic formatting")
+    return f"{price:.8f}"
+
+
+def ensure_valid_stop_tp_prices(symbol: str, position_side: str, sl_price: Optional[float], tp_price: Optional[float]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Ensure SL/TP trigger prices are on the correct side of current price to avoid -2021 immediate-trigger errors.
+    Returns (sl_str, tp_str) already rounded to the symbol's tick with safe bias.
+    position_side: 'LONG' or 'SHORT'
+    """
+    try:
+        current = get_current_price_sync(symbol)
+    except Exception:
+        current = 0.0
+
+    try:
+        tick = get_price_tick_size(symbol)
+        if not tick or tick <= 0:
+            tick = 0.0001
+    except Exception:
+        tick = 0.0001
+
+    sl_str = None
+    tp_str = None
+
+    if sl_price is not None and np.isfinite(sl_price):
+        sp = float(sl_price)
+        if position_side == 'LONG':
+            # For LONG, SL (SELL STOP) must be strictly below current
+            if current > 0 and not (sp < current - tick):
+                sp = current - 2 * tick
+            sl_str = round_price_to(symbol, sp, rounding=ROUND_DOWN)
+        else:
+            # For SHORT, SL (BUY STOP) must be strictly above current
+            if current > 0 and not (sp > current + tick):
+                sp = current + 2 * tick
+            sl_str = round_price_to(symbol, sp, rounding=ROUND_CEILING)
+
+    if tp_price is not None and np.isfinite(tp_price):
+        tp = float(tp_price)
+        if position_side == 'LONG':
+            # For LONG, TP (SELL TAKE_PROFIT) must be strictly above current
+            if current > 0 and not (tp > current + tick):
+                tp = current + 2 * tick
+            tp_str = round_price_to(symbol, tp, rounding=ROUND_CEILING)
+        else:
+            # For SHORT, TP (BUY TAKE_PROFIT) must be strictly below current
+            if current > 0 and not (tp < current - tick):
+                tp = current - 2 * tick
+            tp_str = round_price_to(symbol, tp, rounding=ROUND_DOWN)
+
+    return sl_str, tp_str
+
+
 def get_price_tick_size(symbol: str) -> float:
     """
     Returns the tick size (minimum price increment) for the given symbol, or 0 if unavailable.
@@ -2694,6 +2771,9 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
     position_side = 'LONG' if side == 'BUY' else 'SHORT'
     close_side = 'SELL' if side == 'BUY' else 'BUY'
 
+    # Validate and bias SL/TP away from the current price to avoid -2021
+    sl_str, tp_str = ensure_valid_stop_tp_prices(symbol, position_side, stop_price, take_price)
+
     market_order_params = {
         'symbol': symbol,
         'side': side,
@@ -2715,20 +2795,74 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
 
     # Build the full order batch
     order_batch = [market_order_params]
-    
-    sl_order = close_order_params.copy()
-    sl_order.update({
-        'type': 'STOP_MARKET',
-        'stopPrice': round_price(symbol, stop_price),
-    })
-    order_batch.append(sl_order)
-    
-    tp_order = close_order_params.copy()
-    tp_order.update({
-        'type': 'TAKE_PROFIT_MARKET',
-        'stopPrice': round_price(symbol, take_price),
-    })
-    order_batch.append(tp_order)
+
+    if sl_str:
+        sl_order = close_order_params.copy()
+        sl_order.update({
+            'type': 'STOP_MARKET',
+            'stopPrice': sl_str,
+            'workingType': 'CONTRACT_PRICE'
+        })
+        order_batch.append(sl_order)
+
+    if tp_str:
+        tp_order = close_order_params.copy()
+        tp_order.update({
+            'type': 'TAKE_PROFIT_MARKET',
+            'stopPrice': tp_str,
+            'workingType': 'CONTRACT_PRICE'
+        })
+        order_batch.append(tp_order)
+
+    def _retry_with_nudge(prev_errors: list[dict]) -> list[dict]:
+        """
+        If -2021 immediate trigger occurred, nudge prices further from the current price and retry once.
+        """
+        try:
+            current = get_current_price_sync(symbol)
+            tick = get_price_tick_size(symbol) or 0.0001
+        except Exception:
+            current, tick = 0.0, 0.0001
+
+        nudge = 3 * tick
+        sl2, tp2 = sl_str, tp_str
+
+        # Adjust based on side
+        if sl2:
+            try:
+                sval = float(sl2)
+                if position_side == 'LONG':
+                    sval = min(sval, current - nudge) if current > 0 else sval
+                    sl2 = round_price_to(symbol, sval, rounding=ROUND_DOWN)
+                else:
+                    sval = max(sval, current + nudge) if current > 0 else sval
+                    sl2 = round_price_to(symbol, sval, rounding=ROUND_CEILING)
+            except Exception:
+                pass
+        if tp2:
+            try:
+                tval = float(tp2)
+                if position_side == 'LONG':
+                    tval = max(tval, current + nudge) if current > 0 else tval
+                    tp2 = round_price_to(symbol, tval, rounding=ROUND_CEILING)
+                else:
+                    tval = min(tval, current - nudge) if current > 0 else tval
+                    tp2 = round_price_to(symbol, tval, rounding=ROUND_DOWN)
+            except Exception:
+                pass
+
+        rebatch = [market_order_params]
+        if sl2:
+            s = close_order_params.copy()
+            s.update({'type': 'STOP_MARKET', 'stopPrice': sl2, 'workingType': 'CONTRACT_PRICE'})
+            rebatch.append(s)
+        if tp2:
+            t = close_order_params.copy()
+            t.update({'type': 'TAKE_PROFIT_MARKET', 'stopPrice': tp2, 'workingType': 'CONTRACT_PRICE'})
+            rebatch.append(t)
+
+        log.warning(f"Immediate-trigger (-2021) detected for {symbol}. Nudging triggers and retrying once. New batch: {rebatch}")
+        return client.futures_place_batch_order(batchOrders=rebatch)
 
     try:
         log.info(f"Placing batch order for {symbol}: {order_batch}")
@@ -2736,6 +2870,12 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
 
         errors = [resp for resp in batch_response if 'code' in resp]
         successful_orders = [resp for resp in batch_response if 'orderId' in resp]
+
+        # Retry once if immediate-trigger error occurred
+        if any((e.get('code') == -2021 or 'immediately trigger' in str(e).lower()) for e in errors):
+            batch_response = _retry_with_nudge(errors)
+            errors = [resp for resp in batch_response if 'code' in resp]
+            successful_orders = [resp for resp in batch_response if 'orderId' in resp]
 
         if errors:
             log.error(f"Batch order placement had failures for {symbol}. Errors: {errors}. Successful: {successful_orders}")
@@ -2745,9 +2885,9 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
                 log.warning(f"Market order for {symbol} was successful but SL/TP failed. Attempting to close the naked position.")
                 
                 closed_successfully = False
-                for i in range(3): # Retry up to 3 times
+                for i in range(3):  # Retry up to 3 times
                     try:
-                        time.sleep(1 + i) # Give exchange time, with increasing delay
+                        time.sleep(1 + i)  # Give exchange time, with increasing delay
                         client.futures_create_order(
                             symbol=symbol,
                             side=close_side,
@@ -2758,7 +2898,7 @@ def place_market_order_with_sl_tp_sync(symbol: str, side: str, qty: float, lever
                         )
                         log.info(f"Successfully closed naked position for {symbol} on attempt {i + 1}.")
                         closed_successfully = True
-                        break # Exit loop on success
+                        break  # Exit loop on success
                     except Exception as close_e:
                         log.exception(f"Attempt {i + 1} to close naked position for {symbol} failed. Error: {close_e}")
                 
@@ -2840,6 +2980,9 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     else:
         current_qty = qty
 
+    # Bias and round prices to avoid immediate trigger (-2021)
+    sl_str, tp_str = ensure_valid_stop_tp_prices(symbol, position_side, sl_price, tp_price)
+
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     order_batch = []
     
@@ -2854,19 +2997,21 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
     else:
         base_close_order['reduceOnly'] = True
 
-    if sl_price:
+    if sl_str:
         sl_order = base_close_order.copy()
         sl_order.update({
             'type': 'STOP_MARKET',
-            'stopPrice': round_price(symbol, sl_price),
+            'stopPrice': sl_str,
+            'workingType': 'CONTRACT_PRICE'
         })
         order_batch.append(sl_order)
     
-    if tp_price:
+    if tp_str:
         tp_order = base_close_order.copy()
         tp_order.update({
             'type': 'TAKE_PROFIT_MARKET',
-            'stopPrice': round_price(symbol, tp_price),
+            'stopPrice': tp_str,
+            'workingType': 'CONTRACT_PRICE'
         })
         order_batch.append(tp_order)
 
@@ -2874,17 +3019,73 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
         # This is a critical logic error if this function is called without any action to take.
         raise RuntimeError(f"place_batch_sl_tp_sync called for {symbol} without sl_price or tp_price. This should not happen.")
 
+    def _retry_with_nudge(prev_errors: list[dict]) -> list[dict]:
+        """
+        If -2021 immediate trigger occurred, nudge prices further from the current price and retry once.
+        """
+        try:
+            current = get_current_price_sync(symbol)
+            tick = get_price_tick_size(symbol) or 0.0001
+        except Exception:
+            current, tick = 0.0, 0.0001
+
+        nudge = 3 * tick
+        s2, t2 = sl_str, tp_str
+
+        # Adjust based on side
+        if s2:
+            try:
+                sval = float(s2)
+                if position_side == 'LONG':
+                    sval = min(sval, current - nudge) if current > 0 else sval
+                    s2 = round_price_to(symbol, sval, rounding=ROUND_DOWN)
+                else:
+                    sval = max(sval, current + nudge) if current > 0 else sval
+                    s2 = round_price_to(symbol, sval, rounding=ROUND_CEILING)
+            except Exception:
+                pass
+        if t2:
+            try:
+                tval = float(t2)
+                if position_side == 'LONG':
+                    tval = max(tval, current + nudge) if current > 0 else tval
+                    t2 = round_price_to(symbol, tval, rounding=ROUND_CEILING)
+                else:
+                    tval = min(tval, current - nudge) if current > 0 else tval
+                    t2 = round_price_to(symbol, tval, rounding=ROUND_DOWN)
+            except Exception:
+                pass
+
+        rebatch = []
+        if s2:
+            s = base_close_order.copy()
+            s.update({'type': 'STOP_MARKET', 'stopPrice': s2, 'workingType': 'CONTRACT_PRICE'})
+            rebatch.append(s)
+        if t2:
+            t = base_close_order.copy()
+            t.update({'type': 'TAKE_PROFIT_MARKET', 'stopPrice': t2, 'workingType': 'CONTRACT_PRICE'})
+            rebatch.append(t)
+
+        log.warning(f"Immediate-trigger (-2021) detected for {symbol}. Nudging triggers and retrying once. New batch: {rebatch}")
+        return client.futures_place_batch_order(batchOrders=rebatch)
+
     try:
         log.info(f"Placing batch SL/TP order for {symbol}: {order_batch}")
         batch_response = client.futures_place_batch_order(batchOrders=order_batch)
         
         # Check for errors within the batch response
         errors = [resp for resp in batch_response if 'code' in resp]
+        if any((e.get('code') == -2021 or 'immediately trigger' in str(e).lower()) for e in errors):
+            # Retry once with a small nudge away from current price
+            batch_response = _retry_with_nudge(errors)
+            errors = [resp for resp in batch_response if 'code' in resp]
+
         if errors:
             # If any order in the batch failed, log it for attention and raise an exception.
             error_details = f"Errors: {errors}"
             log.error(f"Batch SL/TP order placement failed for {symbol}. {error_details}")
-            mark_attention_required_sync(symbol, "batch_order_failed", error_details)
+            # Keep reason aligned with external alerting (batchorderfailed)
+            mark_attention_required_sync(symbol, "batchorderfailed", error_details)
             raise RuntimeError(f"Batch SL/TP order placement failed for {symbol}. {error_details}")
             
         log.info(f"Batch SL/TP order successful for {symbol}. Response: {batch_response}")
@@ -2900,6 +3101,9 @@ def place_batch_sl_tp_sync(symbol: str, side: str, sl_price: Optional[float] = N
         return processed_orders
     except BinanceAPIException as e:
         log.exception("BinanceAPIException placing batch SL/TP: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Exception placing batch SL/TP: %s", e)
         raise
     except Exception as e:
         log.exception("Exception placing batch SL/TP: %s", e)
