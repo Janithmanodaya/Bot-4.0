@@ -3886,6 +3886,15 @@ async def evaluate_and_enter(symbol: str):
             run_s11 = (11 in modes) or (0 in modes)
             run_s12 = (12 in modes) or (0 in modes)
             # Run the standard OHLCV path for these strategies
+            run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12]) or (0 in modes)
+            # Determine which strategy evaluators should run this cycle
+            run_s4 = (4 in modes) or (0 in modes)
+            run_s5 = (5 in modes) or (0 in modes)
+            run_s6 = (6 in modes) or (0 in modes)
+            run_s10 = (10 in modes) or (0 in modes)
+            run_s11 = (11 in modes) or (0 in modes)
+            run_s12 = (12 in modes) or (0 in modes)
+            # Run the standard OHLCV path for these strategies
             run_others = any(m in modes for m in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12]) or (0 in mod_codeesnew)</
 
 
