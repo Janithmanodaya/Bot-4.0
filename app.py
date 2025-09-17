@@ -1940,36 +1940,26 @@ def remove_pending_order_from_db(pending_order_id: str):
     conn.commit()
     conn.close()
 
-def load_pending_orders_from_db() -> Dict[str, Dict[str, Any]]:
-    conn = sqlite3.connect(CONFIG["DB_FILE"])
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM pending_limit_orders")
-    rows = cur.fetchall()
-    conn.close()
+def load_pending_orders_from_db() -> Dict[str, Dict[str, Any]]:     conn = sqlite3.connect(CONFIG["DB_FILE"])    connc.row_factory = sqlite3.Row    cur  = conn.cursor()    cur .execute("SELECT * FROM pending_limit_orders")    rowsr = cur.fetchall()    connc.close()
+    orders = {}   = for row in rows:       s rec = dict(row)       o # Normalize time fields to ISO with UTC tzinfo to avoid naive/aware comparison issues         for key in ('place_time', 'expiry_time'):            val = rec.get(key)
+            try:                if isinstance(val, str):
+                    dt = datetime.fromisoformat(val)                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)                    rec[key] = dt.isoformat()
+                elif isinstance(val, datetime):                    if val.tzinfo is None:
+                        val = val.replace(tzinfo=timezone.utc)                    rec[key] = val.isoformat()
+            except Exception:                # Leave original on failure
+                pass        rec['trailing'] = bool(rec.get('trailing'))
+        orders[rec['id']] = rec    return ord_codeernews</
 
-    orders = {}
-    for row in rows:
-        rec = dict(row)
-        # Normalize time fields to ISO with UTC tzinfo to avoid naive/aware comparison issues
-        for key in ('place_time', 'expiry_time'):
-            val = rec.get(key)
-            try:
-                if isinstance(val, str):
-                    dt = datetime.fromisoformat(val)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    rec[key] = dt.isoformat()
-                elif isinstance(val, datetime):
-                    if val.tzinfo is None:
-                        val = val.replace(tzinfo=timezone.utc)
-                    rec[key] = val.isoformat()
-            except Exception:
-                # Leave original on failure
-                pass
-        rec['trailing'] = bool(rec.get('trailing'))
-        orders[rec['id']] = rec
-    return orders
+
+
+
+
+
+
+
+
+ return orders
 
 def record_trade(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
