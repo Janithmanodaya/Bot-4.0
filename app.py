@@ -4810,6 +4810,171 @@ async def evaluate_strategy_5(symbol: str, df_m15: pd.DataFrame):
         return
 
 
+async def evaluate_strategy_11(symbol: str, df_current: pd.DataFrame):
+    """
+    Strategy 11: Mean Reversion on H1 Bollinger Bands with H4 RSI and ADX filters.
+    Entry:
+      - SHORT when H1 close breaches upper band AND H4 RSI < RSI_SHORT_MAX
+      - LONG  when H1 close breaches lower band AND H4 RSI > RSI_LONG_MIN
+      - Require ADX on H1 and H4 to be above configured minimums
+    Sizing:
+      - Fixed USDT risk like S4/S5 using distance from entry to SL
+    SL/TP:
+      - SL beyond breached band by 0.5 * ATR(H1)
+      - TP at H1 basis (BB middle band) — "wired TP exit logic"
+    Order:
+      - Place LIMIT at H1 close with both SL and TP persisted in pending order meta
+    """
+    try:
+        s11 = CONFIG.get('STRATEGY_11', {})
+        bb_len = int(s11.get('BB_LENGTH', 20))
+        bb_std = float(s11.get('BB_STD', 2.0))
+        rsi_p4h = int(s11.get('RSI_PERIOD_4H', 14))
+        rsi_long_min = float(s11.get('RSI_LONG_MIN', 55))
+        rsi_short_max = float(s11.get('RSI_SHORT_MAX', 45))
+        adx_h1_period = int(s11.get('ADX_PERIOD_H1', 14))
+        adx_4h_period = int(s11.get('ADX_PERIOD_4H', 14))
+        adx_min_h1 = float(s11.get('ADX_MIN_H1', 20))
+        adx_min_4h = float(s11.get('ADX_MIN_4H', 25))
+        atr_p_h1 = int(s11.get('ATR_PERIOD_H1', 14))
+        risk_usd = float(s11.get('RISK_USD', 0.50))
+        expiry_hours = int(s11.get('ORDER_EXPIRY_HOURS', 2))
+
+        # Fetch H1 and H4 datasets
+        df_h1 = await asyncio.to_thread(fetch_klines_sync, symbol, '1h', 300)
+        if df_h1 is None or len(df_h1) < max(bb_len + 5, 50):
+            _record_rejection(symbol, "S11-Not enough H1 data", {"len": len(df_h1) if df_h1 is not None else 0})
+            return
+        df_4h = await asyncio.to_thread(fetch_klines_sync, symbol, '4h', 200)
+        if df_4h is None or len(df_4h) < max(rsi_p4h + 5, 50):
+            _record_rejection(symbol, "S11-Not enough H4 data", {"len": len(df_4h) if df_4h is not None else 0})
+            return
+
+        # Compute indicators
+        df_h1 = df_h1.copy()
+        up_h1, lo_h1 = bollinger_bands(df_h1['close'], bb_len, bb_std)
+        basis_h1 = sma(df_h1['close'], bb_len)
+        df_h1['s11_bbu'] = up_h1
+        df_h1['s11_bbl'] = lo_h1
+        df_h1['s11_basis'] = basis_h1
+        df_h1['s11_atr'] = atr_wilder(df_h1, atr_p_h1)
+        adx(df_h1, period=adx_h1_period)
+
+        df_4h = df_4h.copy()
+        df_4h['s11_rsi_4h'] = rsi(df_4h['close'], rsi_p4h)
+        adx(df_4h, period=adx_4h_period)
+
+        sig_h1 = df_h1.iloc[-2]
+        rsi4h = float(df_4h['s11_rsi_4h'].iloc[-2]) if 's11_rsi_4h' in df_4h.columns else float('nan')
+        adx_h1_val = float(df_h1['adx'].iloc[-2]) if 'adx' in df_h1.columns else 0.0
+        adx_4h_val = float(df_4h['adx'].iloc[-2]) if 'adx' in df_4h.columns else 0.0
+
+        # Filters: ADX thresholds on H1 and H4
+        if not (adx_h1_val >= adx_min_h1 and adx_4h_val >= adx_min_4h):
+            _record_rejection(symbol, "S11-ADX too weak", {"adx_h1": adx_h1_val, "min_h1": adx_min_h1, "adx_4h": adx_4h_val, "min_4h": adx_min_4h}, signal_candle=sig_h1)
+            return
+
+        # RSI directional filter
+        side = None
+        if float(sig_h1['close']) <= float(sig_h1['s11_bbl']) and rsi4h >= rsi_long_min:
+            side = 'BUY'
+        elif float(sig_h1['close']) >= float(sig_h1['s11_bbu']) and rsi4h <= rsi_short_max:
+            side = 'SELL'
+        else:
+            _record_rejection(symbol, "S11-RSI filter block", {"close": float(sig_h1['close']), "bbu": float(sig_h1['s11_bbu']), "bbl": float(sig_h1['s11_bbl']), "rsi4h": rsi4h}, signal_candle=sig_h1)
+            return
+
+        # Confirm band breach condition
+        if side == 'BUY' and not (float(sig_h1['close']) <= float(sig_h1['s11_bbl'])):
+            _record_rejection(symbol, "S11-No BB breach", {"side": side, "close": float(sig_h1['close']), "bbl": float(sig_h1['s11_bbl'])}, signal_candle=sig_h1)
+            return
+        if side == 'SELL' and not (float(sig_h1['close']) >= float(sig_h1['s11_bbu'])):
+            _record_rejection(symbol, "S11-No BB breach", {"side": side, "close": float(sig_h1['close']), "bbu": float(sig_h1['s11_bbu'])}, signal_candle=sig_h1)
+            return
+
+        entry_price = float(sig_h1['close'])
+        atr_val = float(sig_h1['s11_atr'])
+        upper = float(sig_h1['s11_bbu'])
+        lower = float(sig_h1['s11_bbl'])
+        basis = float(sig_h1['s11_basis'])
+
+        # SL beyond the breached band by 0.5*ATR(H1)
+        atr_buf = 0.5 * atr_val
+        if side == 'BUY':
+            stop_price = lower - atr_buf
+            take_price = basis  # TP wired to BB basis on H1
+        else:
+            stop_price = upper + atr_buf
+            take_price = basis
+
+        distance = abs(entry_price - stop_price)
+        if distance <= 0 or not np.isfinite(distance):
+            _record_rejection(symbol, "S11-Invalid SL distance", {"entry": entry_price, "sl": stop_price})
+            return
+
+        # Sizing: fixed USDT risk like S4/S5
+        ideal_qty = risk_usd / distance
+        ideal_qty = await asyncio.to_thread(round_qty, symbol, ideal_qty, rounding=ROUND_DOWN)
+
+        # Enforce min notional
+        min_notional = await asyncio.to_thread(get_min_notional_sync, symbol)
+        qty_min = await asyncio.to_thread(round_qty, symbol, (min_notional / entry_price) if entry_price > 0 else 0.0, rounding=ROUND_CEILING)
+
+        if ideal_qty <= 0 or ideal_qty < qty_min:
+            _record_rejection(symbol, "S11-Qty below minimum", {"ideal": ideal_qty, "min": qty_min})
+            return
+
+        final_qty = ideal_qty
+        notional = final_qty * entry_price
+
+        # Leverage derived from risk and notional (consistent with S4/S5)
+        balance = await asyncio.to_thread(get_account_balance_usdt)
+        actual_risk_usdt = final_qty * distance
+        margin_to_use = CONFIG["MARGIN_USDT_SMALL_BALANCE"] if balance < CONFIG["RISK_SMALL_BALANCE_THRESHOLD"] else actual_risk_usdt
+        uncapped_leverage = int(math.ceil(notional / max(margin_to_use, 1e-9)))
+        max_leverage = min(CONFIG.get("MAX_BOT_LEVERAGE", 30), get_max_leverage(symbol))
+        leverage = max(1, min(uncapped_leverage, max_leverage))
+
+        # Place LIMIT order; persist both SL and TP in pending meta
+        limit_order_resp = await asyncio.to_thread(place_limit_order_sync, symbol, side, final_qty, entry_price, leverage)
+        order_id = str(limit_order_resp.get('orderId'))
+        pending_order_id = f"{symbol}_{order_id}"
+
+        expiry_time = datetime.utcnow() + timedelta(hours=expiry_hours)
+
+        pending_meta = {
+            "id": pending_order_id, "order_id": order_id, "symbol": symbol,
+            "side": side, "qty": final_qty, "limit_price": entry_price,
+            "stop_price": stop_price, "take_price": take_price, "leverage": leverage,
+            "risk_usdt": actual_risk_usdt, "place_time": datetime.utcnow().isoformat(),
+            "expiry_time": expiry_time.isoformat(),
+            "strategy_id": 11,
+            "atr_at_entry": atr_val,
+            "trailing": False  # TP-at-basis mean reversion, no trailing by default
+        }
+
+        async with pending_limit_orders_lock:
+            pending_limit_orders[pending_order_id] = pending_meta
+            await asyncio.to_thread(add_pending_order_to_db, pending_meta)
+
+        title = "⏳ New Pending Order: S11-MeanReversion"
+        new_order_msg = (
+            f"{title}\n\n"
+            f"**Symbol:** `{symbol}`\n"
+            f"**Side:** `{side}`\n"
+            f"**Price:** `{entry_price:.4f}`\n"
+            f"**Qty:** `{final_qty}`\n"
+            f"**Risk:** `{actual_risk_usdt:.2f} USDT`\n"
+            f"**Leverage:** `{leverage}x`\n"
+            f"**TP (H1 basis):** `{round_price(symbol, take_price)}`"
+        )
+        await asyncio.to_thread(send_telegram, new_order_msg, parse_mode='Markdown')
+
+    except Exception as e:
+        await asyncio.to_thread(log_and_send_error, f"S11 evaluation error for {symbol}", e)
+        return
+
+
 
 # ------------- Strategy 6 (Price-Action Only) helpers -------------
 def _s6_in_session_window(ts: pd.Timestamp) -> bool:
