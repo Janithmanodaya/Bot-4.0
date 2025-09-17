@@ -1887,10 +1887,41 @@ def add_pending_order_to_db(rec: Dict[str, Any]):
     if take_val is None:
         take_val = 0.0
 
+    # Normalize datetime strings to be timezone-aware (UTC) for expiry_time and place_time
+    place_time_val = rec.get('place_time')
+    try:
+        if isinstance(place_time_val, str):
+            dt = datetime.fromisoformat(place_time_val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            place_time_val = dt.isoformat()
+        elif isinstance(place_time_val, datetime):
+            if place_time_val.tzinfo is None:
+                place_time_val = place_time_val.replace(tzinfo=timezone.utc)
+            place_time_val = place_time_val.isoformat()
+    except Exception:
+        # Leave as-is on parse failure
+        pass
+
+    expiry_val = rec.get('expiry_time')
+    try:
+        if isinstance(expiry_val, str):
+            dt = datetime.fromisoformat(expiry_val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            expiry_val = dt.isoformat()
+        elif isinstance(expiry_val, datetime):
+            if expiry_val.tzinfo is None:
+                expiry_val = expiry_val.replace(tzinfo=timezone.utc)
+            expiry_val = expiry_val.isoformat()
+    except Exception:
+        # Leave as-is on parse failure
+        pass
+
     values = (
         rec.get('id'), rec.get('order_id'), rec.get('symbol'), rec.get('side'),
         rec.get('qty'), rec.get('limit_price'), stop_val, take_val,
-        rec.get('leverage'), rec.get('risk_usdt'), rec.get('place_time'), rec.get('expiry_time'),
+        rec.get('leverage'), rec.get('risk_usdt'), place_time_val, expiry_val,
         rec.get('strategy_id'), rec.get('atr_at_entry'), int(rec.get('trailing', False))
     )
     cur.execute("""
@@ -1909,20 +1940,26 @@ def remove_pending_order_from_db(pending_order_id: str):
     conn.commit()
     conn.close()
 
-def load_pending_orders_from_db() -> Dict[str, Dict[str, Any]]:
-    conn = sqlite3.connect(CONFIG["DB_FILE"])
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM pending_limit_orders")
-    rows = cur.fetchall()
-    conn.close()
+def load_pending_orders_from_db() -> Dict[str, Dict[str, Any]]:     conn = sqlite3.connect(CONFIG["DB_FILE"])    connc.row_factory = sqlite3.Row    cur  = conn.cursor()    cur .execute("SELECT * FROM pending_limit_orders")    rowsr = cur.fetchall()    connc.close()
+    orders = {}   = for row in rows:       s rec = dict(row)       o # Normalize time fields to ISO with UTC tzinfo to avoid naive/aware comparison issues         for key in ('place_time', 'expiry_time'):            val = rec.get(key)
+            try:                if isinstance(val, str):
+                    dt = datetime.fromisoformat(val)                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)                    rec[key] = dt.isoformat()
+                elif isinstance(val, datetime):                    if val.tzinfo is None:
+                        val = val.replace(tzinfo=timezone.utc)                    rec[key] = val.isoformat()
+            except Exception:                # Leave original on failure
+                pass        rec['trailing'] = bool(rec.get('trailing'))
+        orders[rec['id']] = rec    return ord_codeernews</
 
-    orders = {}
-    for row in rows:
-        rec = dict(row)
-        rec['trailing'] = bool(rec.get('trailing'))
-        orders[rec['id']] = rec
-    return orders
+
+
+
+
+
+
+
+
+ return orders
 
 def record_trade(rec: Dict[str, Any]):
     conn = sqlite3.connect(CONFIG["DB_FILE"])
