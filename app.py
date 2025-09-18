@@ -1918,6 +1918,15 @@ def add_pending_order_to_db(rec: Dict[str, Any]):
         # Leave as-is on parse failure
         pass
 
+    # Also update the in-memory record so callers referencing the same dict see normalized values
+    try:
+        if place_time_val:
+            rec['place_time'] = place_time_val
+        if expiry_val:
+            rec['expiry_time'] = expiry_val
+    except Exception:
+        pass
+
     values = (
         rec.get('id'), rec.get('order_id'), rec.get('symbol'), rec.get('side'),
         rec.get('qty'), rec.get('limit_price'), stop_val, take_val,
